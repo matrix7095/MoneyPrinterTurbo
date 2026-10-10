@@ -453,7 +453,7 @@ def scheduler_plan(runtime, session, scheduler_id):
                 {
                     **item,
                     "request_id": request_id,
-                    "title": f"mpt-worker:{kind.value}:{item['task_id']}",
+                    "title": f"mpt_worker_{kind.value}_{item['task_id']}_{request_id.rsplit(':', 1)[-1]}",
                     "role_id": role.value,
                     "skill_name": role_spec(role).skill_name,
                     "agent_id": fresh_id,

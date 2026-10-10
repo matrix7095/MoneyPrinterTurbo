@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 import sys
 import time
@@ -191,7 +192,11 @@ def test_deployment_and_contract2_offer_is_real_scoped_fresh_and_one_use(
         worker = ready["worker_requests"][0]
         assert worker["task_id"] == task_id
         assert (worker["model"], worker["reasoning_effort"]) == (model, "max")
-        assert worker["title"] == f"mpt-worker:source_discovery:{task_id}"
+        assert re.fullmatch(r"[a-z0-9_]+", worker["title"])
+        assert worker["title"] == (
+            f"mpt_worker_source_discovery_{task_id}_"
+            f"{worker['request_id'].rsplit(':', 1)[-1]}"
+        )
         assert worker["agent_id"] != payload["agent_id"]
         roles = cli._handoff_roles()
         launcher = validate_worker(
@@ -319,6 +324,7 @@ def test_plan_authority_versions_capacity_and_expired_offers(tmp_path):
         assert sum(len(plan["worker_requests"]) for plan in plans) == 2
         requests = [worker for plan in plans for worker in plan["worker_requests"]]
         assert len({worker["request_id"] for worker in requests}) == 2
+        titles_by_task = {worker["task_id"]: worker["title"] for worker in requests}
         with Session(runtime.engine) as session:
             for offer in session.exec(select(SchedulerOffer)).all():
                 offer.expires_at = utc_now() - timedelta(seconds=1)
@@ -329,6 +335,15 @@ def test_plan_authority_versions_capacity_and_expired_offers(tmp_path):
         assert not {worker["request_id"] for worker in fresh["worker_requests"]} & {
             worker["request_id"] for worker in requests
         }
+        assert {
+            worker["task_id"] for worker in fresh["worker_requests"]
+        } <= titles_by_task.keys()
+        for worker in fresh["worker_requests"]:
+            assert worker["title"] != titles_by_task[worker["task_id"]]
+            assert worker["title"] == (
+                f"mpt_worker_{worker['task_type']}_{worker['task_id']}_"
+                f"{worker['request_id'].rsplit(':', 1)[-1]}"
+            )
 
 
 def test_expired_owned_reservation_and_confirmed_lease_recovery(tmp_path):
