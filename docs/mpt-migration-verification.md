@@ -453,3 +453,17 @@ automations now target MoneyPrinterTurbo with updated launcher/maintenance paths
 their schedules, models, notification preferences and auto-archive behavior were
 preserved, and both remain PAUSED. Final cutover evidence and independent reports
 are under the main checkout's `storage/smoke/final-cutover-20261010/`.
+
+At the final UI gate, the explicitly authorized old worktree UI was stopped;
+both verified processes exited and port 8510 became free. Starting Main's UI
+was rejected before process creation with `blocked by policy`, including the
+loopback-only variant. The tool provided no exact rule or denial reason. Local
+configuration specifies reviewer `user`, not `auto_review`; this must not be
+reported as an established automatic-review decision. No execution policy was
+changed. The complete Main UI passed a listener-free Streamlit AppTest against
+the real 8000 API: three read-only GETs returned 200, the workbench title and new
+published platform ID appeared, and no errors or exceptions occurred. This does
+not prove an actual browser-serving UI: the production cutover remains partial
+until startup is permitted and browser acceptance succeeds. Evidence:
+`readonly-ui-initialization-check.json`, `ui-execution-policy-diagnosis.json`
+and `current-ui-cutover-state.json` in the final cutover evidence directory.
