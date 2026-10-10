@@ -348,6 +348,20 @@ out-of-root historical fixtures also need a reviewed configuration/path step.
 
 ## Actual isolated merge and restore rehearsal, 2026-10-10
 
+For the later main deployment, keep the selected staging root permanently at
+`main/storage/business-8000` and use its `data` child as the runtime DataDir.
+The migration tool already writes content and submission paths under
+`<staging>/data`. After a fresh reviewed merge, use SQLite backup to put
+`<staging>/target.db` at `<staging>/data/database/app.db`; do not move the media
+directory or rewrite frozen task payloads. The 8010 database/media must be the
+baseline, not the historical source, so its genuine MPT ownership audits survive.
+This directory contract is statically compatible, but the fully published new
+episode baseline still needs fresh preflight, repeat import, restore and an
+actual isolated start/stop at that DataDir before main cutover. Completed baseline
+tasks are also checked for context/hash/media blockers. Successful stop removes
+the exact instance's `private/server.json`, permitting a later port change;
+unsuccessful stop keeps the guard. Operating credentials are created independently.
+
 `storage/data-migration-rehearsal-20261010-a/` was freshly prepared from read-only
 source and MPT baseline snapshots with the reviewed pinned paused handoff. Both
 inventories were READY with zero blockers. This was not a source freeze or cutover.

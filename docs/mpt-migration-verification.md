@@ -108,9 +108,9 @@ submitted. The terminal fail cleaned its temporary task workspace. Evidence was
 recovered from the original tool records into the durable directory
 `storage/smoke/native-image-constraint-failure-20261010/`: ten raw files and exact
 prompts were preserved, and all three recreated enlargement hashes match their
-original records. The missing terminal-failure recovery handoff has passed
-isolated acceptance; live recovery is still pending. The image constraints
-have not been silently weakened.
+original records. The terminal-failure recovery handoff passed isolated
+acceptance and was used live to create a new visual-plan revision. Its
+independent plan QC is pending; the original failed input remains unchanged.
 Asset/final QC, rendering, publish review, real external publication ID/URL
 and screenshot evidence remain required.
 
@@ -161,3 +161,18 @@ Evidence is in `storage/failure-recovery-independent-final.log`,
 `storage/failure-recovery-independent-adversarial-proof.json` and
 `storage/failure-recovery-independent-source-hashes.json`. These were isolated
 checks; they did not mutate live services or establish publication success.
+
+The accepted code `b18aeee59a688e36b8e0013346674d9d0c033f9e` then restarted the
+independent 8010 service: listener PID 22564, launcher PID 4556 and authenticated
+/anonymous content reads 200/401. The original 8000 and 8510 listeners remained
+PID 19020 and 18684. Admin retry admitted `agt_740daeea825b4f2fb06fe963c7a6cda9`;
+the native assistant returned VALID and COMPLETED/CONSUMED. Core created the new
+visual plan `agt_48c51962d064498493df1466cf64ee76`, which also returned
+COMPLETED/CONSUMED and awaits independent plan QC. The failed source task remains
+FAILED with its original frozen hash, and the approved narration still has SHA
+`8050b68f644208e5fa59ec2225f71969cc24f5a6cfdb9e76dfed432e48bda5dd`.
+Actual proofs are under `storage/smoke/image-failure-recovery-20261010/`;
+assistant and visual results are separately preserved under
+`storage/smoke/episode-recovery-plan-20261010/` and
+`storage/smoke/episode-visual-repair-20261010/`. This is recovery progress,
+not image acceptance, final acceptance or publication evidence.
