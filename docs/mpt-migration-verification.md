@@ -1,8 +1,12 @@
 # Migration verification checkpoint, 2026-10-10
 
-This checkpoint covers the migration worktree, not production cutover or a
-successful Douyin publication. The source Glance process on port 8000 remains
-unchanged. No new external publication has been verified.
+The final state includes an actual new Douyin publication, migrated production
+data and archive histories, Main API on port 8000 and the Main business UI on
+loopback port 8510. See [the final cutover evidence](#actual-publication-and-production-cutover-2026-10-10).
+The earlier sections below preserve the isolated checkpoints in chronological
+order; their original process IDs and pre-publication observations are historical,
+not the current production state. The old Glance service and old worktree UI
+have been stopped; both existing app automations remain PAUSED.
 
 ## Code and isolated data checks
 
