@@ -499,7 +499,7 @@ class WorkflowService:
             original_title=original_title,
             rights_status=rights_status,
             rights_note=rights_note,
-            published_at=published_at,
+            published_at=as_utc(published_at) if published_at is not None else None,
         )
         self.session.add(candidate)
         self.session.commit()
