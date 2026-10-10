@@ -46,13 +46,15 @@ git rev-parse origin/main
      merge --no-commit --no-ff <fixed-upstream-sha>
    ```
 
-3. 按提交和目录检查差异，逐段处理冲突并保留必要的 MPT 行为。禁止一键选 ours/theirs 后跳过复核。重点审查 `app/services/`、API/WebUI 调用、任务/状态与 artifact 安全边界、Docker/启动入口、`pyproject.toml`、`uv.lock`。依赖锁文件由单一维护者处理；生产依赖锁和生产导入路径不得含模型 SDK，所有语义处理必须进入 AgentTask。需要检查未迁移上游功能时，在隔离的可选兼容环境验证，不能把 SDK 装进目标生产环境；不照搬供应商 SDK、配置项或凭据。
+3. 按提交和目录检查差异，逐段处理冲突并保留必要的 MPT 行为。禁止一键选 ours/theirs 后跳过复核。重点审查 `app/services/`、API/WebUI 调用、任务/状态与 artifact 安全边界、Docker/启动入口、`pyproject.toml`、`uv.lock`。依赖锁文件由单一维护者处理；默认生产安装闭包与启动导入路径不得安装或导入模型 SDK，所有语义处理必须进入 AgentTask。锁文件可以包含明确隔离的 optional compatibility extra 的 SDK；门禁检查实际默认安装环境和启动导入，不能要求整个锁文件没有 SDK。需要检查未迁移上游功能时，在隔离的可选兼容环境验证，不能把 SDK 装进目标生产环境；不照搬供应商 SDK、配置项或凭据。
 
 4. 在 integration worktree 用干净配置、独立 DB/artifact 目录完成验证：MPT 回归与 lint；Glance 迁移的来源发现、AgentClient 真实 HTTP、schema、重启后 SQLite 持久化、错误角色/过期租约拒绝、幂等入库、Artifact 与失败恢复；Python 3.11/3.12/3.13 矩阵；生产依赖/启动路径不安装或导入模型 SDK；8010 隔离预生产验证。发布恢复样本须覆盖 UNKNOWN/NEEDS_USER 和“提交后未返回结果”，证明仅只读核对且幂等恢复不重复发起 Douyin 请求。新旧行为差异和失败都要有记录。任何一项失败，停止该 SHA，不快进、不重启、不推送。
 
 5. 所有门禁通过后才提交集成结果；再次确认本地 `main` 干净且仍等于记录的 MPT 基线，然后才用 `git merge --ff-only codex/upstream-sync-<short-sha>` 推进。基线不符时停止并重建集成分支。重启目标服务后，先证明实际进程和版本，再检查 API、AgentTask SQLite、Artifact 读写及生产 readiness；保留上一版本 SHA、数据备份和快速回退步骤。只有重启验证有证据且代码/数据回滚路径仍可用，才 push 到 `origin`。禁止 `reset --hard` 和强推；代码回退用经审查的 revert，数据回退用已验证的 DB/Artifact 备份。
 
 6. 每次同步留一条可审计记录（建议 `docs/upstream-sync-log.md`）：日期、上游 SHA、MPT 基线/集成提交、冲突文件及取舍、依赖/锁文件变化、测试与 Python 矩阵、8010 结果、重启证据、push SHA 和回滚目标。不得把密钥、token、生产素材或完整环境配置写入记录。
+
+当前上游 SHA 与 bootstrap 基线相同，`Already up to date` 不能算升级演练通过。最终演练须使用实际不同的两个固定历史 SHA，或新出现的上游 SHA，在包含迁移代码的独立 integration worktree 完成上述门禁；多 writer 尚未提交的工作区不能用于这个演练。
 
 ## 停止与回退条件
 

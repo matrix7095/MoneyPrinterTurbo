@@ -31,7 +31,7 @@ def test_mimo_lost_paid_response_is_not_replayed_and_client_closes():
     with (
         tempfile.TemporaryDirectory() as temp_dir,
         patch.object(voice.config, "app", {"mimo_api_key": "fixture-key"}),
-        patch.object(voice, "OpenAI", side_effect=client_factory),
+        patch("openai.OpenAI", side_effect=client_factory),
         patch("openai._base_client.time.sleep"),
     ):
         result = voice.mimo_tts("Hello", "fixture-voice", 1.0, str(Path(temp_dir) / "voice.mp3"))

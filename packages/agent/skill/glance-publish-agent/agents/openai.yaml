@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 发布 Agent"
+  short_description: "在用户点击或 Handsfree 闸门通过后使用本机浏览器或 social-auto-upload 完成抖音发布并回传证据"
+  default_prompt: "使用 $glance-publish-agent 领取并完成 Glance 抖音直发布任务。"

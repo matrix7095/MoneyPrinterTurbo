@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from fastapi import Response
 from pydantic import ValidationError
 
 from app.controllers.v1 import llm as llm_controller
@@ -12,6 +13,15 @@ from app.models.schema import (
 
 
 class TestLlmController(unittest.TestCase):
+    def setUp(self):
+        self.compatibility = patch.object(
+            llm_controller.llm,
+            "is_upstream_compatibility_enabled",
+            return_value=True,
+        )
+        self.compatibility.start()
+        self.addCleanup(self.compatibility.stop)
+
     def test_terms_request_bounds_generated_term_count(self):
         """Ordered term prompts must not allocate arbitrary-length examples."""
         self.assertEqual(
@@ -40,7 +50,7 @@ class TestLlmController(unittest.TestCase):
             "generate_script",
             return_value="Generated script",
         ) as generate:
-            response = llm_controller.generate_video_script(None, body)
+            response = llm_controller.generate_video_script(None, Response(), body)
 
         self.assertEqual(
             response,
@@ -68,7 +78,7 @@ class TestLlmController(unittest.TestCase):
             "generate_terms",
             return_value=["beans", "brewing"],
         ) as generate:
-            response = llm_controller.generate_video_terms(None, body)
+            response = llm_controller.generate_video_terms(None, Response(), body)
 
         self.assertEqual(
             response,
@@ -100,7 +110,9 @@ class TestLlmController(unittest.TestCase):
             "generate_social_metadata",
             return_value=metadata,
         ) as generate:
-            response = llm_controller.generate_video_social_metadata(None, body)
+            response = llm_controller.generate_video_social_metadata(
+                None, Response(), body
+            )
 
         self.assertEqual(response, {"status": 200, "data": metadata})
         generate.assert_called_once_with(

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 编导 Agent"
+  short_description: "翻译完整研究材料并编写、优化和审校一分钟中文视频脚本任务"
+  default_prompt: "使用 $glance-script-agent 领取并完成 Glance 编导任务。"

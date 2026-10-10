@@ -648,9 +648,8 @@ class TestVoiceService(unittest.TestCase):
 
         fake_client = _FakeClient()
 
-        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
-            vs,
-            "OpenAI",
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "openai.OpenAI",
             return_value=fake_client,
         ) as openai_client, patch(
             "pydub.AudioSegment.from_file",

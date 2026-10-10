@@ -1913,6 +1913,17 @@ def start(
     默认值，让自定义音频始终受当前任务目录约束。
     """
     try:
+        # API, CLI and WebUI share this boundary; provider extras never authorize
+        # production model calls or bypass server-issued publishing review.
+        if not llm.is_upstream_compatibility_enabled():
+            if stop_at in {"materials", "video"} and params.video_source not in {
+                "local", "pexels", "pixabay", "coverr",
+            }:
+                return _mark_task_failed(task_id, "preflight", "Generated material requires an AgentTask artifact")
+            if stop_at == "video" and params.bgm_type in _VIDEO_MUSIC_PROVIDERS and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume):
+                return _mark_task_failed(task_id, "preflight", "Generated music requires an AgentTask audio artifact")
+            if stop_at == "video" and upload_post.upload_post_service.enabled and upload_post.upload_post_service.auto_upload:
+                return _mark_task_failed(task_id, "preflight", "Publishing requires a server-issued publish task")
         return _run_pipeline(
             task_id,
             params,

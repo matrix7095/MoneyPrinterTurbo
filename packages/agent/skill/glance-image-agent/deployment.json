@@ -1,0 +1,1 @@
+{"recommended_model_tier":"普通级","recommended_reasoning_effort":"中等；连续性任务使用高","required_host_capabilities":["原生生图","图片理解","文件上传"],"recommended_max_inflight":1,"lease_profile":"image-generation"}

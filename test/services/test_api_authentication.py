@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -53,7 +54,7 @@ class TestAPIAuthenticationHTTP(unittest.TestCase):
 
         # 请求模型提供了默认值，空请求也可能真实调用大模型。这里隔离外部
         # 服务并核对调用次数，既验证鉴权顺序，也避免测试消耗用户的 API。
-        with patch(
+        with patch.dict(os.environ, {"MPT_UPSTREAM_COMPATIBILITY": "1"}), patch(
             "app.controllers.v1.llm.llm.generate_script",
             return_value="mocked script",
         ) as generate_script:

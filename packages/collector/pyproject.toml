@@ -1,0 +1,17 @@
+[project]
+name = "glance-collector"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "feedparser>=6,<7",
+  "glance-core",
+  "httpx>=0.28,<1",
+]
+
+[tool.uv.sources]
+glance-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

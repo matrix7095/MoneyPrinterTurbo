@@ -18,6 +18,8 @@ x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
 x-common-environment: &common-environment
+  # 仅 Claude 兼容变体启用上游 MPT provider/语义流程；默认 Docker 入口保持关闭。
+  MPT_UPSTREAM_COMPATIBILITY: "1"
   # 未设置令牌时直接让 compose 报错，避免容器起来后才在生成阶段失败。
   CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?run 'export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"' first}
 

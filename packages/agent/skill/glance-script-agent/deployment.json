@@ -1,0 +1,8 @@
+{
+  "recommended_model_tier": "普通级",
+  "recommended_reasoning_effort": "高",
+  "required_host_capabilities": ["中文写作", "长文本审校", "结构化 JSON"],
+  "optional_host_capabilities": ["联网核验"],
+  "recommended_max_inflight": 1,
+  "lease_profile": "writing"
+}

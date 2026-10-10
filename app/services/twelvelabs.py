@@ -38,6 +38,7 @@ from loguru import logger
 
 from app.config import config
 from app.services import material
+from app.services.llm import is_upstream_compatibility_enabled
 
 DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
@@ -48,10 +49,12 @@ _PEGASUS_MIN_MAX_TOKENS = 512
 def is_enabled() -> bool:
     """True only when at least one TwelveLabs API key is configured."""
     keys = config.app.get("twelvelabs_api_keys")
-    return bool(keys)
+    return is_upstream_compatibility_enabled() and bool(keys)
 
 
 def _client(httpx_client=None):
+    if not is_upstream_compatibility_enabled():
+        raise RuntimeError("Semantic video assessment requires an AgentTask result")
     # Lazy import + rotated key reuse mirrors the other providers in
     # material.py (get_api_key rotates across configured keys).
     from twelvelabs import TwelveLabs

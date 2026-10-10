@@ -24,7 +24,7 @@ def mock_provider(monkeypatch):
     client = MagicMock()
     client.__enter__.return_value = client
     client.chat.completions.create.return_value = completion
-    monkeypatch.setattr(voice, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
     monkeypatch.setitem(voice.config.app, "mimo_api_key", "test-local-key")
     return client
 

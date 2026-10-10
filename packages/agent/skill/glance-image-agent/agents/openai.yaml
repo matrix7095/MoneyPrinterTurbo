@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 生图 Agent"
+  short_description: "按照平台视觉规范生成、上传并登记可审核的图片素材产物"
+  default_prompt: "使用 $glance-image-agent 领取并完成 Glance 生图任务。"

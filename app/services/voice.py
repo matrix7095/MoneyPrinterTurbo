@@ -25,10 +25,10 @@ from edge_tts import SubMaker
 from edge_tts.srt_composer import Subtitle
 from loguru import logger
 from moviepy.audio.io.AudioFileClip import AudioFileClip
-from openai import OpenAI
 
 from app.config import config
 from app.services import bgm
+from app.services.llm import is_upstream_compatibility_enabled
 from app.utils import utils
 from app.utils.subtitle_reader import moviepy_subtitles
 from app.utils.subtitle_writer import staged_subtitle_file
@@ -640,6 +640,8 @@ def _single_tts(
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
 ) -> Union[SubMaker, None]:
+    if (is_gemini_voice(voice_name) or is_mimo_voice(voice_name)) and not is_upstream_compatibility_enabled():
+        raise RuntimeError("Generative model speech requires an AgentTask audio artifact")
     if is_no_voice(voice_name):
         duration_seconds = estimate_no_voice_duration(text)
         if not generate_silent_audio(duration_seconds, voice_file):
@@ -1915,6 +1917,8 @@ def gemini_tts(
     Returns:
         SubMaker对象或None
     """
+    if not is_upstream_compatibility_enabled():
+        raise RuntimeError("Gemini speech requires an AgentTask audio artifact")
     import base64
     import io
     from pydub import AudioSegment
@@ -2054,6 +2058,8 @@ def mimo_tts(
     MiMo 当前没有返回逐词时间轴，因此这里复用项目已有的 legacy
     SubMaker 兜底方案：根据最终音频时长和脚本文本断句生成字幕时间轴。
     """
+    if not is_upstream_compatibility_enabled():
+        raise RuntimeError("MiMo speech requires an AgentTask audio artifact")
     from pydub import AudioSegment
 
     text = (text or "").strip()
@@ -2077,6 +2083,9 @@ def mimo_tts(
 
     temporary_audio = None
     try:
+        # MiMo's optional transport must not import a model SDK at startup.
+        from openai import OpenAI
+
         logger.info(
             f"start mimo tts, model: {model_name}, voice: {voice_name}"
         )

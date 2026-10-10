@@ -21,7 +21,7 @@ from app.utils import utils
 
 
 @asynccontextmanager
-async def application_lifespan(_: FastAPI):
+async def application_lifespan(instance: FastAPI):
     """集中处理 API 进程启动恢复和关闭日志。"""
     logger.info("startup event")
 
@@ -51,9 +51,30 @@ async def application_lifespan(_: FastAPI):
 
     if isinstance(video_controller.task_manager, RedisTaskManager):
         video_controller.task_manager.resume_queued_tasks()
+    business_options = config._cfg.get("business", {})
+    enabled = os.getenv("MPT_BUSINESS_ENABLED")
+    business_enabled = (
+        enabled.lower() in {"1", "true", "yes"}
+        if enabled is not None else business_options.get("enabled", False) is True
+    )
+    business_runtime = None
+    instance.state.business_runtime = None
     try:
+        if business_enabled:
+            from app.business.runtime import BusinessRuntime, settings_from_config
+
+            # Independent MPT storage and credentials must never inherit Glance's.
+            business_runtime = BusinessRuntime(
+                settings_from_config(config._cfg, root_dir=config.root_dir)
+            )
+            business_runtime.initialize()
+            instance.state.business_runtime = business_runtime
+            business_runtime.start_maintenance()
         yield
     finally:
+        instance.state.business_runtime = None
+        if business_runtime is not None:
+            business_runtime.close()
         logger.info("shutdown event")
 
 

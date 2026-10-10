@@ -1,0 +1,8 @@
+{
+  "recommended_model_tier": "旗舰级",
+  "recommended_reasoning_effort": "高",
+  "required_host_capabilities": ["联网搜索", "网页阅读", "长上下文", "引用来源"],
+  "optional_host_capabilities": ["图片理解"],
+  "recommended_max_inflight": 1,
+  "lease_profile": "research-long"
+}

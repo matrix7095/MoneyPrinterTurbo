@@ -65,7 +65,7 @@ def test_fluxionai_defaults_and_group_overrides(
             http_client=http_client,
             max_retries=0,
         ) as client:
-            with patch.object(llm, "OpenAI", return_value=client) as factory:
+            with patch("openai.OpenAI", return_value=client) as factory:
                 result = llm._generate_response(
                     "生成中文文案",
                     app_config={
@@ -86,7 +86,7 @@ def test_fluxionai_defaults_and_group_overrides(
 
 def test_fluxionai_missing_key_fails_before_network():
     """缺少密钥时沿用统一错误提示，不创建客户端或发起付费请求。"""
-    with patch.object(llm, "OpenAI") as factory:
+    with patch("openai.OpenAI") as factory:
         result = llm._generate_response(
             "test", app_config={"llm_provider": "fluxionai"}
         )
@@ -112,7 +112,7 @@ def test_fluxionai_http_errors_are_not_successful_text(status):
             http_client=http_client,
             max_retries=0,
         ) as client:
-            with patch.object(llm, "OpenAI", return_value=client):
+            with patch("openai.OpenAI", return_value=client):
                 result = llm._generate_response(
                     "test",
                     app_config={

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 视频 Agent"
+  short_description: "按照平台镜头规范生成、上传并登记可审核的 AI 视频素材"
+  default_prompt: "使用 $glance-video-agent 领取并完成 Glance 视频生成任务。"

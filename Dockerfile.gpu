@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy only the requirements.txt first to leverage Docker cache
 COPY requirements.txt ./
+# requirements.txt contains editable local workspace packages.
+COPY packages ./packages
 
 # Install Python dependencies
 RUN python3 -m pip install --no-cache-dir \

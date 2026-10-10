@@ -21,6 +21,7 @@ from PIL import Image, UnidentifiedImageError
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
+    llm,
     material_cache,
     material_upload,
     metaso_minimax,
@@ -809,6 +810,8 @@ def generate_videos_wavespeed(
     使其可以直接接入 ``download_videos`` 的通用下载与时长核算流程。
     ``minimum_duration`` 在生成语境下就是目标片段时长（秒）。
     """
+    if not llm.is_upstream_compatibility_enabled():
+        raise RuntimeError("Generated videos require an AgentTask artifact")
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("wavespeed_api_keys")
@@ -1670,6 +1673,8 @@ def generate_images_openai(
     是否已经凑够配音时长。API 返回的实际尺寸可能与请求不一致，这里以
     图片真实尺寸写入 rendition，不依赖请求参数。
     """
+    if not llm.is_upstream_compatibility_enabled():
+        raise RuntimeError("Generated images require an AgentTask artifact")
     aspect = VideoAspect(video_aspect)
     clip_duration = max(int(minimum_duration), 1)
     endpoint, model = _openai_image_endpoint()
@@ -2149,6 +2154,8 @@ def download_videos(
     文件就以 0~1 的完成比例调用一次，供任务层推进进度条。按需生成的付费
     素材源不报告下载进度。
     """
+    if source not in {"pexels", "pixabay", "coverr"} and not llm.is_upstream_compatibility_enabled():
+        raise RuntimeError("Generated material requires an AgentTask artifact")
     provider = "pexels"
     remote_search_videos = search_videos_pexels
     if source == "pixabay":

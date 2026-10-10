@@ -1,0 +1,7 @@
+{
+  "role_id": "visual",
+  "skill_name": "glance-visual-agent",
+  "skill_version": "1.1.1",
+  "protocol_version": "1",
+  "task_types": ["scene_analyze", "visual_plan", "visual_plan_qc", "asset_qc"]
+}

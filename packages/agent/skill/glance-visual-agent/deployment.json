@@ -1,0 +1,8 @@
+{
+  "recommended_model_tier": "旗舰级",
+  "recommended_reasoning_effort": "高",
+  "required_host_capabilities": ["图片理解", "视频或关键帧理解", "结构化 JSON"],
+  "optional_host_capabilities": ["原生生图"],
+  "recommended_max_inflight": 1,
+  "lease_profile": "visual"
+}

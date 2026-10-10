@@ -1,0 +1,1 @@
+{"recommended_model_tier":"普通级","recommended_reasoning_effort":"高","required_host_capabilities":["原生视频生成","进度查询","文件上传","长任务心跳"],"recommended_max_inflight":1,"lease_profile":"video-generation-long"}

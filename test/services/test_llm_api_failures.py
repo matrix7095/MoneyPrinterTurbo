@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
+from fastapi import Response
 from app.controllers.v1 import llm as controller
 from app.models.exception import HttpException
 from app.models.schema import VideoScriptRequest, VideoTermsRequest
@@ -26,8 +27,10 @@ from app.models.schema import VideoScriptRequest, VideoTermsRequest
 )
 def test_provider_failure_does_not_return_success(service, handler, body, failed):
     request = SimpleNamespace(headers={"x-task-id": "request-1"})
-    with patch.object(controller.llm, service, return_value=failed):
+    with patch.object(
+        controller.llm, "is_upstream_compatibility_enabled", return_value=True
+    ), patch.object(controller.llm, service, return_value=failed):
         with pytest.raises(HttpException) as raised:
-            handler(request, body)
+            handler(request, Response(), body)
     assert raised.value.status_code == 503
     assert "unavailable" in raised.value.message

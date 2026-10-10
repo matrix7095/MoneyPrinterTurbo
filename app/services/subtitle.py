@@ -4,10 +4,6 @@ import tempfile
 import threading
 from timeit import default_timer as timer
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
 from loguru import logger
 
 from app.config import config
@@ -21,6 +17,8 @@ device = config.whisper.get("device", "cpu")
 compute_type = config.whisper.get("compute_type", "int8")
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
+_WHISPER_NOT_LOADED = object()
+WhisperModel = _WHISPER_NOT_LOADED
 _model_init_lock = threading.Lock()
 
 
@@ -64,6 +62,12 @@ def create(
     word_level: bool = False,
     log_details: bool = True,
 ):
+    global WhisperModel
+    if WhisperModel is _WHISPER_NOT_LOADED:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            WhisperModel = None
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
         return ""

@@ -10,8 +10,6 @@ from time import perf_counter
 from typing import List
 
 from loguru import logger
-from openai import AzureOpenAI, OpenAI
-from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
@@ -254,7 +252,18 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
+def is_upstream_compatibility_enabled() -> bool:
+    """Provider extras are for explicitly isolated upstream regression runs."""
+    return os.getenv("MPT_UPSTREAM_COMPATIBILITY") == "1"
+
+
 def _generate_response(prompt: str, app_config=None) -> str:
+    if not is_upstream_compatibility_enabled():
+        raise RuntimeError(
+            "Use the MPT business workbench to select a candidate and follow its content_id; "
+            "POST /api/v1/scripts, /terms or /social-metadata with that content_id "
+            "returns durable Agent task status and consumed results"
+        )
     sdk_client = None
     sdk_stream = None
     try:
@@ -290,6 +299,11 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 f"fallback to '{base_url}'"
             )
         adapter = provider.adapter
+        # Keep SDKs outside API/WebUI imports; only the optional compatibility
+        # environment needs provider adapters while AgentTask replaces callers.
+        if adapter in {"openai_compatible", "azure", "cloudflare_ai_gateway", "modelscope"}:
+            from openai import AzureOpenAI, OpenAI
+            from openai.types.chat import ChatCompletion
         api_version = ""
 
         # Ollama 的默认地址依赖当前是否运行在容器中，无法作为静态 Registry
@@ -1226,6 +1240,8 @@ def generate_social_metadata(
                 f"failed to generate social metadata, trying again... {i + 1}"
             )
 
+    if not is_upstream_compatibility_enabled():
+        raise RuntimeError("Use /api/v1/social-metadata with a business content_id for the consumed Agent result")
     logger.warning("falling back to heuristic social metadata")
     return _fallback_social_metadata(video_subject, video_script, platform)
 

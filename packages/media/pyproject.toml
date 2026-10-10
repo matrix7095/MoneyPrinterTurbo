@@ -1,0 +1,35 @@
+[project]
+name = "glance-media"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "edge-tts>=7,<8",
+  "faster-whisper>=1.1,<2",
+  "glance-core",
+  "httpx>=0.28,<1",
+  "pysubs2>=1.8,<2",
+  "scenedetect>=0.7,<0.8",
+  "yt-dlp>=2025.1",
+]
+
+[project.optional-dependencies]
+# 可选 CUDA 加速；本地 faster-whisper / CTranslate2 CPU ASR 是常规依赖，无 torch。
+# 安装：uv sync --all-packages --extra gpu
+gpu = [
+  "nvidia-cublas-cu12; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+]
+
+[tool.uv.sources]
+glance-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/glance_media"]
+artifacts = [
+  "src/glance_media/fonts/assets/*.otf",
+  "src/glance_media/fonts/OFL.txt",
+]

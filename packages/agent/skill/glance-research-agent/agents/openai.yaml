@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 研究 Agent"
+  short_description: "搜索海外新奇项目、实时查重、核验一手来源并完成结构化内容研究任务"
+  default_prompt: "使用 $glance-research-agent 领取并完成 Glance 研究任务。"

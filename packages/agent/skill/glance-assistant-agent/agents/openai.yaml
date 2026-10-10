@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 助手 Agent"
+  short_description: "辅助人工完成选题、视频源补录、脚本、成片审核以及发布检查工作节点"
+  default_prompt: "Use -assistant-agent to process the next Glance manual-assistance task."

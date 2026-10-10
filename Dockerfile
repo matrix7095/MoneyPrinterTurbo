@@ -81,6 +81,8 @@ RUN set -u; \
 
 # Copy only the requirements.txt first to leverage Docker cache
 COPY requirements.txt ./
+# requirements.txt contains editable local workspace packages.
+COPY packages ./packages
 
 # 本地默认优先国内 PyPI 镜像；GHCR 发布使用官方 PyPI，避免海外 runner 因跨境镜像访问变慢。
 RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \

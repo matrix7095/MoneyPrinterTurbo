@@ -658,7 +658,7 @@ def _save_uploaded_local_materials(uploaded_files):
 
 def _initialize_session_state():
     """集中初始化跨 rerun 保留的页面状态。"""
-    if not st.session_state.get("cross_post_recovery_checked"):
+    if llm.is_upstream_compatibility_enabled() and not st.session_state.get("cross_post_recovery_checked"):
         # WebUI 可以不经过 FastAPI 独立运行，因此也需要在首次会话初始化时处理
         # 进程重启留下的发布状态。恢复失败时不写标记，后续 rerun 会再次尝试。
         recovered = tm.recover_interrupted_cross_posts()
@@ -8366,6 +8366,11 @@ def _render_generation_controls(
 
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
+    if not llm.is_upstream_compatibility_enabled():
+        from webui.business import render_business_page
+
+        render_business_page(config._cfg, config.root_dir)
+        return
     _render_top_bar()
 
     if st.session_state.get("settings_dialog_open", False):

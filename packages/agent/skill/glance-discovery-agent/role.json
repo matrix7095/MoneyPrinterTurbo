@@ -1,0 +1,7 @@
+{
+  "role_id": "discovery",
+  "skill_name": "glance-discovery-agent",
+  "skill_version": "1.1.1",
+  "protocol_version": "1",
+  "task_types": ["source_discovery", "candidate_enrich"]
+}

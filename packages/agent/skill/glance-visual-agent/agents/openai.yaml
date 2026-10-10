@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 视觉 Agent"
+  short_description: "理解视频和关键帧场景、规划竖屏镜头并完成结构化视觉方案质检"
+  default_prompt: "使用 $glance-visual-agent 领取并完成 Glance 视觉任务。"

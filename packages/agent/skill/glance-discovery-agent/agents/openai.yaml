@@ -1,0 +1,4 @@
+interface:
+  display_name: "Glance 搜索 Agent"
+  short_description: "使用低成本模型完成来源发现、实时查重、中文摘要和候选初筛"
+  default_prompt: "使用 $glance-discovery-agent 领取并完成 Glance 的来源发现或候选整理任务。"

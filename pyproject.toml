@@ -19,11 +19,7 @@ dependencies = [
     "edge-tts==7.2.7",
     "fastapi==0.136.3",
     "uvicorn==0.32.1",
-    "openai==2.24.0",
-    "faster-whisper==1.1.0",
     "loguru==0.7.3",
-    "dashscope==1.20.14",
-    "azure-cognitiveservices-speech==1.41.1",
     "redis==5.2.0",
     "python-multipart==0.0.27",
     "pyyaml==6.0.3",
@@ -32,11 +28,24 @@ dependencies = [
     "socksio==1.0.0",
     "pydub==0.25.1",
     "audioop-lts==0.2.2; python_version >= '3.13'",
-    "litellm==1.86.2",
-    "google-genai==2.11.0",
+    "glance-core",
+    "glance-agent",
+    "glance-collector",
+    "glance-media",
 ]
 
 [project.optional-dependencies]
+# Isolated upstream provider tests only; production uses AgentTask and must
+# install with `uv sync --locked --no-default-groups` (no extras).
+upstream-providers = [
+    "openai==2.24.0",
+    "dashscope==1.20.14",
+    "litellm==1.86.2",
+    "google-genai==2.11.0",
+]
+# Local transcription and speech are optional media capabilities, not LLMs.
+asr = ["faster-whisper==1.1.0", "av<19"]
+azure-speech = ["azure-cognitiveservices-speech==1.41.1"]
 # Optional TwelveLabs (https://twelvelabs.io) video-understanding/embedding
 # integration. Only needed when `twelvelabs_api_keys` is configured; install
 # with `uv sync --extra twelvelabs`.
@@ -77,3 +86,12 @@ packages = ["app"]
 [tool.uv]
 # 当前项目以应用运行形态为主，不作为可发布的 Python 包安装。
 package = false
+
+[tool.uv.workspace]
+members = ["packages/core", "packages/agent", "packages/collector", "packages/media"]
+
+[tool.uv.sources]
+glance-core = { workspace = true }
+glance-agent = { workspace = true }
+glance-collector = { workspace = true }
+glance-media = { workspace = true }

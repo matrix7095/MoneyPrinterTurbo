@@ -267,17 +267,18 @@ class TaskQueryRequest(BaseModel):
 
 
 class VideoScriptRequest(VideoScriptParams, BaseModel):
-    pass
+    content_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 class VideoTermsRequest(VideoTermsParams, BaseModel):
+    content_id: str | None = Field(default=None, min_length=1, max_length=80)
     # Ordered term generation allocates an example list proportional to amount
     # before contacting the model. Reject malformed or excessive API requests.
     amount: int = Field(default=5, ge=1, le=50)
 
 
 class VideoSocialMetadataRequest(VideoSocialMetadataParams, BaseModel):
-    pass
+    content_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 # ---------------------------
@@ -322,15 +323,33 @@ class TaskListData(BaseModel):
     page_size: int
 
 
-class VideoScriptData(BaseModel):
+class SemanticResultContext(BaseModel):
+    content_id: str | None = None
+    task_ids: dict[str, str] | None = None
+    result_origin: str | None = None
+
+
+class SemanticTaskData(BaseModel):
+    content_id: str
+    business_status: str
+    stage: str
+    status: Literal["PENDING"] = "PENDING"
+    task_ids: dict[str, str]
+    tasks: list[dict[str, Any]]
+    required_tasks: list[str]
+    poll_url: str
+    next_action: str
+
+
+class VideoScriptData(SemanticResultContext):
     video_script: str
 
 
-class VideoTermsData(BaseModel):
+class VideoTermsData(SemanticResultContext):
     video_terms: List[str]
 
 
-class VideoSocialMetadataData(BaseModel):
+class VideoSocialMetadataData(SemanticResultContext):
     title: str
     caption: str
     hashtags: List[str]
@@ -458,7 +477,7 @@ class TaskDeletionResponse(BaseResponse):
 
 
 class VideoScriptResponse(BaseResponse):
-    data: VideoScriptData
+    data: VideoScriptData | SemanticTaskData
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -474,7 +493,7 @@ class VideoScriptResponse(BaseResponse):
 
 
 class VideoTermsResponse(BaseResponse):
-    data: VideoTermsData
+    data: VideoTermsData | SemanticTaskData
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -488,7 +507,7 @@ class VideoTermsResponse(BaseResponse):
 
 
 class VideoSocialMetadataResponse(BaseResponse):
-    data: VideoSocialMetadataData
+    data: VideoSocialMetadataData | SemanticTaskData
 
     model_config = ConfigDict(
         json_schema_extra={
