@@ -14,8 +14,8 @@
 | 守护与正式调度 | Watchdog最近执行结果0；身份叠加与名称交接修复均已部署，已再次恢复enabled=true、max_parallel=2，其他配置与维护前一致 | 通过运行配置检查 |
 | 修复代码与独立验证 | 已部署f8f747e；pipeline SHA与冻结审查一致；971项完整业务回归通过，独立审查APPROVE及53项独立测试通过 | 通过 |
 | 正确提交与文档 | 主目录干净，提交已快进并推送origin/main；本文与证明文件对应 | 通过当前提交检查 |
-| 第5版脚本修复 | 正常SHORT_SCRIPT已COMPLETED；SCRIPT_QC passed=true；SCRIPT_REVIEW_ASSIST APPROVE/high，仅节奏warning | 通过脚本阶段 |
-| 第5版视觉与新成片 | VISUAL_PLAN已完成，独立QC因身份叠加能力未声明返回非通过；正常Recovery已送回后续修订，不能沿用旧通过结果 | 未通过，合同修复中 |
+| 第7版脚本与素材 | 中文类别口播脚本、SCRIPT_QC、SCRIPT_REVIEW_ASSIST及VISUAL_PLAN_QC通过；六张新图片完成，正式自动调度的ASSET_QC已COMPLETED且passed=true | 通过脚本和素材阶段 |
+| 新成片与影音审核 | 第6版实际画面已证明OpeningIdentity和Concept可见，但CONTENT_QC因关键品牌音频消歧及完整动态观看证据不足返回非通过；第7版已修订，尚未通过新成片审核 | 未通过 |
 | 完整影音审核能力 | 无已启用、已实测的完整媒体理解Provider；Gemini仅是待授权实测入口 | 未通过 |
 | 新视频真实发布 | 最新真实ID仍为旧作品7695010253280234779；本轮没有新PUBLISHED和外部ID | 未通过 |
 | 后续无人值守授权 | 未来尺寸准备授权及Gemini外部上传授权仍待明确答复；本轮授权不可擅自扩大 | 未完成 |
@@ -25,7 +25,7 @@
 
 当前维护操作：独立代码与冻结任务诊断确认MPT渲染器已经通过OpeningIdentity ASS层显示已审script.opening.product_identity，范围0至min(8秒,实际时长)；但实际VISUAL_PLAN、QC与Recovery合同只声明了Concept标签，导致合法中文类别口播又被要求恢复品牌读音。身份层只包含正式身份，不自动拼接类别或陪护条件，后二者仍由实际旁白字幕承载。旧QC非通过和Recovery结果原样保留，证据 `opening-overlay-before-contract-repair-proof.json`。共享合同修复已在Stable工作树冻结：六个源码文件和一个专用测试文件，27项专用测试、446项相关回归及Ruff/AST/diff检查通过；独立代码审查APPROVE且另跑53项HTTP/真实渲染测试通过，Root完整业务回归971项通过（452.50秒、退出码0）。f8f747e已受管部署并推送，API PID15460/launcher8224指向主目录；授权200、匿名401、UI健康200，冻结七文件SHA一致，证明opening-contract-release-proof.json。调度原配置保存在 `scheduler-before-opening-contract-repair.json`，已恢复原enabled=true并实查所有配置与备份一致；API和UI健康，未停止在执行的Worker。
 
-恢复调度后的原生交接验证发现另一个明确缺陷：服务端v2 Worker title含冒号与连字符，但本宿主原生spawn task_name仅接受小写字母、数字和下划线。原样创建被拒绝，控制器返回HANDOFF_ERROR并停止补位；没有任务被领取、没有重试同一offer。服务端名称生成与真实HTTP契约测试修复已冻结，32项HTTP测试通过，独立审查APPROVE并另跑32项测试通过（9.49秒），be950ce已受管部署并推送，API PID21672/launcher22224及原UI16940健康，授权200/匿名401/UI健康200，调度配置已完整恢复；待全新offer实际native spawn验证。证据scheduler-native-name-release-proof.json。本次发现使无人值守交接稳定性仍未通过，不影响已部署身份叠加修复的971项测试结论。
+恢复调度后的原生交接验证发现另一个明确缺陷：服务端v2 Worker title含冒号与连字符，但本宿主原生spawn task_name仅接受小写字母、数字和下划线。原样创建被拒绝，控制器返回HANDOFF_ERROR并停止补位；没有任务被领取、没有重试同一offer。服务端名称生成与真实HTTP契约测试修复已冻结，32项HTTP测试通过，独立审查APPROVE并另跑32项测试通过（9.49秒），be950ce已受管部署并推送，API PID21672/launcher22224及原UI16940健康，授权200/匿名401/UI健康200，调度配置已完整恢复；随后本轮16轮控制器中15个全新Worker名称均通过实际native spawn；最后图片Worker已自然结束，控制器停止补位，未重置预算。正式定时调度也已在新线程01a127aa-74d2-7343-a2a5-2c6199a52c72原样派发第7版素材QC，数据库显示COMPLETED且passed=true。名称交接缺陷已通过实际派发验证，完整成片和真实发布仍待验收。第6版素材QC曾提交超时，当前数据库为CANCELLED且保留passed=true结果，不能把它记成COMPLETED或CONSUMED；第7版QC为独立新任务。当前证据production-cycle-7-progress-proof.json，历史部署证据scheduler-native-name-release-proof.json。
 
 ## 目标与验收边界
 
