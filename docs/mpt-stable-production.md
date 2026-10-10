@@ -1,6 +1,6 @@
 # MoneyPrinterTurbo 稳定生产与运维记录
 
-更新日期：2026-10-10。本文随稳定生产修复提交，最终验收证据以文末记录为准。
+更新日期：2026-10-11。本文随稳定生产修复提交，最终验收证据以文末记录为准。
 
 ## 目标与验收边界
 
@@ -154,3 +154,8 @@ NO_TASK 且无活动 handle 时结束；DISABLED、BLOCKED、HANDOFF_ERROR 停�
 同轮另一个 RECOVERY Worker 已 COMPLETED/CONSUMED，正常创建另一条内容的脚本修复计划。两个当前 Worker 均已终态；控制面下一轮返回契约 2 DISABLED。为修复本地租约识别暂时关闭新派发，代码诊断正在进行；服务和界面保持在线。此处记录的是部署后发现的新运行缺陷，816 项既有绿测未覆盖真实新 Worker 身份的准备命令调用链。
 本地租约缺陷已修复：dispatch 使用一次性 Worker 身份，后续 CLI 恢复启动器基础身份，prepare-image 原先未读取租约身份。现仅接受基础身份或其合法 12 位十六进制派发后缀，继续使用既有精确任务、身份、令牌与文件校验。修改前同路径回归复现 1 failed / 35 passed；修改后四模块联合 172 passed，独立复审 36 passed、APPROVE、0 问题，Ruff、编译与 diff 检查通过。此改动仅影响新 CLI 进程，无需重启 API 或 UI；816 项完整回归属于前一渲染器版本，不能宣称覆盖本次 CLI 改动。正式新 Worker 的图片准备、后续质检与真实发布仍待运行验收。
 00:36 本地租约修复提交 2ee6506edc3f170ca76dffbd70085265c59137b8 已快进主目录并推送 origin/main；CLI 模块路径确认为主目录 packages/agent/src/glance_agent/cli.py。未重启 API/UI，正式调度 enabled=true、max_parallel=2；API 200、UI 200、Windows Watchdog 最近执行结果 0，证明文件 image-lease-release-runtime-proof.json。契约 2 新计划已创建新图片 Worker 与脚本 Worker。新图片 Worker attempt 2 确认租约，真实新原生首图 941×1672 已经 prepare-image 成功 PREPARED 为 1080×1920；后续 7 图、素材质检、正式成片和新发布仍未完成。这是真实生产路径对修复的验证，不代表整个新周期已验收。
+## 新图片提交后的独立审核检查点（尚未完成稳定生产验收）
+
+Jackery 新图片任务 agt_8063b6337aad401c9f81fe39eb6ccfd9 的 attempt 2 已 VALID、COMPLETED / CONSUMED，8 张真实 PNG 均为 1080×1920，原生 941×1672 原件哈希与本机准备方法如实保留。实际定时调度领取独立素材质检 agt_9c30bd154c894f2f98ea9b376ece5a49；该质检返回 passed=false，第 0、2、4 段含冻结要求禁止的端口、插头和具体接线。正常恢复任务 agt_dcaacd10f8cd4eb7b41e229cecd2550a 已领取，须走新素材版本与独立重审，未放行旧图。证据：主目录 storage/smoke/stable-production-20261010/new-cycle-asset-qc-failed-proof.json。
+
+另一条 Eve 内容的独立新 Worker 也实际通过 fresh lease 尺寸准备，5 张原生图已生成，准备与提交仍在进行。脚本辅助审核此前提出遗漏“受训陪护持续近身在场”的 REVISE；当前 MPT 脚本辅助意见只记录建议，配音由脚本质检通过触发，不能把辅助意见记录描述为已阻止配音。最终独立成片验收与高置信度发布审核仍是强制门禁，事实遗漏仍待后续结果核对。当前没有这两条新内容的真实发布记录，不能以旧 IKEA 发布代替本轮验收。
