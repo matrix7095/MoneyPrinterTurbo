@@ -45,6 +45,7 @@ class MptMediaExecutor(MediaExecutor):
         video_path,
         voice_path,
         narration,
+        opening_identity=None,
         plan_data,
         scenes,
         assets=None,
@@ -97,6 +98,7 @@ class MptMediaExecutor(MediaExecutor):
         subtitle_path = self._build_subtitles(
             narration,
             voice_duration,
+            opening_identity=opening_identity,
             boundaries=boundaries,
             concept_intervals=[
                 (segment.narration_start_sec, segment.narration_end_sec)

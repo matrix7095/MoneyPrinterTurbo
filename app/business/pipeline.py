@@ -2634,6 +2634,7 @@ def render_content(engine: Engine, settings: Settings, content_id: str, *, consu
                     plan_task.input_data.get("voice_artifact"),
                 ),
                 "narration": script["full_narration"],
+                "opening_identity": script.get("opening", {}).get("product_identity"),
                 "plan_data": render_plan_data,
                 "scenes": scenes,
                 "assets": artifact_paths,

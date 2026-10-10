@@ -1944,6 +1944,7 @@ class MediaExecutor:
         video_path: Path,
         voice_path: Path,
         narration: str,
+        opening_identity: str | None = None,
         plan_data: dict[str, Any],
         scenes: list[dict[str, Any]],
         assets: dict[str, Path] | None = None,
@@ -2180,6 +2181,7 @@ class MediaExecutor:
         subtitle_path = self._build_subtitles(
             narration,
             voice_duration,
+            opening_identity=opening_identity,
             boundaries=timing_boundaries,
             concept_intervals=[
                 (segment.narration_start_sec, segment.narration_end_sec)
@@ -2439,6 +2441,7 @@ class MediaExecutor:
         narration: str,
         duration: float,
         *,
+        opening_identity: str | None = None,
         boundaries: list[dict[str, Any]] | None = None,
         concept_intervals: list[tuple[float, float]] | None = None,
     ) -> Path:
@@ -2491,6 +2494,40 @@ class MediaExecutor:
                         style="Concept",
                     )
                 )
+        identity = "".join(char if char.isprintable() else " " for char in (opening_identity or "")).strip()
+        if identity and duration > 0:
+            from PIL import ImageFont
+
+            # Fullwidth control glyphs stay visible without becoming ASS overrides or line breaks.
+            identity = identity.translate(str.maketrans({"\\": "＼", "{": "｛", "}": "｝"}))
+            font = ImageFont.truetype(str(FONT_FILES[1]), 48)
+            lines = [""]
+            # CJK characters can wrap; other non-space tokens keep model numbers and accented names intact.
+            for token in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]|[^\s\u3400-\u4dbf\u4e00-\u9fff]+|\s+", identity):
+                if lines[-1] and font.getlength(lines[-1] + token) > 692:
+                    lines.append(token)
+                else:
+                    lines[-1] += token
+            if len(lines) > 12 or any(font.getlength(line) > 692 for line in lines):
+                raise NonRetryableMediaError("Opening product identity is too long for the readable safe area")
+            subs.styles["OpeningIdentity"] = pysubs2.SSAStyle(
+                fontname="Noto Sans SC",
+                fontsize=48,
+                bold=True,
+                primarycolor=pysubs2.Color(255, 255, 255),
+                outlinecolor=pysubs2.Color(0, 0, 0),
+                backcolor=pysubs2.Color(0, 0, 0, 102),
+                borderstyle=3,
+                outline=4,
+                shadow=0,
+                alignment=8,
+                marginl=100,
+                marginr=280,
+                marginv=320,
+            )
+            subs.append(pysubs2.SSAEvent(
+                start=0, end=int(min(8.0, duration) * 100) * 10, text=r"\N".join(lines), style="OpeningIdentity",
+            ))
         subs.save(str(output))
         return output
 
