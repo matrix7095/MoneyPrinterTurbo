@@ -8,9 +8,10 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 from glance_collector.service import CollectionService
 from glance_core.database import begin_immediate, build_engine, create_db
-from glance_core.models import AgentTask, AuditEvent, Source, TaskStatus, TaskType
+from glance_core.models import AgentTask, AgentWorker, AuditEvent, Content, ContentStatus, Source, TaskStatus, TaskType, as_utc
+from glance_core.runtime_config import effective_settings
 from glance_core.settings import Settings
-from glance_core.task_service import AgentTaskService, stable_hash
+from glance_core.task_service import AgentTaskService, TaskConflictError, stable_hash
 from glance_core.workflow import WorkflowService, parse_platform_domains
 from sqlmodel import Session, select
 
@@ -20,12 +21,78 @@ from app.business.quarantine import (
     assert_allowed,
     eligible_task_clause,
     filter_task_reads,
+    deployment_proof,
 )
 
 logger = logging.getLogger(__name__)
 CONSUMED = "mpt_discovery_consumed"
 AGENT_CONSUMED = "mpt_agent_consumed"
 OWNED = "mpt_task_owned"
+FAILURE_RECOVERY = "mpt_failure_recovery_created"
+
+
+def _require_owned_input(session, task, *, consumed=False):
+    assert_allowed(session, task_id=task.id)
+    receipts = session.exec(select(AuditEvent).where(
+        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+        AuditEvent.action == OWNED,
+    )).all()
+    if stable_hash(task.input_data) != task.input_hash or not receipts or any(
+        row.metadata_json.get("input_hash") != task.input_hash for row in receipts
+    ):
+        raise TaskConflictError("RECOVERY_SOURCE_CHANGED_OR_UNOWNED")
+    if consumed:
+        receipts = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+            AuditEvent.action == AGENT_CONSUMED,
+        )).all()
+        if task.status != TaskStatus.COMPLETED or not receipts or any(
+            row.metadata_json.get("result_hash") != stable_hash(task.result_data) for row in receipts
+        ):
+            raise TaskConflictError("RECOVERY_UPSTREAM_NOT_ACCEPTED")
+
+
+def _require_current_revision(session, task):
+    revisions = session.exec(select(AgentTask).where(
+        AgentTask.content_id == task.content_id, AgentTask.task_type == task.task_type,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
+    if task.task_type == TaskType.SCENE_ANALYZE:
+        # Core scene builders version each numbered batch independently.
+        revisions = [row for row in revisions if (row.input_data.get("batch_index") or 1)
+                     == (task.input_data.get("batch_index") or 1)]
+    latest = revisions[0] if revisions else None
+    if latest is None or latest.id != task.id:
+        raise TaskConflictError("RECOVERY_SOURCE_SUPERSEDED")
+
+
+def _failure_hash(task):
+    return stable_hash({"code": task.error_code, "message": task.error_message,
+                        "agent_id": task.assigned_agent_id, "result": task.result_data})
+
+
+def _require_reconciled_content(session, content_id):
+    # Intent keys span revisions/artifacts. A different task may already have clicked.
+    latest = {}
+    for event in session.exec(select(AuditEvent).where(AuditEvent.entity_type == "publish_intent")).all():
+        key = (AgentTaskService._intent_sequence(event), as_utc(event.created_at), event.id)
+        if event.entity_id not in latest or key > latest[event.entity_id][0]:
+            latest[event.entity_id] = (key, event)
+    for _, event in latest.values():
+        data = event.metadata_json
+        if not isinstance(data, dict) or not isinstance(data.get("content_id"), str) or not data["content_id"]:
+            raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+        if data["content_id"] != content_id:
+            continue
+        fields = ("platform", "account_id", "content_id", "video_artifact_id", "video_sha256")
+        if (any(not isinstance(data.get(field), str) for field in fields)
+                or not data["platform"] or not data["account_id"]
+                or not (data["video_artifact_id"] or data["video_sha256"])
+                or data.get("intent_key") != event.entity_id
+                or stable_hash({field: data[field] for field in fields}) != event.entity_id
+                or AgentTaskService._intent_sequence(event) < 0
+                or data.get("status") != "FAILED"):
+            raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
 
 
 def settings_from_config(
@@ -143,6 +210,251 @@ class BusinessRuntime:
             finally:
                 session.rollback()
 
+    def _require_native_deployment(self, session, task):
+        from glance_core.agent_roles import primary_role_for
+        from app.business.requests import DeploymentReportRequest
+        from app.business.scheduler import deployment_files
+        from app.business.bundles import sha256_file
+
+        proof = deployment_proof(session, task.assigned_agent_id or "")
+        worker = session.get(AgentWorker, proof.entity_id) if proof else None
+        if worker is None or not worker.deployment_verified_at or worker.role_id != primary_role_for(task.task_type).value:
+            raise TaskConflictError("RECOVERY_DEPLOYMENT_UNVERIFIED")
+        try:
+            launcher, _, _ = deployment_files(self, DeploymentReportRequest(
+                agent_id=worker.agent_id, role_id=worker.role_id, launcher_path=worker.launcher_path,
+                skill={"name": worker.skill_name, "path": proof.metadata_json["skill_path"],
+                       "content_hash": worker.skill_content_hash}, protocol_version=worker.protocol_version,
+            ))
+            if (not proof.metadata_json.get("device_label")
+                    or sha256_file(launcher) != proof.metadata_json["launcher_sha256"]
+                    or sha256_file(launcher.with_suffix(".json")) != proof.metadata_json["manifest_sha256"]):
+                raise ValueError("Deployment changed")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise TaskConflictError("RECOVERY_DEPLOYMENT_CHANGED") from None
+
+    def _failure_source(self, session, task_id):
+        task = session.get(AgentTask, task_id)
+        if task is None:
+            raise KeyError(task_id)
+        _require_owned_input(session, task)
+        if task.status != TaskStatus.FAILED or task.task_type == TaskType.RECOVERY:
+            raise TaskConflictError("RECOVERY_REQUIRES_TERMINAL_SOURCE_FAILURE")
+        if task.task_type not in self.supported_task_types:
+            raise TaskConflictError("RECOVERY_CONSUMER_UNAVAILABLE")
+        failure = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+            AuditEvent.action == "failed",
+        ).order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())).first()
+        if (failure is None or failure.actor_type != "agent" or task.attempt < 1
+                or failure.actor_id != task.assigned_agent_id
+                or failure.metadata_json.get("late_report")
+                or failure.metadata_json.get("next_status") != TaskStatus.FAILED.value
+                or failure.metadata_json.get("error_code") != task.error_code
+                or failure.metadata_json.get("message") != (task.error_message or "")[:200]):
+            raise TaskConflictError("RECOVERY_FAILURE_EVIDENCE_MISSING")
+        self._require_native_deployment(session, task)
+        content = session.get(Content, task.content_id) if task.content_id else None
+        if task.content_id and (content is None or content.business_status in {
+            ContentStatus.ARCHIVED, ContentStatus.PUBLISHED, ContentStatus.REJECTED,
+        }):
+            raise TaskConflictError("RECOVERY_CONTENT_NOT_CURRENT")
+        if task.task_type == TaskType.DOUYIN_PUBLISH and self.task_service(session).publish_intent_for_task(task):
+            raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+        if task.content_id:
+            _require_reconciled_content(session, task.content_id)
+            _require_current_revision(session, task)
+        upstream_types = {"research": TaskType.CONTENT_RESEARCH, "script": TaskType.SHORT_SCRIPT,
+                          "script_qc": TaskType.SCRIPT_QC, "visual_plan": TaskType.VISUAL_PLAN,
+                          "visual_plan_qc": TaskType.VISUAL_PLAN_QC, "scene_analysis": TaskType.SCENE_ANALYZE,
+                          "asset_generate_image": TaskType.ASSET_GENERATE_IMAGE,
+                          "content_qc": TaskType.CONTENT_QC, "publish_prepare": TaskType.PUBLISH_PREPARE}
+        for name, reference in (task.input_data.get("upstream_task_ids") or {}).items():
+            if name not in upstream_types:
+                continue  # Historical previous_plan and Artifact references are not current task parents.
+            refs = reference if name == "scene_analysis" and isinstance(reference, list) else [reference]
+            if not refs or any(not isinstance(ref, str) or not ref for ref in refs):
+                raise TaskConflictError("RECOVERY_UPSTREAM_NOT_ACCEPTED")
+            for upstream_id in refs:
+                upstream = session.get(AgentTask, upstream_id)
+                if upstream is None or upstream.content_id != task.content_id or upstream.task_type != upstream_types[name]:
+                    raise TaskConflictError("RECOVERY_UPSTREAM_NOT_ACCEPTED")
+                _require_owned_input(session, upstream, consumed=True)
+                _require_current_revision(session, upstream)
+        return task, failure.metadata_json.get("retryable") is True
+
+    def _failure_visual_target(self, session, flow, task):
+        from app.business.pipeline import _current_visual_plan_for_asset_task
+
+        plan = _current_visual_plan_for_asset_task(session, flow, task)
+        script = flow.completed_task_for(task.content_id or "", TaskType.SHORT_SCRIPT)
+        if plan is None or script is None:
+            raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
+        _require_owned_input(session, plan, consumed=True)
+        _require_owned_input(session, script, consumed=True)
+        _require_current_revision(session, plan)
+        _require_current_revision(session, script)
+        declared = task.input_data.get("upstream_task_ids") or {}
+        frozen_plan = task.input_data.get("visual_plan")
+        requests = [{"segment_index": index, "asset_request": segment["asset_request"]}
+                    for index, segment in enumerate(plan.result_data.get("segments", []))
+                    if segment.get("asset_request")]
+        actual = [{"segment_index": item.get("segment_index"), "asset_request": item.get("asset_request")}
+                  for item in task.input_data.get("requests", [])]
+        if (plan.input_data.get("upstream_task_ids", {}).get("script") != script.id
+                or task.input_data.get("script") != script.result_data
+                or actual != requests or not requests
+                or (frozen_plan is not None and frozen_plan != plan.result_data)
+                or (not declared.get("visual_plan") and frozen_plan is None)):
+            raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
+        return plan
+
+    def schedule_failure_recovery(self, task_id):
+        from app.business.pipeline import workflow
+
+        with Session(self.engine) as session:
+            task = session.get(AgentTask, task_id)
+            if task is None:
+                raise KeyError(task_id)
+            key = task.content_id or task.id
+        with content_operation_lock(self.settings, key):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    task, retryable = self._failure_source(session, task_id)
+                    current = effective_settings(session, self.settings)
+                    flow = workflow(session, current)
+                    flow.tasks = self.task_service(session)
+                    existing = session.exec(select(AgentTask).where(
+                        AgentTask.task_type == TaskType.RECOVERY,
+                    )).all()
+                    for recovery in existing:
+                        failure = recovery.input_data.get("failure") or {}
+                        if failure.get("source_task_id") == task.id and failure.get("source_attempt") == task.attempt:
+                            _require_owned_input(session, recovery)
+                            if failure.get("code") != task.error_code:
+                                raise TaskConflictError("RECOVERY_FAILURE_CHANGED")
+                            return {"recovery_status": recovery.status.value, "recovery_task_id": recovery.id}
+                    if task.content_id and session.exec(select(AgentTask.id).where(
+                        AgentTask.content_id == task.content_id,
+                        AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+                    )).first():
+                        raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+                    target = None
+                    if task.task_type == TaskType.ASSET_GENERATE_IMAGE:
+                        target = self._failure_visual_target(session, flow, task)
+                    owned = select(AuditEvent.entity_id).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.action == OWNED,
+                        AuditEvent.metadata_json["input_hash"].as_string() == AgentTask.input_hash,
+                    )
+                    with filter_task_reads(session, eligible_task_clause() & (
+                        (AgentTask.task_type != TaskType.RECOVERY) | AgentTask.id.in_(owned)
+                    )):
+                        recovery = flow.create_recovery_task(
+                            task, code=task.error_code, message=task.error_message, retryable=retryable,
+                            failure_class="BUSINESS_QC" if target is not None and task.error_code
+                            == "GENERATED_IMAGE_CONSTRAINT_MISMATCH" else None,
+                            repair_target_task_id=target.id if target is not None and task.error_code
+                            == "GENERATED_IMAGE_CONSTRAINT_MISMATCH" else None,
+                            actor_id="mpt-agent-failure",
+                        )
+                    if recovery is not None:
+                        if recovery.id in {row.id for row in existing}:
+                            _require_owned_input(session, recovery)
+                        else:
+                            session.add(AuditEvent(
+                                actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                entity_id=recovery.id, action=OWNED, metadata_json={"input_hash": recovery.input_hash},
+                            ))
+                            session.add(AuditEvent(
+                                actor_type="system", actor_id="mpt-agent-failure", entity_type="agent_task",
+                                entity_id=recovery.id, action=FAILURE_RECOVERY,
+                                metadata_json={"source_task_id": task.id, "source_input_hash": task.input_hash,
+                                               "source_attempt": task.attempt, "source_failure_hash": _failure_hash(task),
+                                               "recovery_input_hash": recovery.input_hash,
+                                               "target_hashes": {parent.id: {"input": parent.input_hash,
+                                                                           "result": stable_hash(parent.result_data)}
+                                                                 for parent in (target, flow.completed_task_for(
+                                                                     task.content_id, TaskType.SHORT_SCRIPT))}
+                                               if target is not None else {}},
+                            ))
+                    Session.commit(session)
+                    return {"recovery_status": recovery.status.value if recovery else
+                            "DEFERRED" if flow.recovery_capacity_deferred else "BLOCKED",
+                            "recovery_task_id": recovery.id if recovery else None}
+                finally:
+                    session.rollback()
+
+    def _failure_recovery_needs_apply(self, session, recovery):
+        receipt = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == FAILURE_RECOVERY,
+        )).first()
+        if receipt is None:
+            source = session.get(AgentTask, (recovery.input_data.get("failure") or {}).get("source_task_id"))
+            origin = session.exec(select(AuditEvent.id).where(
+                AuditEvent.entity_id == recovery.id, AuditEvent.action == "recovery_task_created",
+                AuditEvent.actor_id == "mpt-agent-failure",
+            )).first()
+            if origin or (source is not None and source.status == TaskStatus.FAILED):
+                raise TaskConflictError("RECOVERY_FAILURE_RECEIPT_MISSING")
+            return True  # Existing QC-origin Recovery keeps its portable consumer contract.
+        _require_owned_input(session, recovery)
+        self._require_native_deployment(session, recovery)
+        source = session.get(AgentTask, receipt.metadata_json.get("source_task_id"))
+        if source is None:
+            raise TaskConflictError("RECOVERY_SOURCE_MISSING")
+        _require_owned_input(session, source)
+        if (source.input_hash != receipt.metadata_json.get("source_input_hash")
+                or source.attempt != receipt.metadata_json.get("source_attempt")
+                or _failure_hash(source) != receipt.metadata_json.get("source_failure_hash")
+                or recovery.input_hash != receipt.metadata_json.get("recovery_input_hash")
+                or (recovery.input_data.get("failure") or {}).get("source_task_id") != source.id
+                or recovery.content_id != source.content_id):
+            raise TaskConflictError("RECOVERY_SOURCE_CHANGED")
+        _require_reconciled_content(session, source.content_id)
+        for target_id, hashes in receipt.metadata_json.get("target_hashes", {}).items():
+            target = session.get(AgentTask, target_id)
+            if target is None:
+                raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
+            _require_owned_input(session, target)
+            accepted = session.exec(select(AuditEvent).where(
+                AuditEvent.action == AGENT_CONSUMED, AuditEvent.entity_id == target.id,
+            )).all()
+            if target.input_hash != hashes["input"] or stable_hash(target.result_data) != hashes["result"]:
+                raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
+            if not accepted or any(event.metadata_json.get("result_hash") != hashes["result"] for event in accepted):
+                raise TaskConflictError("RECOVERY_UPSTREAM_NOT_ACCEPTED")
+        # A marker-write failure must not repeat an already executed portable action.
+        retried = session.exec(select(AuditEvent.id).where(
+            AuditEvent.action == "recovery_same_task_retried", AuditEvent.entity_id == source.id,
+            AuditEvent.metadata_json["recovery_task_id"].as_string() == recovery.id,
+        )).first()
+        children = session.exec(select(AgentTask).where(
+            AgentTask.content_id == recovery.content_id,
+            AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
+        )).all()
+        if retried or children:
+            if any(stable_hash(child.input_data) != child.input_hash for child in children):
+                raise TaskConflictError("RECOVERY_REPAIR_INPUT_CHANGED")
+            return False
+        source, _ = self._failure_source(session, source.id)
+        if session.exec(select(AgentTask.id).where(
+            AgentTask.content_id == recovery.content_id, AgentTask.id != recovery.id,
+            AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+        )).first():
+            raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+        if source.task_type == TaskType.ASSET_GENERATE_IMAGE:
+            flow = self.workflow_service(session)
+            target = self._failure_visual_target(session, flow, source)
+            lineage = recovery.input_data.get("lineage") or {}
+            if source.error_code == "GENERATED_IMAGE_CONSTRAINT_MISMATCH" and (
+                lineage.get("repair_target_task_id") != target.id
+                or recovery.input_data.get("failure", {}).get("failure_class") != "BUSINESS_QC"
+            ):
+                raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
+        return True
+
     def consume_agent(self, task_id: str, *, lock_timeout_seconds: float = 30) -> bool:
         with Session(self.engine) as session:
             assert_allowed(session, task_id=task_id)
@@ -187,7 +499,8 @@ class BusinessRuntime:
                     if marker.metadata_json.get("result_hash") != digest:
                         raise ValueError("Consumed Agent result changed")
                     return False
-            action = pipeline.advance_after_agent(self.engine, self.settings, task_id)
+                needs_apply = kind != TaskType.RECOVERY or self._failure_recovery_needs_apply(session, task)
+            action = pipeline.advance_after_agent(self.engine, self.settings, task_id) if needs_apply else None
             operations = {
                 "voice": pipeline.approve_script,
                 "render": pipeline.render_content,

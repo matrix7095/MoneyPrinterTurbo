@@ -74,6 +74,15 @@ and publication time, recheck its visible platform status, and upload that
 specific screenshot as an Artifact. Missing or ambiguous evidence remains
 UNKNOWN and never permits another upload or final click.
 
+A read-only comparison with the original Glance publication table matched its
+latest external ID to that configured account. All four nonempty historical
+source IDs appear in this observed manager response. The fifth source record,
+dated 2026-08-17, has neither an external ID nor a URL and has not received fresh
+external verification. The comparison and missing-evidence record are saved as
+`account-binding-proof.json` and `historical-unmatched-record.json` beside the
+preflight evidence. No source record
+was changed, and a database PUBLISHED status alone is not external proof.
+
 After that actual preflight, fresh launchers were staged under
 `storage/agent-launcher-staging/publish-preflight-20261010/` with the five
 demonstrated publish capabilities. Registration authenticated the publish role
@@ -95,9 +104,13 @@ second image attempt retained ten native 941 by 1672 outputs and three enlarged
 segments still failed the frozen matching-stool geometry requirements, so the
 task was truthfully failed with `GENERATED_IMAGE_CONSTRAINT_MISMATCH` and
 `retryable=false`. No generated image Artifact was uploaded and no result was
-submitted. Evidence is in the task's staged workspace
-`generation-provenance.json`. The missing terminal-failure recovery handoff is
-being repaired; the image constraints have not been silently weakened.
+submitted. The terminal fail cleaned its temporary task workspace. Evidence was
+recovered from the original tool records into the durable directory
+`storage/smoke/native-image-constraint-failure-20261010/`: ten raw files and exact
+prompts were preserved, and all three recreated enlargement hashes match their
+original records. The missing terminal-failure recovery handoff has passed
+isolated acceptance; live recovery is still pending. The image constraints
+have not been silently weakened.
 Asset/final QC, rendering, publish review, real external publication ID/URL
 and screenshot evidence remain required.
 
@@ -123,3 +136,28 @@ full Python 3.12 business suite passed 343 in 186.21 seconds, recorded in
 `storage/business-launcher-endpoint-final-20261010.log`. Proxy evidence is
 `storage/endpoint-independent-proxy-fixed-proof.json`. These checks did not
 contact production or trigger a publish.
+
+## Accepted terminal-failure recovery
+
+The fail hook preserves the committed failure and separately admits a core
+Recovery task. An authenticated admin retry uses the same admission path for
+failures recorded before this hook existed. Creation and consumption require
+current owned frozen inputs, accepted parent receipts, unchanged native
+deployment, current revisions and reconciled content publication intents.
+Queued replacements and UNKNOWN or malformed publication intents block repair.
+Image constraint failure can target a new visual-plan revision only when the
+full frozen script, plan and requests bind to the current accepted lineage.
+The original failure and accepted script/voice are preserved.
+
+All 58 new tests passed on Python 3.11, 3.12 and 3.13. Independent acceptance
+passed 109 tests plus five isolated runtime adversarial cases; source hashes
+still match the reviewed files. The tests exercised assistant HTTP completion
+through core visual repair, marker-write replay, concurrent retries, rollback,
+ordinary QC recovery after an earlier transient failure, and scene-analysis
+lists with separate batch revisions. Ruff, AST and diff checks passed.
+Root's fresh full Python 3.12 business suite passed 401 in 207.01 seconds;
+the log is `storage/business-failure-recovery-final-20261010.log`.
+Evidence is in `storage/failure-recovery-independent-final.log`,
+`storage/failure-recovery-independent-adversarial-proof.json` and
+`storage/failure-recovery-independent-source-hashes.json`. These were isolated
+checks; they did not mutate live services or establish publication success.

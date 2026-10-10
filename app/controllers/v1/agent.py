@@ -40,7 +40,7 @@ from app.business.bundles import (
     scene_evidence_context,
     sha256_file,
 )
-from app.business.auth import bearer_token, require_agent
+from app.business.auth import bearer_token, require_admin, require_agent
 from app.business.requests import (
     ClaimRequest,
     DispatchRequest,
@@ -581,6 +581,7 @@ def fail(
     *,
     task_id: str,
     payload: FailRequest,
+    request: Request,
     authorization: str | None = Header(default=None),
     service: Annotated[AgentTaskService, Depends(task_service)],
 ):
@@ -598,7 +599,27 @@ def fail(
         raise HTTPException(status_code=404, detail="Task not found") from None
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    return {"status": task.status, "task_id": task.id}
+    recovery = {"recovery_status": "NOT_REQUIRED", "recovery_task_id": None}
+    if task.status == TaskStatus.FAILED:
+        try:
+            recovery = get_runtime(request).schedule_failure_recovery(task.id)
+        except Exception:
+            # The accepted failure remains committed if recovery cannot be admitted yet.
+            logger.exception("Terminal Agent failure pending recovery: %s", task.id)
+            recovery["recovery_status"] = "PENDING"
+    return {"status": task.status, "task_id": task.id, **recovery}
+
+
+@router.post("/agent/tasks/{task_id}/retry-recovery", dependencies=[Depends(require_admin)])
+def retry_failure_recovery(*, task_id: str, request: Request):
+    try:
+        return get_runtime(request).schedule_failure_recovery(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found") from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except RuntimeSettingsError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
 def content_root(content: Content, runtime) -> Path:
