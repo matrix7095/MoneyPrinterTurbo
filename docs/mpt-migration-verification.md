@@ -6,7 +6,7 @@ loopback port 8510. See [the final cutover evidence](#actual-publication-and-pro
 The earlier sections below preserve the isolated checkpoints in chronological
 order; their original process IDs and pre-publication observations are historical,
 not the current production state. The old Glance service and old worktree UI
-have been stopped; both existing app automations remain PAUSED.
+have been stopped. Both existing app automations are now ACTIVE, using the stable production launcher and managed runtime recovery. See [the stable production record](mpt-stable-production.md) for current status; the earlier PAUSED observations below are historical.
 
 ## Code and isolated data checks
 
@@ -489,3 +489,7 @@ $env:MPT_BUSINESS_ADMIN_TOKEN_FILE = "$PWD/storage/business-8000/data/private/ru
 
 This is a foreground UI process, not a Windows startup service; keep its owning
 terminal/session running. Do not restore the old Glance watchdog for the new UI.
+
+## Managed runtime follow-up, 2026-10-10
+
+Commit `83bb3cf` replaced the foreground-only runtime with owned API and WebUI launchers plus the installed `MPT Runtime Watchdog` minute/login task. Actual task runs returned 0 and retained healthy process identities. Seven native roles passed selftests. The existing 10-minute scheduler and daily 08:00 operations automations are ACTIVE. Full business regression passed 755 tests. A fresh production cycle remains under verification; this follow-up does not claim that cycle or its next publication has passed.
