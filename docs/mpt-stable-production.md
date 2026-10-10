@@ -11,17 +11,19 @@
 | 要求 | 实际证据 | 状态 |
 | --- | --- | --- |
 | 主目录生产API和新界面 | API PID3592的app-dir、UI PID16940的Main.py均指向主目录；授权API200、匿名401、UI健康200 | 通过 |
-| 守护与正式调度 | Watchdog最近执行结果0；正式调度enabled=true、max_parallel=2；实际定时聊天正在等原视觉计划Worker | 通过当前运行检查 |
+| 守护与正式调度 | Watchdog最近执行结果0；为身份叠加合同修复临时enabled=false，max_parallel=2及其他配置保留；正在排空现有Worker | 维护中，部署后须恢复 |
 | 修复代码与独立验证 | 已部署f97c6f5；pipeline SHA与冻结审查一致；944项完整业务回归通过，独立复审APPROVE | 通过 |
 | 正确提交与文档 | 主目录干净，提交已快进并推送origin/main；本文与证明文件对应 | 通过当前提交检查 |
 | 第5版脚本修复 | 正常SHORT_SCRIPT已COMPLETED；SCRIPT_QC passed=true；SCRIPT_REVIEW_ASSIST APPROVE/high，仅节奏warning | 通过脚本阶段 |
-| 第5版视觉与新成片 | VISUAL_PLAN agt_008d08637c9046eebca5100f66c4c0b8实际LEASED；后续须独立验收 | 进行中 |
+| 第5版视觉与新成片 | VISUAL_PLAN已完成，独立QC因身份叠加能力未声明返回非通过；正常Recovery已送回后续修订，不能沿用旧通过结果 | 未通过，合同修复中 |
 | 完整影音审核能力 | 无已启用、已实测的完整媒体理解Provider；Gemini仅是待授权实测入口 | 未通过 |
 | 新视频真实发布 | 最新真实ID仍为旧作品7695010253280234779；本轮没有新PUBLISHED和外部ID | 未通过 |
 | 后续无人值守授权 | 未来尺寸准备授权及Gemini外部上传授权仍待明确答复；本轮授权不可擅自扩大 | 未完成 |
 | 后续稳定生产结论 | 必须补齐媒体能力、正常新成片质检及真实发布，再确认日常自动化范围 | 未完成 |
 
 6秒合成能力探针的本地自检也已完成：实际解码画面在3秒前后从红转蓝，白方块持续右移；音轨1.5秒约440Hz、4.5秒约880Hz，其余校验时间点静音。证明为主目录稳定生产证据目录 `av-capability-probe-validation.json`，用于后续盲测对照；尚未向Gemini上传或验证其理解能力。
+
+当前维护操作：独立代码与冻结任务诊断确认MPT渲染器已经通过OpeningIdentity ASS层显示已审script.opening.product_identity，范围0至min(8秒,实际时长)；但实际VISUAL_PLAN、QC与Recovery合同只声明了Concept标签，导致合法中文类别口播又被要求恢复品牌读音。身份层只包含正式身份，不自动拼接类别或陪护条件，后二者仍由实际旁白字幕承载。旧QC非通过和Recovery结果原样保留，证据 `opening-overlay-before-contract-repair-proof.json`。共享合同修复正在Stable工作树实施，尚未批准或部署。调度原配置保存在 `scheduler-before-opening-contract-repair.json`，修复验收、受管部署后必须恢复原enabled=true并实查；API和UI继续健康运行，未停止在执行的Worker。
 
 ## 目标与验收边界
 
