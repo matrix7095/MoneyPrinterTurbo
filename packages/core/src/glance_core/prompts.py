@@ -299,6 +299,7 @@ def resolve_instructions(
     *,
     handsfree: bool | None = None,
     schema_version: str = "1",
+    base_settings: Settings | None = None,
 ) -> str:
     """当前有效指令：共同身份规则，并按模式叠加无人值守规则。"""
     row = session.get(TaskPrompt, task_type.value)
@@ -315,7 +316,7 @@ def resolve_instructions(
         boundary = "发布" if task_type == TaskType.DOUYIN_PUBLISH else "图片"
         template += f"\n## 固定{boundary}执行边界：以下规则覆盖自定义提示词中冲突的执行方式\n"
         template += TASK_INSTRUCTIONS[task_type]
-    current = effective_settings(session, Settings())
+    current = effective_settings(session, base_settings if base_settings is not None else Settings())
     use_handsfree = current.handsfree_enabled if handsfree is None else handsfree
     if use_handsfree:
         template += _HANDSFREE_INSTRUCTIONS.get(task_type, "")

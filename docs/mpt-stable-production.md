@@ -189,3 +189,16 @@ Jackery 新图片任务 `agt_de827b376abc40b9af7a5689bb7dc115` 已完成并消�
 Eve 的正常恢复任务 `agt_89ca4a9ad0d148cb9ee518f3d3202c07` 已应用并产生新脚本 `agt_ef052b54c0bf4aeb8a596777735eeb00`。独立脚本质检 `agt_074a92d1e05a4594bf4c5acbbc43968a` 发现当前合同禁止观众字段使用条件，与研究和脚本审核要求明确持续近身受训陪护相冲突，开场场景价值兑现也不足。第三轮恢复 `agt_61e21b2292344ee2a9ac2d3dd61560cc` 按三轮预算阻断，内容当前 SCRIPT_REVIEW/recovery_blocked。保留研究事实、旧任务和恢复预算，不直接修改状态或批准脚本。
 
 最新真实发布记录仍为 IKEA 作品 `7695010253280234779`，不能用它代替上述新周期的最终验收。当前业务阻塞快照为主目录 `storage/smoke/stable-production-20261010/new-cycle-current-blockers-proof.json`。后续日常 AI 概念图尺寸准备的长期授权仍未收到明确答复；当前周期授权不会自动扩展为永久授权。
+
+
+主线程进一步验证了现有业务工作台播放路径：选择 Jackery、读取冻结 final_video，播放器使用既有 Streamlit HTTP media URL（不包含令牌），从0播放到39秒，ended=true、readyState=4；HTTP视频字节 SHA256 与冻结的 c73cd2515d0cd18d83c8976e11d2f1d727b850d8f98aca558c13e91fec69a7e6 一致。证明和截图为同证据目录 `current-final-video-existing-player-proof.json`、`current-final-video-existing-player.png`。这只证明加载及播放能力，不能替代独立完整画面审核或真实听回，未据此改写失败 QC。内容下拉切换后的旧详情只在 Streamlit 重跑期间短暂保留，最终已显示同一 Jackery 内容与成片；未因瞬态添加缓存修复。
+
+Eve 的冲突已定位到提示词配置上下文：已有 Handsfree 必要适用条件共享覆盖规则，但 MPT workflow/bundle 调用的 resolve_instructions 使用默认 Settings()，丢失生产启动的 Handsfree=true，而数据库没有显式覆盖行。显式传 Handsfree=true 时该规则出现，当前实际 served_prompt_hash 与缺规则版本匹配。正在修复启动 baseSettings 透传，保持数据库设置覆盖优先，覆盖任务创建、真实 bundle 和 Recovery current_contract；修复完成与新周期通过仍需后续独立验证。
+
+
+配置补丁已完成独立复审：APPROVE，0 未修复问题。首次审查发现 Collector 的 WorkflowService 构造和 SOURCE_DISCOVERY 直接解析未传启动配置；两处现已补齐，新增8项真实HTTP来源发现场景，加上原16项，共24项配置矩阵。最终六模块285 passed / 55.83秒；复审独立配置矩阵与播放器指令共25 passed / 10.47秒，九个Python文件Ruff、AST、diff检查通过。配置、显式发布策略和完整动态/音频质检门槛保持。当前补丁冻结，完整test/business重新运行中；此前因漏点中断的完整测试不能视为通过。为了切换配置修复，正式Agent调度暂设enabled=false，并保留max_parallel=2；API与UI继续运行。验收和部署后须恢复原调度开关并重新检查。
+
+
+最终冻结补丁的完整业务回归已完成：944 passed / 424.35 秒，0 failed，3819 条既有依赖弃用警告，进程exit0。日志为稳定工作树 `.artifacts/business-tests-prompt-settings-final.log`。该结果覆盖原919项及新增24项真实HTTP配置合同矩阵、1项媒体审核指引合同。此次修复不修改既有事实边界、历史冻结任务、恢复预算或质检通过状态；将在主目录部署后通过正规reject-script生成新脚本修订。
+
+本轮Root原生调度在四个Worker终态后，第6轮因调用了不存在的mpt-codex-scheduler.ps1而按HANDOFF_ERROR停止，未重复交接或提交业务结果；实际通用控制启动器为现存mpt-codex.ps1。下一次控制运行应从该启动器scheduler-plan --scheduler-id mpt-codex --contract-version 2开始，不复用旧offer。

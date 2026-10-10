@@ -386,8 +386,10 @@ class WorkflowService:
         recovery_same_task_retries: int = 1,
         recovery_unknown_attempts: int = 1,
         recovery_max_parallel: int = 1,
+        base_settings: Settings | None = None,
     ) -> None:
         self.session = session
+        self.base_settings = base_settings
         self.data_dir = data_dir
         self.tasks = AgentTaskService(session, submission_root, lease_minutes)
         self.recovery_enabled = bool(recovery_enabled)
@@ -651,7 +653,7 @@ class WorkflowService:
         return self.tasks.create_task(
             task_type=TaskType.CANDIDATE_ENRICH,
             content_id=None,
-            instructions=resolve_instructions(self.session, TaskType.CANDIDATE_ENRICH),
+            instructions=resolve_instructions(self.session, TaskType.CANDIDATE_ENRICH, base_settings=self.base_settings),
             input_data={"items": items},
             priority=int(max(signal.heat_score if signal else 0 for _, signal in picked_rows)),
             schema_version="2",
@@ -694,7 +696,7 @@ class WorkflowService:
         from glance_core.content_acceptance import candidate_source_context
         from glance_core.runtime_config import effective_settings
 
-        policy = effective_settings(self.session, settings or Settings())
+        policy = effective_settings(self.session, settings or self.base_settings or Settings())
         handsfree = policy.handsfree_enabled
         for candidate, signal in rows:
             context = candidate_source_context(self.session, candidate) if handsfree else None
@@ -719,7 +721,7 @@ class WorkflowService:
         return self.tasks.create_task(
             task_type=TaskType.CANDIDATE_ASSIST,
             content_id=None,
-            instructions=resolve_instructions(self.session, TaskType.CANDIDATE_ASSIST),
+            instructions=resolve_instructions(self.session, TaskType.CANDIDATE_ASSIST, base_settings=self.base_settings),
             input_data={
                 "items": items,
                 **(self.image_generation_inputs(policy) if handsfree else {}),
@@ -1117,7 +1119,8 @@ class WorkflowService:
             task_type=task_type,
             content_id=content_id,
             instructions=resolve_instructions(
-                self.session, task_type, handsfree=handsfree, schema_version=schema_version
+                self.session, task_type, handsfree=handsfree, schema_version=schema_version,
+                base_settings=self.base_settings,
             ),
             input_data=input_data,
             priority=priority,
@@ -1165,7 +1168,7 @@ class WorkflowService:
         if content.production_mode == ProductionMode.IMAGE_ONLY:
             from glance_core.runtime_config import effective_settings
 
-            policy = effective_settings(self.session, settings or Settings())
+            policy = effective_settings(self.session, settings or self.base_settings or Settings())
             inputs.update(self.image_generation_inputs(policy))
         return inputs
 
@@ -2090,7 +2093,7 @@ class WorkflowService:
         recovery = self.tasks.create_task(
             task_type=TaskType.RECOVERY,
             content_id=source_task.content_id,
-            instructions=resolve_instructions(self.session, TaskType.RECOVERY),
+            instructions=resolve_instructions(self.session, TaskType.RECOVERY, base_settings=self.base_settings),
             input_data=input_data,
             priority=60,
         )
@@ -3063,7 +3066,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=TaskType.SHORT_SCRIPT,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, TaskType.SHORT_SCRIPT),
+            instructions=resolve_instructions(self.session, TaskType.SHORT_SCRIPT, base_settings=self.base_settings),
             input_data=input_data,
             priority=52,
         )
@@ -3140,7 +3143,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=TaskType.SCRIPT_REVIEW_ASSIST,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, TaskType.SCRIPT_REVIEW_ASSIST),
+            instructions=resolve_instructions(self.session, TaskType.SCRIPT_REVIEW_ASSIST, base_settings=self.base_settings),
             input_data=input_data,
             priority=50,
         )
@@ -3646,7 +3649,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=TaskType.DOUYIN_PUBLISH,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, TaskType.DOUYIN_PUBLISH),
+            instructions=resolve_instructions(self.session, TaskType.DOUYIN_PUBLISH, base_settings=self.base_settings),
             input_data=input_data,
             priority=70,
         )
@@ -3705,7 +3708,7 @@ class WorkflowService:
             "transcript": transcript,
             "production_mode": content.production_mode.value,
             **(
-                self.image_generation_inputs(effective_settings(self.session, Settings()))
+                self.image_generation_inputs(effective_settings(self.session, self.base_settings or Settings()))
                 if content.production_mode == ProductionMode.IMAGE_ONLY
                 else {}
             ),
@@ -3855,7 +3858,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=repair_type,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, repair_type),
+            instructions=resolve_instructions(self.session, repair_type, base_settings=self.base_settings),
             input_data=input_data,
             priority=52,
         )
@@ -4455,7 +4458,7 @@ class WorkflowService:
         try:
             reroute = self.tasks.create_task(
                 task_type=TaskType.SOURCE_DISCOVERY,
-                instructions=resolve_instructions(self.session, TaskType.SOURCE_DISCOVERY),
+                instructions=resolve_instructions(self.session, TaskType.SOURCE_DISCOVERY, base_settings=self.base_settings),
                 input_data={
                     **data,
                     "direction_key": direction_key,

@@ -392,6 +392,7 @@ def build_bundle(
         task.task_type,
         handsfree=handsfree_publish,
         schema_version=task.schema_version,
+        base_settings=flow.base_settings,
     )
     bundle_input = dict(task.input_data)
     if task.task_type == TaskType.RECOVERY:
@@ -416,6 +417,7 @@ def build_bundle(
                     session,
                     source.task_type,
                     schema_version=source.schema_version,
+                    base_settings=flow.base_settings,
                     handsfree=_is_handsfree_publish_policy(
                         source.input_data.get("publish_policy")
                     )

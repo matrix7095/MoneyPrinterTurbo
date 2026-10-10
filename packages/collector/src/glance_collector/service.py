@@ -284,6 +284,7 @@ class CollectionService:
         self.settings = settings
         self.workflow = WorkflowService(
             session,
+            base_settings=settings,
             data_dir=settings.data_dir,
             submission_root=settings.agent_submission_dir,
             lease_minutes=settings.agent_lease_minutes,
@@ -537,7 +538,9 @@ class CollectionService:
         try:
             self.workflow.tasks.create_task(
                 task_type=TaskType.SOURCE_DISCOVERY,
-                instructions=resolve_instructions(self.session, TaskType.SOURCE_DISCOVERY),
+                instructions=resolve_instructions(
+                    self.session, TaskType.SOURCE_DISCOVERY, base_settings=self.settings
+                ),
                 input_data={
                     "source_id": source.id,
                     "collection_run_id": collection_run_id,
