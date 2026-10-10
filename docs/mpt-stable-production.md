@@ -10,8 +10,8 @@
 
 | 要求 | 实际证据 | 状态 |
 | --- | --- | --- |
-| 主目录生产API和新界面 | API PID15460的app-dir、UI PID16940的Main.py均指向主目录；授权API200、匿名401、UI健康200 | 通过 |
-| 守护与正式调度 | Watchdog最近执行结果0；身份叠加修复已部署；名称交接修复维护中enabled=false，max_parallel=2及其他配置保留、LEASED=0 | 部署后须再次恢复 |
+| 主目录生产API和新界面 | API PID21672的app-dir、UI PID16940的Main.py均指向主目录；授权API200、匿名401、UI健康200 | 通过 |
+| 守护与正式调度 | Watchdog最近执行结果0；身份叠加与名称交接修复均已部署，已再次恢复enabled=true、max_parallel=2，其他配置与维护前一致 | 通过运行配置检查 |
 | 修复代码与独立验证 | 已部署f8f747e；pipeline SHA与冻结审查一致；971项完整业务回归通过，独立审查APPROVE及53项独立测试通过 | 通过 |
 | 正确提交与文档 | 主目录干净，提交已快进并推送origin/main；本文与证明文件对应 | 通过当前提交检查 |
 | 第5版脚本修复 | 正常SHORT_SCRIPT已COMPLETED；SCRIPT_QC passed=true；SCRIPT_REVIEW_ASSIST APPROVE/high，仅节奏warning | 通过脚本阶段 |
@@ -25,7 +25,7 @@
 
 当前维护操作：独立代码与冻结任务诊断确认MPT渲染器已经通过OpeningIdentity ASS层显示已审script.opening.product_identity，范围0至min(8秒,实际时长)；但实际VISUAL_PLAN、QC与Recovery合同只声明了Concept标签，导致合法中文类别口播又被要求恢复品牌读音。身份层只包含正式身份，不自动拼接类别或陪护条件，后二者仍由实际旁白字幕承载。旧QC非通过和Recovery结果原样保留，证据 `opening-overlay-before-contract-repair-proof.json`。共享合同修复已在Stable工作树冻结：六个源码文件和一个专用测试文件，27项专用测试、446项相关回归及Ruff/AST/diff检查通过；独立代码审查APPROVE且另跑53项HTTP/真实渲染测试通过，Root完整业务回归971项通过（452.50秒、退出码0）。f8f747e已受管部署并推送，API PID15460/launcher8224指向主目录；授权200、匿名401、UI健康200，冻结七文件SHA一致，证明opening-contract-release-proof.json。调度原配置保存在 `scheduler-before-opening-contract-repair.json`，已恢复原enabled=true并实查所有配置与备份一致；API和UI健康，未停止在执行的Worker。
 
-恢复调度后的原生交接验证发现另一个明确缺陷：服务端v2 Worker title含冒号与连字符，但本宿主原生spawn task_name仅接受小写字母、数字和下划线。原样创建被拒绝，控制器返回HANDOFF_ERROR并停止补位；没有任务被领取、没有重试同一offer。服务端名称生成与真实HTTP契约测试修复已冻结，32项HTTP测试通过，独立审查APPROVE并另跑32项测试通过（9.49秒），待受管部署；本次发现使无人值守交接稳定性仍未通过，不影响已部署身份叠加修复的971项测试结论。
+恢复调度后的原生交接验证发现另一个明确缺陷：服务端v2 Worker title含冒号与连字符，但本宿主原生spawn task_name仅接受小写字母、数字和下划线。原样创建被拒绝，控制器返回HANDOFF_ERROR并停止补位；没有任务被领取、没有重试同一offer。服务端名称生成与真实HTTP契约测试修复已冻结，32项HTTP测试通过，独立审查APPROVE并另跑32项测试通过（9.49秒），be950ce已受管部署并推送，API PID21672/launcher22224及原UI16940健康，授权200/匿名401/UI健康200，调度配置已完整恢复；待全新offer实际native spawn验证。证据scheduler-native-name-release-proof.json。本次发现使无人值守交接稳定性仍未通过，不影响已部署身份叠加修复的971项测试结论。
 
 ## 目标与验收边界
 
