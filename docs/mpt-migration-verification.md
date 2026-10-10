@@ -380,3 +380,76 @@ fail closed. Report: `storage/manual-reused-asset-qc-independent-review.md`.
 Thirteen selected cases pass on Python 3.11 and 3.13. Root's frozen final full
 business suite passes 703 tests (3120 warnings, 295.55 seconds), recorded in
 `storage/business-manual-reused-asset-qc-exact-final-20261010.log`.
+
+## Actual publication and production cutover (2026-10-10)
+
+The new IKEA KOMPISHÄNG episode, content
+`content_92b4df321fcf4212ae8adbc435386acf`, passed fresh script, visual-plan,
+asset and final-media QC before the existing operator publish gate. The user
+explicitly authorized local upscaling of the newly generated 941×1672 concept
+images to 1080×1920; the five resulting images received independent full QC.
+The final 31.566667-second 1080×1920 H.264/AAC file is 4,669,000 bytes with SHA-256
+`46e54530013990f44603e5bdfe6887009976c661b345f92c6be3eb7e6e69d3e3`.
+
+Actual Douyin publication is **7695010253280234779**:
+https://www.douyin.com/video/7695010253280234779. The platform creation time is
+2026-10-10 20:09:57 Asia/Shanghai. Creator management, the public video page,
+the complete description, AI disclosure and the saved platform cover were
+independently checked. The core publication record
+`pub_60a1ee1557b742b98851ea4e4d7dbba4` remains PUBLISHED with its original
+recording timestamp; it was not rewritten to imitate platform time.
+Task `agt_335a8ceffcf04585afbfe5428350b6a3` is COMPLETED and CONSUMED.
+Evidence artifact `asset_c4fcf991b4624f1c9d7468caf10fae1c` has SHA-256
+`df3e261c921b6b0be5ea5c4505e91ab3628e361ce765813b110e12fbc271f4b5`.
+Public proof is retained in the migration worktree's
+`storage/smoke/episode-real-publish-20261010/`, including `final-cover-readonly/`.
+There was one final publish click, with no retry after an unknown outcome.
+
+The installed social-auto-upload helper inserts tags but ignores the supplied
+description, and its default 3:4 cover crop clips this 9:16 cover title. Its real
+pre-click CLI failure permitted the existing browser fallback. The final live
+page was checked for the complete description and platform AI declaration;
+the crop was adjusted with the normal UI and its saved result verified after
+publication. These helper limitations remain: an unattended CLI success must
+not replace checking the actual description, declaration and saved cover.
+Neither the helper source nor business receipts were patched to fabricate
+success. The images and cover are disclosed as AI concepts, not product photos.
+
+The main checkout is `C:\Users\Administrator\Documents\MoneyPrinterTurbo`.
+The production API binds `0.0.0.0:8000`, with public URL
+`http://10.10.10.200:8000` and independent data directory
+`storage/business-8000/data`. Actual imports resolve app, agent, collector, core
+and media modules inside this checkout. LAN requests to the business API return
+401 anonymously and 200 with the protected administrator credential. Seven
+native roles were registered and each returned READY from its actual launcher
+self-test. Scheduler `mpt-codex` has capacity 2: discovery uses GPT-6 Luna/max;
+quality and publishing use GPT-6.1 Sol/high. Unsupported native video generation
+is disabled. Handsfree is enabled with a daily publication limit of 1; ASR is
+medium/cpu/int8 and TTS is Edge Yunxi (+20%, +0%). Private credentials and
+original Glance runtime configuration are not committed.
+
+The frozen source plus the newly published MPT baseline imported 132 contents,
+6 publication records and 12,025 referenced files (4,894,428,172 bytes). Every
+reference was checked for size and SHA-256. Repeating the import inserted zero
+rows in all 14 imported tables. SQLite integrity and foreign keys passed; the
+restore rehearsal reproduced the frozen rollback database. The 356 quarantine
+items and four explicitly frozen historical PENDING tasks remain preserved,
+without current OWNED credentials or replay eligibility. Existing incomplete
+historical publication IDs were retained, not invented.
+
+Both archive Git histories are retained at production archive merge
+`a88d92b51a55552b89ebc22d7e2f023f23e4d35b`, with parents
+`d0b1d2ab26201b5efd640423f334662bd3b61973` (new MPT publication baseline) and
+`8aa8c61f675f024610cd9b211a6780041f902e25` (Glance). Strict Git fsck, both
+ancestry checks, 127 original object records and all 11 referenced archive
+commits passed. The combined index preserves source bytes followed by baseline
+bytes. Original absolute audit paths still refer to the preserved Glance backup.
+
+Glance's six verified owned server/worker processes were stopped. Its watchdog
+is Disabled; the exported task XML and unchanged source database remain available
+for rollback. The original checkout and migration worktree are retained because
+they contain rollback material and publication evidence. The two existing app
+automations now target MoneyPrinterTurbo with updated launcher/maintenance paths;
+their schedules, models, notification preferences and auto-archive behavior were
+preserved, and both remain PAUSED. Final cutover evidence and independent reports
+are under the main checkout's `storage/smoke/final-cutover-20261010/`.
