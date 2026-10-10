@@ -8,6 +8,7 @@ from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+from types import SimpleNamespace
 
 import pytest
 import httpx
@@ -37,6 +38,7 @@ from PIL import Image
 from sqlmodel import Session, select
 
 from app.business.publish_policy import publish_budget, try_auto_publish
+from app.business.media_executor import MptMediaExecutor
 from test.business import test_content_http as content_tests
 from test.business.test_content_http import (
     content_app,
@@ -212,7 +214,16 @@ def ready_content(http, runtime, monkeypatch, *, automatic=True):
         0  # Fixture review never queues a click task.
     )
     patched_asr(monkeypatch, available=False)
-    content_id, video_id, _, _, receipt_id = acceptance_fixture(http, runtime)
+    def synthesize_voice(executor, *args, **kwargs):
+        voice = executor.root / "audio" / "manual-voice.wav"
+        voice.parent.mkdir(parents=True, exist_ok=True)
+        voice.write_bytes(b"isolated successful manual voice fixture")
+        return SimpleNamespace(audio_path=voice, duration_sec=45)
+
+    with monkeypatch.context() as voice_patch:
+        voice_patch.setattr(MptMediaExecutor, "synthesize_voice", synthesize_voice)
+        voice_patch.setattr(MptMediaExecutor, "visual_timing_evidence", lambda *args: {})
+        content_id, video_id, _, _, receipt_id = acceptance_fixture(http, runtime, manual_script_approval=True)
     with Session(runtime.engine) as session:
         if automatic:
             session.add(
@@ -351,6 +362,36 @@ def ready_content(http, runtime, monkeypatch, *, automatic=True):
         },
     )
     return content_id, review_id
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg required")
+def test_old_packaged_revise_cannot_become_manual_by_disabling_auto_review(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+    with TestClient(content_app(runtime)) as http:
+        content_id, _ = ready_content(http, runtime, monkeypatch)
+        with Session(runtime.engine) as session:
+            flow = runtime.workflow_service(session)
+            parents = {key: flow.completed_task_for(content_id, kind) for key, kind in (
+                ("script", TaskType.SHORT_SCRIPT), ("script_qc", TaskType.SCRIPT_QC),
+                ("research", TaskType.CONTENT_RESEARCH),
+            )}
+            task = flow.create_agent_task(content_id, TaskType.SCRIPT_REVIEW_ASSIST, {
+                **{key: row.result_data for key, row in parents.items()},
+                "upstream_task_ids": {key: row.id for key, row in parents.items()},
+            }, allow_multiple=True)
+            task_id = task.id
+        assistant = client_for(http, "assistant")
+        claim = assistant.dispatch(wait=0, task_id=task_id)
+        assistant.confirm_claim(task_id, claim["lease_token"], "assistant-worker")
+        assistant.complete(task_id, claim["lease_token"], "assistant-worker", {
+            "verdict": "REVISE", "confidence": "high", "summary": "Unresolved script blocker",
+            "reasons": ["Opening misleads"], "issues": [{"severity": "blocker", "message": "Opening misleads"}],
+        })
+        runtime.settings.handsfree_daily_publish_limit = 2
+        runtime.settings.handsfree_publish_interval_minutes = 0
+        decision = try_auto_publish(runtime.engine, runtime.settings, content_id, now=NOW)
+        assert decision["status"] == "NOT_READY", decision
+        assert "script assistant review" in decision["reason"]
 
 
 @pytest.mark.skipif(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 from contextlib import suppress
 from copy import deepcopy
 from math import ceil, isfinite
@@ -9,6 +11,7 @@ from pathlib import Path
 from glance_collector import CollectionService
 from glance_core.archive import ArchiveService
 from glance_core.content_acceptance import (
+    _unchanged_material_task,
     acceptance_origin,
     acceptance_subject,
     is_handsfree_content,
@@ -35,7 +38,7 @@ from glance_core.models import (
 )
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import DEFAULT_COVER_STYLE_PRESET, Settings
-from glance_core.task_schemas import ContentAcceptanceResult
+from glance_core.task_schemas import ContentAcceptanceResult, ManualAssistResult
 from glance_core.task_service import stable_hash
 from glance_core.workflow import (
     WorkflowService,
@@ -107,7 +110,159 @@ def _verify_rights(session: Session, content: Content) -> None:
         raise NonRetryableMediaError("Candidate rights do not authorize this production mode")
 
 
-def verify_publish_ready(session: Session, settings: Settings, content_id: str) -> Path:
+def _current_script_tasks(session: Session, content_id: str) -> dict:
+    tasks = {}
+    for kind in (TaskType.CONTENT_RESEARCH, TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC,
+                 TaskType.SCRIPT_REVIEW_ASSIST):
+        latest = session.exec(select(AgentTask).where(
+            AgentTask.content_id == content_id, AgentTask.task_type == kind,
+            AgentTask.status != TaskStatus.CANCELLED,
+        ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+        if len(latest) == 2 and latest[0].created_at == latest[1].created_at:
+            raise NonRetryableMediaError(f"Current script assistant review gate: {kind.value} lineage has ambiguous creation times")
+        task = latest[0] if latest else None
+        if kind != TaskType.SCRIPT_REVIEW_ASSIST and (task is None or task.status != TaskStatus.COMPLETED):
+            raise NonRetryableMediaError(f"Current script assistant review gate: current {kind.value} is not completed")
+        tasks[kind] = task
+    return tasks
+
+
+def _script_task_proof(task: AgentTask) -> dict:
+    return {"id": task.id, "input_hash": task.input_hash, "result_hash": stable_hash(task.result_data),
+            "status": task.status.value, "attempt": task.attempt}
+
+
+def _script_approval_snapshot(session: Session, content_id: str) -> dict:
+    result = {}
+    for kind, task in _current_script_tasks(session, content_id).items():
+        if task is not None:
+            _unchanged_material_task(session, task, consumed=False)
+        result[kind.value] = None if task is None else _script_task_proof(task)
+    return result
+
+
+def _manual_approval_key(settings: Settings) -> bytes:
+    secret = settings.admin_token.get_secret_value()
+    if not secret.strip() or secret == "change-me-before-network-use":
+        raise NonRetryableMediaError("Manual script approval requires a configured admin signing secret")
+    return secret.encode("utf-8")
+
+
+def _manual_approval_signature(settings: Settings, event: AuditEvent) -> str:
+    payload = {key: value for key, value in event.metadata_json.items() if key != "signature"}
+    subject = stable_hash({"event_id": event.id, "content_id": event.entity_id, "receipt": payload})
+    return hmac.new(_manual_approval_key(settings), subject.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def _revalidate_script_approval(session: Session, content_id: str, snapshot: dict) -> None:
+    # Claim/complete can change the review before its consumer gets the content lock.
+    session.expire_all()
+    if _script_approval_snapshot(session, content_id) != snapshot:
+        raise NonRetryableMediaError("Script approval subject changed during voice generation")
+
+
+def _record_manual_script_approval(session: Session, settings: Settings, content_id: str, snapshot: dict, voice: dict) -> None:
+    _revalidate_script_approval(session, content_id, snapshot)
+    event = AuditEvent(actor_type="human", actor_id="admin-api", entity_type="content", entity_id=content_id,
+                       action="manual_script_approved", metadata_json={
+                           "contract_version": 1, "producer": "mpt-admin-approve-script",
+                           "tasks": snapshot, "voice_artifact": voice,
+                       })
+    event.metadata_json = {**event.metadata_json, "signature": _manual_approval_signature(settings, event)}
+    session.add(event)  # The successful final stage transition commits the receipt.
+
+
+def _has_manual_script_approval(session: Session, settings: Settings, content_id: str) -> bool:
+    try:
+        snapshot = _script_approval_snapshot(session, content_id)
+        plans = session.exec(select(AgentTask).where(
+            AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+            AgentTask.status != TaskStatus.CANCELLED,
+        ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+        if not plans or (len(plans) == 2 and plans[0].created_at == plans[1].created_at):
+            return False
+        current_plan = plans[0]
+        _unchanged_material_task(session, current_plan, consumed=False)
+        events = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "content", AuditEvent.entity_id == content_id,
+            AuditEvent.action == "manual_script_approved", AuditEvent.actor_type == "human",
+            AuditEvent.actor_id == "admin-api",
+        )).all()
+        content = session.get(Content, content_id)
+        for event in events:
+            receipt = event.metadata_json
+            if not isinstance(receipt, dict):
+                continue
+            signature = receipt.get("signature")
+            if (set(receipt) != {"contract_version", "producer", "tasks", "voice_artifact", "signature"}
+                or receipt.get("contract_version") != 1 or receipt.get("producer") != "mpt-admin-approve-script"
+                or receipt.get("tasks") != snapshot or not isinstance(signature, str)
+                or len(signature) != 64 or not signature.isascii()
+                or not hmac.compare_digest(signature, _manual_approval_signature(settings, event))):
+                continue
+            binding = receipt.get("voice_artifact")
+            if not isinstance(binding, dict) or current_plan.input_data.get("voice_artifact") != binding:
+                continue
+            voice = session.get(Artifact, binding.get("id")) if isinstance(binding.get("id"), str) else None
+            if (voice is None or voice.content_id != content_id or voice.artifact_type != "voice"
+                or binding != {key: getattr(voice, key) for key in ("id", "relative_path", "sha256", "size_bytes")}):
+                continue
+            root = Path(content.content_dir).resolve()
+            path = (root / voice.relative_path).resolve()
+            if (path.is_relative_to(root) and path.is_file() and path.stat().st_size == voice.size_bytes
+                and sha256_file(path) == voice.sha256):
+                return True
+    except (ValueError, NonRetryableMediaError, OSError):
+        return False
+    return False
+
+
+def _require_script_assist(
+    session: Session, settings: Settings, content_id: str, *, require_approval: bool = True,
+    automatic: bool = False, release: bool = False, allow_manual_approval: bool = False,
+) -> AgentTask | None:
+    current = effective_settings(session, settings)
+    owned = is_handsfree_content(session, content_id)
+    enabled = (current.handsfree_enabled and current.handsfree_auto_review_enabled
+               and owned)
+    if automatic and not release and not enabled:
+        raise NonRetryableMediaError("Handsfree automatic review is currently disabled")
+    if release and automatic and not owned:
+        raise NonRetryableMediaError("Automatic release requires Handsfree content ownership")
+    if not (owned if release or allow_manual_approval else enabled):
+        return None
+    if (release or allow_manual_approval) and _has_manual_script_approval(session, current, content_id):
+        return None
+    try:
+        tasks = _current_script_tasks(session, content_id)
+        for kind, task in tasks.items():
+            if task is None or task.status != TaskStatus.COMPLETED:
+                raise ValueError(f"current {kind.value} is not completed")
+            _unchanged_material_task(session, task, owned=True,
+                                     consumed=kind != TaskType.SCRIPT_REVIEW_ASSIST)
+        research, script, qc, review = (tasks[kind] for kind in (
+            TaskType.CONTENT_RESEARCH, TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC,
+            TaskType.SCRIPT_REVIEW_ASSIST,
+        ))
+        refs = {"script": script.id, "script_qc": qc.id, "research": research.id}
+        if (script.input_data.get("upstream_task_ids", {}).get("research") != research.id
+            or qc.input_data.get("upstream_task_ids", {}).get("script") != script.id
+            or qc.input_data.get("upstream_task_ids", {}).get("research") != research.id
+            or (qc.result_data or {}).get("passed") is not True
+            or review.input_data.get("upstream_task_ids") != refs
+            or any(stable_hash(review.input_data.get(key)) != stable_hash(parent.result_data)
+                   for key, parent in (("script", script), ("script_qc", qc), ("research", research)))):
+            raise ValueError("current script review lineage or frozen snapshots are stale")
+        result = ManualAssistResult.model_validate(review.result_data)
+        if require_approval and (result.verdict != "APPROVE" or result.confidence != "high"
+                                 or any(issue.severity == "blocker" for issue in result.issues)):
+            raise ValueError("current script review requires high-confidence APPROVE without blockers")
+        return review
+    except ValueError as exc:
+        raise NonRetryableMediaError(f"Current script assistant review gate: {exc}") from exc
+
+
+def verify_publish_ready(session: Session, settings: Settings, content_id: str, *, automatic: bool = False) -> Path:
     """MPT's release boundary: old manual QC warnings never authorize publishing."""
     content = session.get(Content, content_id)
     if content is None:
@@ -118,6 +273,7 @@ def verify_publish_ready(session: Session, settings: Settings, content_id: str) 
     research = flow.completed_task_for(content_id, TaskType.CONTENT_RESEARCH)
     plan = flow.completed_task_for(content_id, TaskType.VISUAL_PLAN)
     _require_current_qc(session, content_id, TaskType.SCRIPT_QC, {"script": script, "research": research})
+    _require_script_assist(session, settings, content_id, automatic=automatic, release=True)
     _require_current_qc(session, content_id, TaskType.VISUAL_PLAN_QC, {"visual_plan": plan, "script": script})
     qc = _require_current_qc(session, content_id, TaskType.CONTENT_QC, {"script": script, "visual_plan": plan})
     if qc.schema_version != "2":
@@ -1182,8 +1338,6 @@ def advance_after_agent(engine: Engine, settings: Settings, task_id: str) -> str
         } or not current.handsfree_enabled or not current.handsfree_auto_review_enabled
             or not is_handsfree_content(session, content.id)):
             return None
-        if task.task_type == TaskType.SCRIPT_QC and content.current_stage == "script_review":
-            return "voice"
         if task.task_type in {TaskType.VISUAL_PLAN_QC, TaskType.ASSET_QC,
                               TaskType.ASSET_GENERATE_IMAGE} and content.current_stage == "render_ready":
             return "render"
@@ -1385,6 +1539,10 @@ def _advance_after_agent(
 
         content_id = task.content_id
         if task.task_type == TaskType.SCRIPT_REVIEW_ASSIST:
+            begin_immediate(session)
+            session.refresh(task)
+            if task.status != TaskStatus.COMPLETED:
+                return
             content = session.get(Content, content_id)
             script_task = flow.completed_task_for(content_id, TaskType.SHORT_SCRIPT)
             qc_task = flow.completed_task_for(content_id, TaskType.SCRIPT_QC)
@@ -1408,8 +1566,28 @@ def _advance_after_agent(
                 return
             if content is None or script_task is None or qc_task is None or research_task is None:
                 return
-            # 本阶段助手只提供意见，不自动批准、重写或推进配音；人工审核面板拥有最终
-            # 的脚本通过/打回权。保留原始 verdict 与 issues，便于人工追溯。
+            if content.business_status == ContentStatus.SCRIPT_REVIEW and content.current_stage == "script_review":
+                try:
+                    current_review = _require_script_assist(session, settings, content_id, require_approval=False)
+                except NonRetryableMediaError as exc:
+                    flow.set_error(content_id, "SCRIPT_ASSIST_REVIEW_BLOCKED", str(exc))
+                    return
+                if current_review is not None:
+                    if current_review.id != task.id:
+                        return
+                    result = current_review.result_data
+                    if result.get("confidence") != "high" or result.get("verdict") not in {"APPROVE", "REVISE"}:
+                        flow.set_error(content_id, "SCRIPT_ASSIST_REVIEW_BLOCKED", "脚本辅助审核需要人工确认")
+                        return
+                    if result["verdict"] == "REVISE" or any(
+                        issue.get("severity") == "blocker" for issue in result.get("issues", [])
+                    ):
+                        if flow.auto_revise_script_from_assist(content_id, current_review) is None:
+                            flow.set_error(content_id, "SCRIPT_ASSIST_REVISION_LIMIT", "脚本辅助审核自动修订预算已耗尽")
+                        return
+                    flow.set_error(content_id, None, None)
+                    return "voice"
+            # Manual review suggestions remain persisted for explicit human approval.
             session.add(
                 AuditEvent(
                     actor_type="system",
@@ -2326,22 +2504,43 @@ def repair_stalled_asset_generation(
         return content, task
 
 
-def approve_script(engine: Engine, settings: Settings, content_id: str) -> Content:
+def approve_script(
+    engine: Engine, settings: Settings, content_id: str, *, automatic: bool = False, manual_approval: bool = False,
+) -> Content:
     with Session(engine) as session:
         content = session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
         flow = workflow(session, settings)
         _verify_rights(session, content)
+        script_task = flow.completed_task_for(content_id, TaskType.SHORT_SCRIPT)
         _require_current_qc(
             session, content_id, TaskType.SCRIPT_QC,
-            {"script": flow.completed_task_for(content_id, TaskType.SHORT_SCRIPT),
+            {"script": script_task,
              "research": flow.completed_task_for(content_id, TaskType.CONTENT_RESEARCH)},
         )
-        script = flow.result_for(content_id, TaskType.SHORT_SCRIPT)
+        if automatic and manual_approval:
+            raise NonRetryableMediaError("Automatic execution cannot mint manual script approval")
+        snapshot = None
+        if manual_approval:
+            if content.business_status != ContentStatus.SCRIPT_REVIEW:
+                raise NonRetryableMediaError("Manual script approval requires the script review stage")
+            snapshot = _script_approval_snapshot(session, content_id)
+            _manual_approval_key(settings)
+        review = None if manual_approval else _require_script_assist(session, settings, content_id, automatic=automatic)
+        if review is not None:
+            snapshot = _script_approval_snapshot(session, content_id)
+        if snapshot is not None and (script_task is None or snapshot[TaskType.SHORT_SCRIPT.value]["id"] != script_task.id):
+            raise NonRetryableMediaError("Script approval subject changed before voice generation")
+        if review is not None and (content.business_status != ContentStatus.SCRIPT_REVIEW
+                                   or content.current_stage not in {"script_review", "voice_gate"}):
+            raise NonRetryableMediaError("Current script assistant review has already advanced past voice")
+        script = script_task.result_data if script_task is not None else None
         qc = flow.result_for(content_id, TaskType.SCRIPT_QC)
         if not script or qc is None:
             raise ValueError("Script and a completed script QC are required")
+        _unchanged_material_task(session, script_task, consumed=False)
+        script_proof = _script_task_proof(script_task)
         root = Path(content.content_dir).resolve()
         executor = MediaExecutor(root)
         voice_options = {
@@ -2392,9 +2591,27 @@ def approve_script(engine: Engine, settings: Settings, content_id: str) -> Conte
             "sha256": voice_artifact.sha256,
             "size_bytes": voice_artifact.size_bytes,
         }
+        if snapshot is not None:
+            # Task creation commits: reject a late review before invalidating or scheduling downstream work.
+            _revalidate_script_approval(session, content_id, snapshot)
+        else:
+            # Plain manual callers retain their contract but cannot bind old audio to a changed script.
+            session.expire_all()
+            latest = session.exec(select(AgentTask).where(
+                AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
+                AgentTask.status != TaskStatus.CANCELLED,
+            ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+            if (not latest or _script_task_proof(latest[0]) != script_proof
+                or (len(latest) == 2 and latest[0].created_at == latest[1].created_at)):
+                raise NonRetryableMediaError("Script approval subject changed during voice generation")
+            try:
+                _unchanged_material_task(session, latest[0], consumed=False)
+            except ValueError as exc:
+                raise NonRetryableMediaError("Script approval subject changed during voice generation") from exc
+        if automatic:
+            _require_script_assist(session, settings, content_id, automatic=True)
         flow.set_error(content_id, None, None)
         # 重新配音后旧画面计划按新时长作废重建。
-        script_task = flow.completed_task_for(content_id, TaskType.SHORT_SCRIPT)
         if script_task is None:
             raise ValueError("Script task reference is required")
         previous_plan = (script_task.input_data or {}).get("previous_plan") or flow.result_for(
@@ -2442,6 +2659,8 @@ def approve_script(engine: Engine, settings: Settings, content_id: str) -> Conte
                 **content_qc_rework,
             }
             flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, plan_input, priority=50)
+            if manual_approval:
+                _record_manual_script_approval(session, settings, content_id, snapshot, voice_binding)
             return flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
         scene_data = json.loads((root / "scenes" / "scenes.json").read_text(encoding="utf-8"))
         scene_tasks = flow.scene_analysis_tasks(content_id)
@@ -2481,6 +2700,8 @@ def approve_script(engine: Engine, settings: Settings, content_id: str) -> Conte
             },
             priority=50,
         )
+        if manual_approval:
+            _record_manual_script_approval(session, settings, content_id, snapshot, voice_binding)
         return flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
 
 
@@ -2563,7 +2784,10 @@ def _render_voice_path(
     raise NonRetryableMediaError("Approved voice Artifact or its frozen timing pair is missing or changed")
 
 
-def render_content(engine: Engine, settings: Settings, content_id: str, *, consuming_task_id: str | None = None) -> Content:
+def render_content(
+    engine: Engine, settings: Settings, content_id: str, *, consuming_task_id: str | None = None,
+    automatic: bool = False,
+) -> Content:
     _require_media_tools("ffmpeg", "ffprobe")
     with Session(engine) as session:
         session.info["consuming_agent_task_id"] = consuming_task_id
@@ -2578,6 +2802,7 @@ def render_content(engine: Engine, settings: Settings, content_id: str, *, consu
             session, content_id, TaskType.SCRIPT_QC,
             {"script": script_task, "research": flow.completed_task_for(content_id, TaskType.CONTENT_RESEARCH)},
         )
+        _require_script_assist(session, settings, content_id, automatic=automatic, allow_manual_approval=True)
         _require_current_qc(
             session, content_id, TaskType.VISUAL_PLAN_QC,
             {"visual_plan": plan_task, "script": script_task},
@@ -3078,7 +3303,7 @@ def resume_content_acceptance(engine: Engine, settings: Settings, content_id: st
         )
 
 
-def approve_final(engine: Engine, settings: Settings, content_id: str) -> Content:
+def approve_final(engine: Engine, settings: Settings, content_id: str, *, automatic: bool = False) -> Content:
     _require_media_tools("ffmpeg", "ffprobe")
     with Session(engine) as session:
         content = session.get(Content, content_id)
@@ -3086,7 +3311,9 @@ def approve_final(engine: Engine, settings: Settings, content_id: str) -> Conten
             raise KeyError(content_id)
         settings = effective_settings(session, settings)
         flow = workflow(session, settings)
-        final_path = verify_publish_ready(session, settings, content_id)
+        if automatic:
+            _require_script_assist(session, settings, content_id, automatic=True, allow_manual_approval=True)
+        final_path = verify_publish_ready(session, settings, content_id, automatic=automatic)
         acceptance = flow.completed_task_for(content_id, TaskType.CONTENT_QC)
         if acceptance is not None and acceptance.schema_version == "2":
             verify_acceptance(session, acceptance, acceptance.result_data or {})

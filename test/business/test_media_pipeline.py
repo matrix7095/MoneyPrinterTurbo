@@ -250,14 +250,14 @@ def test_replaying_old_script_qc_does_not_reset_later_media_stage(media_contract
     assert len(session.exec(select(AgentTask)).all()) == before
 
 
-def test_handsfree_followup_voice_is_explicit_and_manual_does_not_auto_approve(media_contract):
+def test_handsfree_script_qc_waits_for_review_and_manual_does_not_auto_approve(media_contract):
     engine, session, settings, content, _, _, _, qc, _, _, _ = media_contract
     assert advance_after_agent(engine, settings, qc.id) is None
     session.add(AuditEvent(actor_type="system", actor_id="handsfree-coordinator", entity_type="content",
                            entity_id=content.id, action="handsfree_candidate_selected"))
     session.commit()
     enabled = settings.model_copy(update={"handsfree_enabled": True, "handsfree_auto_review_enabled": True})
-    assert advance_after_agent(engine, enabled, qc.id) == "voice"
+    assert advance_after_agent(engine, enabled, qc.id) is None
     content.current_stage = "visual_plan"
     content.business_status = ContentStatus.WAITING_AGENT
     session.add(content)

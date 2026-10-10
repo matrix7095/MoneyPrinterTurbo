@@ -746,7 +746,9 @@ class BusinessRuntime:
                 if operation is None or not task.content_id:
                     raise ValueError(f"Unsupported pipeline follow-up: {action}")
                 if action == "render":
-                    operation(self.engine, self.settings, task.content_id, consuming_task_id=task_id)
+                    operation(self.engine, self.settings, task.content_id, consuming_task_id=task_id, automatic=True)
+                elif action in {"voice", "package"}:
+                    operation(self.engine, self.settings, task.content_id, automatic=True)
                 else:
                     operation(self.engine, self.settings, task.content_id)
             with Session(self.engine) as session:

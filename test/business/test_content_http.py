@@ -564,7 +564,7 @@ def test_final_review_bundle_serves_signed_video_and_cover_on_new_server(tmp_pat
         )
 
 
-def acceptance_fixture(http, runtime):
+def acceptance_fixture(http, runtime, *, manual_script_approval=False):
     from app.business import pipeline
     from glance_core.content_acceptance import acceptance_subject, source_context
     from glance_media.executor import run_command
@@ -600,6 +600,14 @@ def acceptance_fixture(http, runtime):
             {"script": script.id, "research": claimed["task_id"]},
             {"passed": True},
         )
+        if manual_script_approval:
+            content = session.get(Content, content_id)
+            content.business_status, content.current_stage = ContentStatus.SCRIPT_REVIEW, "script_review"
+            session.add(content)
+            session.commit()
+            response = http.post(f"/api/v1/contents/{content_id}/approve-script", headers=ADMIN)
+            assert response.status_code == 200, response.text
+            session.expire_all()
         plan = completed(
             TaskType.VISUAL_PLAN,
             {"script": script.id},

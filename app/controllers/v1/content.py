@@ -166,7 +166,10 @@ def prepare(*, content_id: str, request: Request):
 def approve_script(*, content_id: str, request: Request):
     from app.business.pipeline import approve_script
 
-    return run_stage(request, content_id, approve_script, {ContentStatus.SCRIPT_REVIEW})
+    def approve(engine, settings, target_id):
+        return approve_script(engine, settings, target_id, manual_approval=True)
+
+    return run_stage(request, content_id, approve, {ContentStatus.SCRIPT_REVIEW})
 
 
 @router.post("/contents/{content_id}/reject-script")

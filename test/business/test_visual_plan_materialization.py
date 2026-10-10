@@ -147,7 +147,8 @@ def test_first_asset_qc_automatic_render_uses_only_current_accepted_consumption(
         session.commit()
     calls = []
 
-    def render(engine, settings, target_id, *, consuming_task_id):
+    def render(engine, settings, target_id, *, consuming_task_id, automatic):
+        assert automatic is True
         with Session(engine) as session:
             assert session.exec(select(AuditEvent.id).where(AuditEvent.entity_id == qc_id,
                                                            AuditEvent.action == AGENT_CONSUMED)).first() is None

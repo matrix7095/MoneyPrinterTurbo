@@ -105,7 +105,7 @@ def publish_budget(session: Session, settings, *, now=None):
 def _current_review(session, settings, content_id):
     from app.business.pipeline import verify_publish_ready, workflow
 
-    verify_publish_ready(session, settings, content_id)
+    verify_publish_ready(session, settings, content_id, automatic=True)
     flow = workflow(session, settings)
     if settings.publish_prepare_enabled:
         prepare = session.exec(
