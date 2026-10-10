@@ -455,15 +455,33 @@ preserved, and both remain PAUSED. Final cutover evidence and independent report
 are under the main checkout's `storage/smoke/final-cutover-20261010/`.
 
 At the final UI gate, the explicitly authorized old worktree UI was stopped;
-both verified processes exited and port 8510 became free. Starting Main's UI
-was rejected before process creation with `blocked by policy`, including the
-loopback-only variant. The tool provided no exact rule or denial reason. Local
-configuration specifies reviewer `user`, not `auto_review`; this must not be
-reported as an established automatic-review decision. No execution policy was
-changed. The complete Main UI passed a listener-free Streamlit AppTest against
+both verified processes exited and port 8510 became free. The detached .NET
+process-creation commands were rejected before execution with `blocked by
+policy`, including the loopback-only variant. The tool provided no exact rule
+or denial reason. Local configuration specifies reviewer `user`, not
+`auto_review`; this must not be reported as an established automatic-review
+decision. No execution policy was changed.
+
+The complete Main UI first passed a listener-free Streamlit AppTest against
 the real 8000 API: three read-only GETs returned 200, the workbench title and new
-published platform ID appeared, and no errors or exceptions occurred. This does
-not prove an actual browser-serving UI: the production cutover remains partial
-until startup is permitted and browser acceptance succeeds. Evidence:
-`readonly-ui-initialization-check.json`, `ui-execution-policy-diagnosis.json`
-and `current-ui-cutover-state.json` in the final cutover evidence directory.
+published platform ID appeared, and no errors or exceptions occurred. Then
+the explicit Streamlit CLI entry point ran successfully as a tool-managed
+foreground process, retaining its execution handle and startup logs. Actual
+browser acceptance at **http://127.0.0.1:8510/** passed after refreshing the old
+tab: MoneyPrinterTurbo workbench, PUBLISHED state, the new platform ID and its
+publication link were visible. Listener and parent command lines both use Main,
+and the old UI processes are absent. The UI remains local-only; the business
+API continues on 8000. Actual ownership is in `main-ui-start.json` and browser
+proof is `main-ui-published-browser.png` in the final cutover evidence directory.
+
+To run this local UI from the main checkout, use the existing entry point with
+the migrated connection, without putting credentials on the command line:
+
+```powershell
+$env:MPT_BUSINESS_API_URL = 'http://127.0.0.1:8000'
+$env:MPT_BUSINESS_ADMIN_TOKEN_FILE = "$PWD/storage/business-8000/data/private/runtime.json"
+& ./.venv/Scripts/python.exe -m streamlit run ./webui/Main.py --server.address 127.0.0.1 --server.port 8510 --server.headless true --browser.gatherUsageStats false
+```
+
+This is a foreground UI process, not a Windows startup service; keep its owning
+terminal/session running. Do not restore the old Glance watchdog for the new UI.
