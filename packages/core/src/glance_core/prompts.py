@@ -67,8 +67,10 @@ CONTENT_QC 与 FINAL_REVIEW_ASSIST 沿用同一来源与误导标准，不得新
 阶段限定的位置/次数/长度、数字保真、开场/节奏、权益及其他 QC 硬门槛保持不变。
 SHORT_SCRIPT、SCRIPT_QC、SCRIPT_REVIEW_ASSIST、CONTENT_QC、FINAL_REVIEW_ASSIST 使用同一事实边界，
 不得为服从历史建议删掉必要边界后又按绝对化返工；真实缺证或误导仍须定位并拒绝，不自动通过。
+"""
 
-## Handsfree 读音与元数据身份一致性（五阶段共同规则，覆盖旧英文展开要求）
+_PRONUNCIATION_IDENTITY_RULE = """
+## 读音与元数据身份一致性（五阶段共同规则，覆盖旧英文展开要求）
 仅在研究未提供可靠读音依据，或正常易读口播修复需要时，可用已核验产品类别与自然中文规格说明承载口播。
 准确品牌、完整型号与正式身份必须保留在既有 title_options、发布文案等可核对元数据，
 与已核验研究一致且无混淆；不得编造中文品牌名或中文正式名称、删除关键数字事实或改变规格含义。
@@ -298,7 +300,7 @@ def resolve_instructions(
     handsfree: bool | None = None,
     schema_version: str = "1",
 ) -> str:
-    """当前有效指令：可叠加无人值守规则，手动模式使用原提示词。"""
+    """当前有效指令：共同身份规则，并按模式叠加无人值守规则。"""
     row = session.get(TaskPrompt, task_type.value)
     if row is not None and row.instructions.strip():
         template = row.instructions
@@ -400,14 +402,16 @@ audio 必须 false 并定位缺口，不把普通同音转写差异直接当成�
 只有高置信且所有硬项均通过才 passed=true；否则 issues 明确定位返工，交由现有预算修复。
 不得请求人工、不触发发布、不篡改旧QC。相同材料的失败直接修订，不重复签发自己重审。
 """
-    if use_handsfree and task_type in (
+    if task_type in (
         TaskType.SHORT_SCRIPT,
         TaskType.SCRIPT_QC,
         TaskType.SCRIPT_REVIEW_ASSIST,
         TaskType.CONTENT_QC,
         TaskType.FINAL_REVIEW_ASSIST,
     ):
-        template += _HANDSFREE_STAGE_FACT_RULE
+        if use_handsfree:
+            template += _HANDSFREE_STAGE_FACT_RULE
+        template += _PRONUNCIATION_IDENTITY_RULE
     if use_handsfree and task_type in (
         TaskType.SHORT_SCRIPT,
         TaskType.SCRIPT_QC,

@@ -288,3 +288,38 @@ seconds, with all nine reviewed file hashes unchanged. Evidence is in
 `storage/content-qc-recovery-independent-review-final.md` and
 `storage/business-qc-recovery-render-exact-final-v2-20261010.log`. These checks
 do not approve the failed video or prove a new publication.
+
+
+The real content-QC recovery admission returned HTTP 200 and created
+`agt_49fa345654e34ea3a0a7d71fc69f86c1`. Its independent assistant completed and
+was consumed through the budgeted core path, creating fresh owned SHORT_SCRIPT
+`agt_e69f733fc3964ae3af1dd365871830c9`. The independent script changed narration
+to the verified Chinese brand/category while retaining the full formal identity
+in metadata, c1/c3/c5, conceptual-image disclosure and the five registered images.
+Original failed CONTENT_QC input/result and original final-video hash remain
+unchanged. Public evidence is in `storage/smoke/content-qc-budget-recovery-20261010/`
+and `storage/smoke/episode-clear-brand-script-20261010/`.
+
+The new independent manual SCRIPT_QC `agt_66fb3d848acf4583ae30e90542b5d443`
+correctly returned false under its frozen rule requiring the foreign formal name
+in narration; it was accepted/consumed and created budgeted Recovery
+`agt_ea720de7683848a2898880e74be20c58`. The readable-identity policy already
+permits verified category narration plus exact full identity in opening and at
+least one title, but was only appended for Handsfree. This manual/Handsfree
+contract mismatch requires sharing that existing policy across the same five
+stages. No historical QC result was changed and no new video or publication was
+approved. Evidence is in `storage/smoke/episode-clear-brand-script-qc-20261010/`.
+
+
+The shared pronunciation/identity repair extracts the existing policy unchanged
+from the Handsfree fact block and applies it to the same five stages in both modes.
+It does not enable Handsfree or rewrite any completed task. Its 97 new tests pass
+on Python 3.11 and 3.13 (9.79/9.96 seconds). Root's exact final business regression
+passes 639 tests (2938 warnings, 271.25 seconds), with both fixed source hashes
+unchanged. Logs are `storage/business-pronunciation-exact-final-20261010.log` and
+`storage/pronunciation-py311-final-20261010.log` /
+`storage/pronunciation-py313-final-20261010.log`. Independent code acceptance
+approved both fixed files: 97 new cases, 175 related cases and 504 resolver
+equivalence cases, plus real leased HTTP immutable/quarantine probes. The report
+is `storage/manual-pronunciation-independent-review-final.md`. Root owns the
+separate deployment, fresh budgeted repair and actual publication gates.

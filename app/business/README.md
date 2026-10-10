@@ -103,6 +103,15 @@ the verified current final-video Artifact, rather than the old fixed render alia
 The legacy visual-plan restoration endpoint remains limited to its documented
 old mutation; it is not an alternate route for failed semantic QC.
 
+The existing pronunciation/identity policy is shared across SHORT_SCRIPT,
+SCRIPT_QC, SCRIPT_REVIEW_ASSIST, CONTENT_QC and FINAL_REVIEW_ASSIST in both manual
+and Handsfree modes. A legitimate readability repair may narrate a verified
+category with natural Chinese specifications, while retaining the exact formal
+identity in opening.product_identity and at least one title. Verified brand,
+first-eight-second identity/payoff, facts, rights and final-track audio gates
+still apply. This does not enable Handsfree, approve QC, rewrite historical
+results or inject the intended text into ASR.
+
 ## Upstream sync and validation
 
 Handsfree automatic publication additionally uses the shared policy in
