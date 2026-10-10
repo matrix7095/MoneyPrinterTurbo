@@ -27,6 +27,8 @@ from glance_core.task_service import stable_hash
 from glance_core.workflow import DuplicateTopicError, WorkflowService
 from sqlmodel import Session, desc, select
 
+from app.business.quarantine import CONTENT_QUARANTINE
+
 _ACTIVE_TASK_STATUSES = {TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED}
 _HANDSFREE_CANDIDATE_LOW_WATERMARK = 1
 _LOW_WATER_SUPPLEMENT_META = "handsfree_low_water_supplement"
@@ -197,15 +199,20 @@ def _record_low_water_supplement(source: Source, *, now: datetime) -> None:
 
 
 def _handsfree_wip_count(session: Session) -> int:
-    """Only coordinator-selected, nonterminal topics consume the Handsfree WIP budget."""
+    """Only eligible, coordinator-selected nonterminal topics consume the WIP budget."""
     selected = select(AuditEvent.entity_id).where(
         AuditEvent.action == "handsfree_candidate_selected",
+        AuditEvent.entity_type == "content",
+    )
+    quarantined = select(AuditEvent.entity_id).where(
+        AuditEvent.action == CONTENT_QUARANTINE,
         AuditEvent.entity_type == "content",
     )
     return len(
         session.exec(
             select(Content.id).where(
                 Content.id.in_(selected),
+                Content.id.notin_(quarantined),
                 Content.business_status.notin_(
                     [ContentStatus.ARCHIVED, ContentStatus.PUBLISHED]
                 ),

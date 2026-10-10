@@ -18,8 +18,9 @@ from glance_core.models import (
     utc_now,
 )
 from glance_core.settings import Settings
-from glance_core.task_service import stable_hash
+from glance_core.task_service import TaskConflictError, stable_hash
 from app.business.topic_policy import (
+    _handsfree_wip_count,
     _record_low_water_supplement,
     _source_can_receive_low_water_supplement,
 )
@@ -323,13 +324,15 @@ def test_inherited_exhausted_quota_is_preserved_and_normal_due_poll_bypasses_it(
         )
 
 
-def test_auto_topic_disable_and_two_owned_wip_bound_selection(runtime):
+@pytest.mark.parametrize("quarantined", [False, True])
+def test_auto_topic_disable_and_two_owned_wip_bound_selection(runtime, quarantined):
     enable(runtime, handsfree_auto_topic_enabled=False)
     row = candidate(runtime)
     assist(runtime, row)
     now = utc_now()
     assert runtime.maintenance.run(now=now)["selected"] == 0
     existing = [candidate(runtime) for _ in range(2)]
+    historical = []
     with Session(runtime.engine) as session:
         session.get(RuntimeSetting, "handsfree_auto_topic_enabled").value = "true"
         for index in range(2):
@@ -351,8 +354,100 @@ def test_auto_topic_disable_and_two_owned_wip_bound_selection(runtime):
                     metadata_json={},
                 )
             )
+            if quarantined:
+                session.flush()
+                task = runtime.task_service(session).create_task(
+                    task_type=TaskType.CONTENT_RESEARCH,
+                    instructions="frozen historical research",
+                    input_data={"historical": True},
+                    content_id=content.id,
+                )
+                historical.append((content.id, task.id, task.model_dump(mode="json")))
+                session.add(
+                    AuditEvent(
+                        actor_type="system",
+                        actor_id="import",
+                        entity_type="content",
+                        entity_id=content.id,
+                        action=CONTENT_QUARANTINE,
+                        metadata_json={},
+                    )
+                )
         session.commit()
-    assert runtime.maintenance.run(now=now + INTERVAL)["selected"] == 0
+        assert _handsfree_wip_count(session) == (0 if quarantined else 2)
+    result = runtime.maintenance.run(now=now + INTERVAL)
+    assert result["selected"] == result["prepared"] == int(quarantined)
+    with Session(runtime.engine) as session:
+        for content_id, task_id, before in historical:
+            assert (
+                session.get(Content, content_id).business_status
+                == ContentStatus.WAITING_AGENT
+            )
+            assert session.get(AgentTask, task_id).model_dump(mode="json") == before
+            with pytest.raises(TaskConflictError, match="MPT_MIGRATION_QUARANTINED"):
+                runtime.task_service(session).claim(
+                    agent_id="research-fixture",
+                    capabilities={TaskType.CONTENT_RESEARCH},
+                    task_id=task_id,
+                )
+        if quarantined:
+            new_content = session.exec(
+                select(Content).where(Content.candidate_id == row.id)
+            ).one()
+            assert new_content.business_status == ContentStatus.WAITING_AGENT
+            assert new_content.current_stage == "agent_context"
+            research = session.exec(
+                select(AgentTask).where(
+                    AgentTask.content_id == new_content.id,
+                    AgentTask.task_type == TaskType.CONTENT_RESEARCH,
+                )
+            ).one()
+            assert research.status == TaskStatus.PENDING
+
+
+@pytest.mark.parametrize("status", list(ContentStatus))
+@pytest.mark.parametrize("quarantined", [False, True])
+def test_handsfree_wip_count_preserves_status_and_selection_contract(
+    runtime, status, quarantined
+):
+    rows = [candidate(runtime) for _ in range(2)]
+    with Session(runtime.engine) as session:
+        for index, row in enumerate(rows):
+            content = Content(
+                candidate_id=row.id,
+                title="Existing",
+                content_dir=str(runtime.settings.data_dir / f"old-{index}"),
+                business_status=status,
+            )
+            session.add(content)
+            if index == 0:
+                session.add(
+                    AuditEvent(
+                        actor_type="system",
+                        actor_id="handsfree-coordinator",
+                        entity_type="content",
+                        entity_id=content.id,
+                        action="handsfree_candidate_selected",
+                        metadata_json={},
+                    )
+                )
+                if quarantined:
+                    session.add(
+                        AuditEvent(
+                            actor_type="system",
+                            actor_id="import",
+                            entity_type="content",
+                            entity_id=content.id,
+                            action=CONTENT_QUARANTINE,
+                            metadata_json={},
+                        )
+                    )
+        session.commit()
+        expected = int(
+            not quarantined
+            and status not in {ContentStatus.ARCHIVED, ContentStatus.PUBLISHED}
+        )
+        assert _handsfree_wip_count(session) == expected
 
 
 def test_quarantined_paused_pending_task_is_frozen_and_not_reaped(runtime):
