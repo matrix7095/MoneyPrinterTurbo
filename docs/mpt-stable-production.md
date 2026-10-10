@@ -15,7 +15,7 @@
 | 修复代码与独立验证 | 已部署f8f747e；pipeline SHA与冻结审查一致；971项完整业务回归通过，独立审查APPROVE及53项独立测试通过 | 通过 |
 | 正确提交与文档 | 主目录干净，提交已快进并推送origin/main；本文与证明文件对应 | 通过当前提交检查 |
 | 第7版脚本与素材 | 中文类别口播脚本、SCRIPT_QC、SCRIPT_REVIEW_ASSIST及VISUAL_PLAN_QC通过；六张新图片完成，正式自动调度的ASSET_QC已COMPLETED且passed=true | 通过脚本和素材阶段 |
-| 新成片与影音审核 | 第6版实际画面已证明OpeningIdentity和Concept可见，但CONTENT_QC因关键品牌音频消歧及完整动态观看证据不足返回非通过；第7版音频、事实、权利和技术检查通过；完整动态观察缺失，CONTENT_QC passed=false，正常Recovery已领取 | 未通过 |
+| 新成片与影音审核 | 第6版实际画面已证明OpeningIdentity和Concept可见，但CONTENT_QC因关键品牌音频消歧及完整动态观看证据不足返回非通过；第7版音频、事实、权利和技术检查通过；完整动态观察缺失，CONTENT_QC passed=false，正常Recovery已完成并按3轮上限阻断 | 未通过 |
 | 完整影音审核能力 | 无已启用、已实测的完整媒体理解Provider；Gemini仅是待授权实测入口 | 未通过 |
 | 新视频真实发布 | 最新真实ID仍为旧作品7695010253280234779；本轮没有新PUBLISHED和外部ID | 未通过 |
 | 后续无人值守授权 | 未来尺寸准备授权及Gemini外部上传授权仍待明确答复；本轮授权不可擅自扩大 | 未完成 |
@@ -27,7 +27,7 @@
 
 恢复调度后的原生交接验证发现另一个明确缺陷：服务端v2 Worker title含冒号与连字符，但本宿主原生spawn task_name仅接受小写字母、数字和下划线。原样创建被拒绝，控制器返回HANDOFF_ERROR并停止补位；没有任务被领取、没有重试同一offer。服务端名称生成与真实HTTP契约测试修复已冻结，32项HTTP测试通过，独立审查APPROVE并另跑32项测试通过（9.49秒），be950ce已受管部署并推送，API PID21672/launcher22224及原UI16940健康，授权200/匿名401/UI健康200，调度配置已完整恢复；随后本轮16轮控制器中15个全新Worker名称均通过实际native spawn；最后图片Worker已自然结束，控制器停止补位，未重置预算。正式定时调度也已在新线程01a127aa-74d2-7343-a2a5-2c6199a52c72原样派发第7版素材QC，数据库显示COMPLETED且passed=true。名称交接缺陷已通过实际派发验证，完整成片和真实发布仍待验收。第6版素材QC曾提交超时，当前数据库为CANCELLED且保留passed=true结果，不能把它记成COMPLETED或CONSUMED；第7版QC为独立新任务。当前证据production-cycle-7-progress-proof.json，历史部署证据scheduler-native-name-release-proof.json。
 
-第7版独立成片QC `agt_d26cda3f4bd24b30b780ca007ef9be55` 已COMPLETED，最终视频SHA256为 `94f54e5d77adf1a6ce3042bfb7f8469795dcfd16879d2ee5fdf558ae9343fee2`。批准中文类别口播与同片独立ASR/PCM联合证据支持audio=true，facts/rights/technical亦通过；未声称原生听回。整体仍passed=false：宿主没有可用完整动态理解，本地file播放被拒绝，17张抽帧不足以覆盖连续字幕、身份/概念标签、帧间对应和节奏；结尾轮椅局部出框另列warning。Recovery `agt_fe9cc9d53fdd4b17a89c912db506a87b` 正在执行，不能把再次改脚本或播放器ended当作媒体能力补齐。证据 `production-cycle-7-content-qc-proof.json`。
+第7版独立成片QC `agt_d26cda3f4bd24b30b780ca007ef9be55` 已COMPLETED，最终视频SHA256为 `94f54e5d77adf1a6ce3042bfb7f8469795dcfd16879d2ee5fdf558ae9343fee2`。批准中文类别口播与同片独立ASR/PCM联合证据支持audio=true，facts/rights/technical亦通过；未声称原生听回。整体仍passed=false：宿主没有可用完整动态理解，本地file播放被拒绝，17张抽帧不足以覆盖连续字幕、身份/概念标签、帧间对应和节奏；结尾轮椅局部出框另列warning。Recovery `agt_fe9cc9d53fdd4b17a89c912db506a87b` 已COMPLETED，action=mark_recovery_blocked，同一根因第3轮达到max_rounds=3；服务端已停止重制，但实际content状态为SCRIPT_REVIEW/current_stage=recovery_blocked，尚未证明自动跳过，不能把再次改脚本或播放器ended当作媒体能力补齐。证据 `production-cycle-7-content-qc-proof.json` 和 `production-cycle-7-recovery-terminal-proof.json`。正式调度本轮已NO_TASK且没有active handles。实际阻断状态仍带泛化人工处理提示，正在核对MPT维护是否缺少Handsfree自动跳过消费，不能把计划要求当成归档结果。未来启用完整动态媒体审核路径须先完成实际能力验证，不能重置本内容预算或恢复旧非通过结果。
 
 ## 目标与验收边界
 
