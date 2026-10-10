@@ -961,12 +961,23 @@ def _asset_qc_input(
     task: AgentTask | None,
     plan_task: AgentTask,
 ) -> dict | None:
-    from glance_core.content_acceptance import generated_image_material
+    from glance_core.content_acceptance import _owned_visual_chain, generated_image_material
 
     images = (task.result_data or {}).get("images", []) if task else []
     if not plan_task.result_data:
         return None
-    if plan_task.input_data.get("original_reuse") is not True:
+    full_qc = plan_task.input_data.get("original_reuse") is True
+    if not full_qc and _owned_visual_chain(session, plan_task):
+        reused = [
+            session.get(Artifact, segment["asset_id"])
+            for segment in prepared_visual_plan(session, plan_task).get("segments", [])
+            if segment.get("asset_id") and not segment.get("asset_request")
+        ]
+        full_qc = any(
+            artifact is None or artifact.artifact_type == "agent_generated_image"
+            for artifact in reused
+        )
+    if not full_qc:
         if not task or not images:
             return None
         requests = {

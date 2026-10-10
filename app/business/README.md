@@ -158,3 +158,9 @@ The existing scene-batch filter still applies, and cancelled/strictly older
 versions retain their prior behavior. This protects the shared failure, QC,
 parent-chain and visual-restoration guards without changing stored task IDs,
 timestamps, input hashes or recovery budgets.
+
+Manual plans that reuse owned generated images require fresh full asset QC for
+the current plan, even without the historical `original_reuse` flag. The shared
+factory resolves signed selected images through the existing full-QC branch;
+previous generation/QC results cannot approve a new plan. Source-only plans keep
+their existing behavior; mixed source/generated reuse remains fail closed.

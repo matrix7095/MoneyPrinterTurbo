@@ -657,3 +657,272 @@ def test_reuse_qc_input_during_exact_accepted_generation_consumption(image_contr
         session.commit()
         with pytest.raises(ValueError, match="proof missing"):
             generated_image_material(session, content, image_id)
+
+
+@pytest.fixture
+def manual_reuse_contract(image_contract, request):
+    runtime, content_id, old_plan_id, generation_id, old_qc_id, image_id, _ = image_contract
+    assert runtime.consume_agent(old_qc_id)
+    with Session(runtime.engine) as session:
+        flow = runtime.workflow_service(session)
+        origin = session.get(AgentTask, generation_id)
+        content = session.get(Content, content_id)
+        image_ids = [image_id]
+        for index in range(1, 6):
+            generation = flow.create_agent_task(content_id, TaskType.ASSET_GENERATE_IMAGE,
+                                                {**origin.input_data, "fixture_image": index}, allow_multiple=True)
+            path = Path(content.content_dir) / f"image-{index}.png"
+            path.write_bytes(f"image-fixture-{index}".encode())
+            artifact = Artifact(content_id=content_id, artifact_type="agent_generated_image",
+                                relative_path=path.name, sha256=sha256_file(path), size_bytes=path.stat().st_size,
+                                mime_type="image/png", producer_stage=generation.id)
+            session.add(artifact)
+            record_accepted_completion(session, runtime, generation,
+                                       {"images": [{"segment_index": 0, "artifact_id": artifact.id}]})
+            session.add(AuditEvent(actor_type="system", actor_id="fixture", entity_type="agent_task",
+                                   entity_id=generation.id, action=AGENT_CONSUMED,
+                                   metadata_json={"result_hash": stable_hash(generation.result_data)}))
+            image_ids.append(artifact.id)
+        old_plan = session.get(AgentTask, old_plan_id)
+        segments = [
+            {"asset_id": asset_id, "layout": "image_card", "narration_start_sec": index * 3,
+             "narration_end_sec": (index + 1) * 3}
+            for index, asset_id in enumerate(image_ids[:5])
+        ]
+        shape = getattr(request, "param", "all_generated")
+        allowed_ids = list(image_ids)
+        if shape in {"source_only", "mixed_source"}:
+            path = Path(content.content_dir) / "source.png"
+            path.write_bytes(b"source-image")
+            source = Artifact(content_id=content_id, artifact_type="source_image", relative_path=path.name,
+                              sha256=sha256_file(path), size_bytes=path.stat().st_size, mime_type="image/png",
+                              producer_stage="source_image_acquire")
+            session.add(source)
+            allowed_ids.append(source.id)
+            for segment in segments if shape == "source_only" else segments[-1:]:
+                segment["asset_id"] = source.id
+        elif shape == "future_generation":
+            segments[-1].pop("asset_id")
+            segments[-1]["asset_request"] = {"prompt": "new current plan image"}
+        inputs = {**old_plan.input_data, "allowed_asset_ids": allowed_ids}
+        if shape == "reuse_false":
+            inputs["original_reuse"] = False
+        plan = flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, inputs, allow_multiple=True)
+        record_accepted_completion(session, runtime, plan, {"segments": segments})
+        flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
+        session.commit()
+        plan_id = plan.id
+    assert runtime.consume_agent(plan_id)
+    with Session(runtime.engine) as session:
+        plan_qc = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                                      AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
+                                                      AgentTask.status == TaskStatus.PENDING)).one()
+        record_accepted_completion(session, runtime, plan_qc, {"passed": True})
+        session.commit()
+        plan_qc_id = plan_qc.id
+        frozen = {task.id: (deepcopy(task.input_data), task.input_hash, deepcopy(task.result_data))
+                  for task in session.exec(select(AgentTask).where(AgentTask.content_id == content_id)).all()}
+    return runtime, content_id, plan_id, plan_qc_id, image_ids, frozen
+
+
+@pytest.mark.parametrize("passed", [False, True])
+@pytest.mark.parametrize("manual_reuse_contract", ["all_generated", "reuse_false"], indirect=True)
+def test_manual_reused_images_require_fresh_full_current_qc(manual_reuse_contract, monkeypatch, passed):
+    from glance_core.content_acceptance import generated_image_material, resolved_visual_plan
+
+    runtime, content_id, plan_id, plan_qc_id, image_ids, frozen = manual_reuse_contract
+    monkeypatch.setattr(pipeline, "render_content", lambda *args, **kwargs: pytest.fail("Manual QC auto-rendered"))
+    assert runtime.consume_agent(plan_qc_id)
+    with Session(runtime.engine) as session:
+        plan = session.get(AgentTask, plan_id)
+        assert plan.input_data.get("original_reuse") is not True
+        qc = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                                AgentTask.task_type == TaskType.ASSET_QC,
+                                                AgentTask.status == TaskStatus.PENDING)).one()
+        assert qc.input_data["upstream_task_ids"] == {"visual_plan": plan_id}
+        assert qc.input_data["full_generated_assets"] is True
+        content = session.get(Content, content_id)
+        assert (content.business_status, content.current_stage) == (ContentStatus.WAITING_AGENT, "asset_qc")
+        expected = [{"segment_index": index, **generated_image_material(session, content, asset_id)}
+                    for index, asset_id in enumerate(image_ids[:5])]
+        assert qc.input_data["assets"] == expected
+        assert image_ids[5] not in {item["artifact_id"] for item in expected}
+        script = session.get(AgentTask, plan.input_data["upstream_task_ids"]["script"])
+        assert qc.input_data["script"] == script.result_data
+        assert qc.input_data["context_files"] == [session.get(Artifact, asset_id).relative_path
+                                                   for asset_id in image_ids[:5]]
+        with pytest.raises(ValueError):
+            resolved_visual_plan(session, plan)
+        record_accepted_completion(session, runtime, qc, {"passed": passed})
+        session.commit()
+        qc_id = qc.id
+    assert runtime.consume_agent(plan_qc_id) is False
+    assert runtime.consume_agent(qc_id)
+    assert runtime.consume_agent(qc_id) is False
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        plan = session.get(AgentTask, plan_id)
+        if passed:
+            assert (content.business_status, content.current_stage) == (ContentStatus.PRODUCING, "render_ready")
+            assert resolved_visual_plan(session, plan) == frozen[plan_id][2]
+        else:
+            assert content.current_stage != "render_ready"
+            with pytest.raises(ValueError, match="Full current asset QC"):
+                resolved_visual_plan(session, plan)
+        assert len(session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                                       AgentTask.task_type == TaskType.ASSET_QC,
+                                                       AgentTask.input_data["upstream_task_ids"]["visual_plan"].as_string() == plan_id)).all()) == 1
+        for task_id, snapshot in frozen.items():
+            task = session.get(AgentTask, task_id)
+            assert (task.input_data, task.input_hash, task.result_data) == snapshot
+
+
+@pytest.mark.parametrize("manual_reuse_contract", ["source_only", "mixed_source"], indirect=True)
+def test_reuse_factory_preserves_source_only_and_rejects_mixed_coverage(manual_reuse_contract):
+    runtime, content_id, plan_id, plan_qc_id, _, frozen = manual_reuse_contract
+    with Session(runtime.engine) as session:
+        plan = session.get(AgentTask, plan_id)
+        flow = runtime.workflow_service(session)
+        if all(session.get(Artifact, segment["asset_id"]).artifact_type == "source_image"
+               for segment in plan.result_data["segments"]):
+            assert pipeline._asset_qc_input(session, flow, None, plan) is None
+        else:
+            # Core full coverage includes source asset IDs, which the generated-only factory cannot approve.
+            with pytest.raises(ValueError, match="Current plan image generation is incomplete"):
+                pipeline._asset_qc_input(session, flow, None, plan)
+            with pytest.raises(ValueError, match="Current plan image generation is incomplete"):
+                runtime.consume_agent(plan_qc_id)
+            return
+    assert runtime.consume_agent(plan_qc_id)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        assert (content.business_status, content.current_stage) == (ContentStatus.PRODUCING, "render_ready")
+        assert not session.exec(select(AgentTask).where(AgentTask.task_type == TaskType.ASSET_QC,
+                                                      AgentTask.status == TaskStatus.PENDING)).all()
+        assert session.get(AgentTask, plan_id).result_data == frozen[plan_id][2]
+
+
+@pytest.mark.parametrize("tamper", ["missing", "foreign", "bytes", "generation_input", "plan_input", "undeclared"])
+def test_manual_reuse_factory_rejects_unproven_images(manual_reuse_contract, tamper):
+    runtime, content_id, plan_id, _, image_ids, _ = manual_reuse_contract
+    with Session(runtime.engine) as session:
+        plan = session.get(AgentTask, plan_id)
+        artifact = session.get(Artifact, image_ids[0])
+        if tamper == "missing":
+            for asset_id in image_ids[:5]:
+                session.delete(session.get(Artifact, asset_id))
+        elif tamper == "foreign":
+            candidate = Candidate(source_type="agent", source_id="foreign", source_url="https://example.org/foreign",
+                                  original_title="Other")
+            session.add(candidate)
+            session.flush()
+            other = Content(candidate_id=candidate.id, title="Other",
+                            content_dir=str(runtime.settings.content_dir / "foreign"))
+            session.add(other)
+            session.flush()
+            artifact.content_id = other.id
+            session.add(artifact)
+        elif tamper == "bytes":
+            (Path(session.get(Content, content_id).content_dir) / artifact.relative_path).write_bytes(b"tampered")
+        elif tamper == "generation_input":
+            generation = session.get(AgentTask, artifact.producer_stage)
+            generation.input_data = {**generation.input_data, "tampered": True}
+            session.add(generation)
+        elif tamper == "plan_input":
+            plan.input_data = {**plan.input_data, "tampered": True}
+            session.add(plan)
+        else:
+            # An accepted but undeclared selection must not gain a reuse grant.
+            result = deepcopy(plan.result_data)
+            result["segments"][0]["asset_id"] = image_ids[5]
+            replacement = runtime.workflow_service(session).create_agent_task(
+                content_id, TaskType.VISUAL_PLAN, {**plan.input_data, "allowed_asset_ids": image_ids[:5]},
+                allow_multiple=True)
+            record_accepted_completion(session, runtime, replacement, result)
+            session.add(AuditEvent(actor_type="system", actor_id="fixture", entity_type="agent_task",
+                                   entity_id=replacement.id, action=AGENT_CONSUMED,
+                                   metadata_json={"result_hash": stable_hash(result)}))
+            plan = replacement
+        session.commit()
+        with pytest.raises(ValueError):
+            pipeline._asset_qc_input(session, runtime.workflow_service(session), None, plan)
+
+
+@pytest.mark.parametrize("manual_reuse_contract", ["future_generation"], indirect=True)
+def test_reuse_waits_for_current_generation_and_full_qc_covers_both(manual_reuse_contract):
+    from glance_core.content_acceptance import generated_image_material, resolved_visual_plan
+
+    runtime, content_id, plan_id, plan_qc_id, image_ids, frozen = manual_reuse_contract
+    with Session(runtime.engine) as session:
+        with pytest.raises(ValueError, match="Current plan image generation is incomplete"):
+            pipeline._asset_qc_input(session, runtime.workflow_service(session), None,
+                                     session.get(AgentTask, plan_id))
+    assert runtime.consume_agent(plan_qc_id)
+    with Session(runtime.engine) as session:
+        generation = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                                         AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
+                                                         AgentTask.status == TaskStatus.PENDING)).one()
+        assert generation.input_data["upstream_task_ids"] == {"visual_plan": plan_id}
+        assert generation.input_data["requests"] == [{"segment_index": 4,
+                                                     "asset_request": {"prompt": "new current plan image"}}]
+        content = session.get(Content, content_id)
+        path = Path(content.content_dir) / "current-generation.png"
+        path.write_bytes(b"new-current-image")
+        artifact = Artifact(content_id=content_id, artifact_type="agent_generated_image", relative_path=path.name,
+                            sha256=sha256_file(path), size_bytes=path.stat().st_size,
+                            mime_type="image/png", producer_stage=generation.id)
+        session.add(artifact)
+        record_accepted_completion(session, runtime, generation,
+                                   {"images": [{"segment_index": 4, "artifact_id": artifact.id}]})
+        session.commit()
+        generation_id, artifact_id = generation.id, artifact.id
+    assert runtime.consume_agent(generation_id)
+    with Session(runtime.engine) as session:
+        qc = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                                AgentTask.task_type == TaskType.ASSET_QC,
+                                                AgentTask.status == TaskStatus.PENDING)).one()
+        assert qc.input_data["upstream_task_ids"] == {"visual_plan": plan_id,
+                                                   "asset_generate_image": generation_id}
+        assert qc.input_data["full_generated_assets"] is True
+        expected_ids = image_ids[:4] + [artifact_id]
+        content = session.get(Content, content_id)
+        assert qc.input_data["assets"] == [{"segment_index": index,
+                                           **generated_image_material(session, content, asset_id)}
+                                          for index, asset_id in enumerate(expected_ids)]
+        record_accepted_completion(session, runtime, qc, {"passed": True})
+        session.commit()
+        qc_id = qc.id
+    assert runtime.consume_agent(qc_id)
+    with Session(runtime.engine) as session:
+        plan = session.get(AgentTask, plan_id)
+        assert [segment["asset_id"] for segment in resolved_visual_plan(session, plan)["segments"]] == expected_ids
+        assert (plan.input_data, plan.input_hash, plan.result_data) == frozen[plan_id]
+
+
+def test_current_generation_without_reuse_keeps_generation_scoped_qc(image_contract):
+    runtime, _, plan_id, generation_id, qc_id, _, _ = image_contract
+    with Session(runtime.engine) as session:
+        inputs = pipeline._asset_qc_input(session, runtime.workflow_service(session),
+                                          session.get(AgentTask, generation_id), session.get(AgentTask, plan_id))
+        assert inputs == session.get(AgentTask, qc_id).input_data
+        assert "full_generated_assets" not in inputs
+
+
+def test_reuse_factory_rejects_old_generation_as_current(manual_reuse_contract):
+    runtime, _, plan_id, _, image_ids, _ = manual_reuse_contract
+    with Session(runtime.engine) as session:
+        generation = session.get(AgentTask, session.get(Artifact, image_ids[0]).producer_stage)
+        with pytest.raises(ValueError, match="Generated image is not from current plan/task"):
+            pipeline._asset_qc_input(session, runtime.workflow_service(session), generation,
+                                     session.get(AgentTask, plan_id))
+
+
+def test_portable_unowned_reuse_keeps_legacy_no_qc_route(manual_reuse_contract):
+    runtime, _, plan_id, plan_qc_id, _, _ = manual_reuse_contract
+    with Session(runtime.engine) as session:
+        for event in session.exec(select(AuditEvent).where(AuditEvent.entity_id.in_([plan_id, plan_qc_id]),
+                                                         AuditEvent.action.in_([OWNED, AGENT_CONSUMED]))).all():
+            session.delete(event)
+        session.commit()
+        assert pipeline._asset_qc_input(session, runtime.workflow_service(session), None,
+                                        session.get(AgentTask, plan_id)) is None

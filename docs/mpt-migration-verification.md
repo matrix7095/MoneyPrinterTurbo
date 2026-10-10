@@ -368,3 +368,15 @@ Root's exact final combined business suite passes 687 tests (3120 warnings,
 298.30 seconds) with all six accepted source hashes unchanged. Log:
 `storage/business-visual-context-tie-exact-final-20261010.log`. This closes the
 code regression gate; deployment and fresh actual-media publication are separate.
+
+Manual reuse of the five owned AI images exposed a missing fresh current-plan
+asset-QC task when `original_reuse` was absent or false. The shared factory now
+uses the existing full-QC branch for these owned plans. Independent acceptance
+passes 143 connected tests and actual TCP plan-QC to asset-QC consumption with
+five decoded, hash-verified PNGs. Historical inputs/results remain unchanged;
+denials preserve business state, while corrupt bundle rejection retains its
+existing `bundle_served` audit side effect. Mixed source/generated reuse remains
+fail closed. Report: `storage/manual-reused-asset-qc-independent-review.md`.
+Thirteen selected cases pass on Python 3.11 and 3.13. Root's frozen final full
+business suite passes 703 tests (3120 warnings, 295.55 seconds), recorded in
+`storage/business-manual-reused-asset-qc-exact-final-20261010.log`.
