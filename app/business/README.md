@@ -144,3 +144,11 @@ manual item somebody else's automatic authorization.
 Follow `packages/MIGRATION.md` and `docs/glance-upstream-sync.md`. Review request models, AgentTaskService, CollectionService, bundle/materialization contracts and pipeline consumers together. Keep adapter differences centralized: isolated configuration/auth, source-backed signing, supported consumers, transport/index/hash validation, content serialization and result recovery.
 
 Real AgentClient HTTP tests in `test/business/test_discovery_http.py`, `test/business/test_content_http.py` and `test/business/test_deployment_http.py` use temporary SQLite/filesystem state. They cover discovery rollback/restart/concurrent consumers; dispatch exact-task reservation/capacity/confirmation; research marker-failure replay; actual advance/admin serialization; OS-lock crash release; historical quarantine/recovery exclusion; scoped deployment/scheduler authentication; concurrent plans and expired offers; owned lease reaping; exact model/effort and one-use handoff; changed staged proof; raw header/role/schema/lease denial; upload/context integrity; and lease-authenticated video/cover downloads resolving on port 8010. These fixtures prove transport and persisted-state behavior. They do not prove a live deployment, native Worker creation or a new external publication ID/evidence; those require separate acceptance.
+
+Visual planning and plan QC receive only signed image references through the
+existing lease-authenticated bundle/context endpoints. QC resolves the selected
+current or hash-bound prepared plan, preserving Artifact ownership, generation
+provenance, file size/hash and content-root checks. Bundle manifests bind image
+filenames to Artifact IDs; Windows filename collisions fail closed. Future image
+requests need no fabricated bytes. Transport repair leaves frozen task inputs and
+previous QC results unchanged, and does not approve image or final-video quality.

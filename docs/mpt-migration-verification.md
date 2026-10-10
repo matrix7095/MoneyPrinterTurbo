@@ -339,3 +339,15 @@ alter the 20 previous task rows. A repeat scan created no additional task.
 Public recovery evidence is in
 `storage/smoke/episode-current-review-recovery-20261010/`. These checks do not
 approve final media or establish a new publication.
+
+The visual-image transport repair independently passes 248 connected cases and
+45 cases after the controller resolution was hoisted outside its manifest loop.
+Real loopback TCP probes download all five PNGs for current and prepared-plan
+shapes, enforce authentication/lease/root/size/hash boundaries, and preserve
+frozen input and previous result bytes. Resolution falls from seven whole-image
+passes to three per five-image bundle. The 26 new cases pass on Python 3.11 and
+3.13. Evidence: `storage/visual-context-transport-independent-review.md` and
+`storage/visual-context-py311-20261010.log` /
+`storage/visual-context-py313-20261010.log`. Live plan QC still requires a fresh
+leased attempt with the actual supplied pixels; transport checks are not image
+or publication approval.

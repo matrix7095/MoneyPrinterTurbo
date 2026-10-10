@@ -341,8 +341,8 @@ def bundle(
         get_runtime(request).workflow_service(session),
     )
     if task.content_id:
+        files = context_files_for(task, session)
         for entry in result["context_manifest"]:
-            files = context_files_for(task, session)
             if entry["index"] < len(files):
                 verify_context_artifact(session, content, files[entry["index"]])
     return result

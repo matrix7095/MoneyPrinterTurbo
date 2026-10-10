@@ -23,6 +23,22 @@ from test.business.test_deployment_http import app_for
 from test.business.test_agent_failure_recovery import registered_client
 
 
+def record_accepted_completion(session, runtime, task, result):
+    task.status, task.result_data, task.completed_at = TaskStatus.COMPLETED, result, utc_now()
+    task.attempt, task.assigned_agent_id = 1, "fixture-worker"
+    raw = runtime.settings.agent_submission_dir / task.id / "1" / "result.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(json.dumps(result), encoding="utf-8")
+    session.add(task)
+    session.add(AgentSubmission(task_id=task.id, attempt=1, agent_id=task.assigned_agent_id,
+                               raw_result_path=str(raw), result_hash=stable_hash(result), validation_status="ACCEPTED"))
+    session.add(AuditEvent(actor_type="agent", actor_id=task.assigned_agent_id,
+                           entity_type="agent_task", entity_id=task.id, action="completed",
+                           metadata_json={"result_hash": stable_hash(result)}))
+    session.add(AuditEvent(actor_type="system", actor_id="fixture", entity_type="agent_task",
+                           entity_id=task.id, action=OWNED, metadata_json={"input_hash": task.input_hash}))
+
+
 @pytest.fixture
 def image_contract(tmp_path):
     runtime = make_runtime(tmp_path)
@@ -162,8 +178,7 @@ def test_sparse_preparation_keeps_agent_result_and_qc_bundle_uses_same_frozen_pl
             plan = runtime.workflow_service(session).create_agent_task(content_id, TaskType.VISUAL_PLAN, inputs, allow_multiple=True)
             original = {"segments": [{"asset_id": image_id, "layout": "image_card",
                                       "narration_start_sec": 0, "narration_end_sec": 30, "purpose": "Product"}]}
-            plan.status, plan.result_data, plan.completed_at = TaskStatus.COMPLETED, original, utc_now()
-            session.add(plan)
+            record_accepted_completion(session, runtime, plan, original)
             content = session.get(Content, content_id)
             content.current_stage = "visual_plan"
             session.add(content)

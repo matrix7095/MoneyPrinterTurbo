@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
-from glance_core.content_acceptance import source_context
+from glance_core.content_acceptance import (
+    _owned_visual_chain,
+    _unchanged_material_task,
+    _visual_parent_chain,
+    generated_image_material,
+    source_context,
+)
 from glance_core.models import (
     AgentTask,
     AgentSubmission,
@@ -699,6 +705,8 @@ def build_bundle(
                 context_files,
                 list(task.input_data.get("scenes", []) or []),
             )
+            for artifact in _visual_image_artifacts(task, session):
+                context_manifest[context_files.index(artifact.relative_path)]["input_ref"] = artifact.id
     bundle_errors = _bundle_contract_errors(
         session,
         task,
@@ -784,6 +792,95 @@ def build_bundle(
     }
 
 
+def _visual_image_artifacts(task: AgentTask, session: Session) -> list[Artifact]:
+    """Transport only signed image references, with the existing material provenance checks."""
+    if task.task_type not in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC}:
+        return []
+    try:
+        if stable_hash(task.input_data) != task.input_hash:
+            raise ValueError("Visual context task input changed")
+        plan = task
+        ids = task.input_data.get("allowed_asset_ids", [])
+        if not isinstance(ids, list) or any(not isinstance(item, str) or not item for item in ids):
+            raise ValueError("Visual context image whitelist is invalid")
+        if task.task_type == TaskType.VISUAL_PLAN_QC:
+            ref = task.input_data.get("upstream_task_ids", {}).get("visual_plan")
+            if not ref:
+                if ids or "prepared_visual_plan" in task.input_data or "visual_plan" in task.input_data:
+                    raise ValueError("Visual context plan lineage unavailable")
+                return []
+            plan = session.get(AgentTask, ref) if isinstance(ref, str) else None
+            if (plan is None or plan.content_id != task.content_id
+                    or plan.task_type != TaskType.VISUAL_PLAN or plan.status != TaskStatus.COMPLETED):
+                raise ValueError("Visual context plan lineage unavailable")
+            current = session.exec(select(AgentTask).where(
+                AgentTask.content_id == task.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+                AgentTask.status != TaskStatus.CANCELLED,
+            ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+            if current is None or current.id != plan.id:
+                raise ValueError("Visual context plan is stale")
+            owned = _owned_visual_chain(session, plan)
+            _unchanged_material_task(session, plan, owned=owned)
+            if owned:
+                _visual_parent_chain(session, plan, owned=True)
+            selected = plan.result_data or {}
+            if "prepared_visual_plan" in task.input_data:
+                if task.input_data.get("visual_plan_result_sha256") != stable_hash(selected):
+                    raise ValueError("Prepared visual plan source changed")
+                selected = task.input_data["prepared_visual_plan"]
+            if not isinstance(selected, dict) or not isinstance(selected.get("segments", []), list):
+                raise ValueError("Visual context plan is invalid")
+            ids = []
+            for segment in selected.get("segments", []):
+                if not isinstance(segment, dict) or not isinstance(segment.get("asset_request") or {}, dict):
+                    raise ValueError("Visual context segment is invalid")
+                if segment.get("asset_id"):
+                    asset_id = segment["asset_id"]
+                    if (asset_id not in plan.input_data.get("allowed_asset_ids", [])
+                            or ("allowed_asset_ids" in task.input_data
+                                and asset_id not in task.input_data["allowed_asset_ids"])):
+                        raise ValueError("Visual context image is not declared by plan/QC")
+                    ids.append(asset_id)
+                request = segment.get("asset_request") or {}
+                if request.get("reference_artifact_id"):
+                    reference_id = request["reference_artifact_id"]
+                    if reference_id not in plan.input_data.get("allowed_reference_artifact_ids", []):
+                        raise ValueError("Visual context reference is not declared by plan")
+                    ids.append(reference_id)
+        if not ids:
+            return []
+        if any(not isinstance(item, str) or not item for item in ids):
+            raise ValueError("Visual context image reference is invalid")
+        content = session.get(Content, task.content_id) if task.content_id else None
+        if content is None:
+            raise ValueError("Visual context content unavailable")
+        root = Path(content.content_dir).resolve()
+        artifacts = []
+        for artifact_id in dict.fromkeys(ids):
+            artifact = session.get(Artifact, artifact_id)
+            if artifact is None or artifact.content_id != content.id:
+                raise ValueError("Visual context image missing/foreign")
+            if (task.task_type == TaskType.VISUAL_PLAN
+                    and artifact.artifact_type == "agent_generated_video"
+                    and artifact.mime_type.startswith("video/")):
+                continue
+            if (artifact.artifact_type not in {"source_image", "agent_generated_image"}
+                    or artifact.mime_type not in {"image/png", "image/jpeg", "image/webp"}
+                    or Path(artifact.relative_path).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}):
+                raise ValueError("Visual context Artifact is not a supported image")
+            if artifact.artifact_type == "agent_generated_image":
+                generated_image_material(session, content, artifact.id)
+            else:
+                target = (root / artifact.relative_path).resolve()
+                if (root not in target.parents or not target.is_file()
+                        or target.stat().st_size != artifact.size_bytes or sha256_file(target) != artifact.sha256):
+                    raise ValueError("Visual context image bytes unavailable/changed")
+            artifacts.append(artifact)
+        return artifacts
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 def context_files_for(task: AgentTask, session: Session | None = None) -> list[str]:
     # Bundle and download must share indices after video filtering; never mutate the leased hash.
     files = _filter_context_files(
@@ -795,6 +892,14 @@ def context_files_for(task: AgentTask, session: Session | None = None) -> list[s
         TaskType.VISUAL_PLAN_QC,
     }:
         files = _scene_context_files(list(task.input_data.get("scenes", []) or []))
+    if session is not None:
+        for artifact in _visual_image_artifacts(task, session):
+            if artifact.relative_path not in files:
+                files.append(artifact.relative_path)
+        if task.task_type in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC}:
+            names = [Path(path).name.casefold() for path in files]
+            if len(names) != len(set(names)):
+                raise HTTPException(status_code=409, detail="Visual context filenames collide")
     if session is not None and task.task_type in _VIDEO_CONTEXT_TASKS:
         for field in ("video_artifact_id", "publish_artifact_id", "cover_artifact_id"):
             artifact_id = task.input_data.get(field)
