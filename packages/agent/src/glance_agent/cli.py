@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import platform
+import re
 import shutil
 import sys
 import tempfile
@@ -1544,7 +1545,14 @@ def prepare_image(
             directory, resolved_task_id = _task_workspace(config, task_id)
             if config.role_id != "image":
                 raise ValueError("prepare-image requires the image role")
-            response = prepare(directory, resolved_task_id, config.agent_id, file, segment_index)
+            lease = load_json(directory / ".lease.json")
+            agent_id = lease.get("agent_id") if isinstance(lease, dict) else None
+            # Role launchers reload the base identity; dispatch stores the frozen fresh identity.
+            if not isinstance(agent_id, str) or not re.fullmatch(
+                re.escape(config.agent_id) + r"(?:-[0-9a-f]{12})?", agent_id
+            ):
+                raise ValueError("Image preparation requires this agent's local task lease")
+            response = prepare(directory, resolved_task_id, agent_id, file, segment_index)
         except typer.Exit:
             raise
         except (ValueError, RuntimeError) as exc:

@@ -137,6 +137,102 @@ def test_cli_is_local_and_returns_receipt(workspace, monkeypatch):
     assert json.loads(result.output)["status"] == "PREPARED"
 
 
+def test_fresh_dispatch_confirm_claim_then_prepare_with_role_launcher(workspace, monkeypatch):
+    directory, source, config = workspace
+    config.agent_id = "mpt-codex-image"
+    fresh_id = "mpt-codex-image-5d1ed7f343ce"
+    task_id = "agt_image_prepare"
+    bundle = {
+        "task": json.loads((directory / "task.json").read_text()),
+        "input": json.loads((directory / "input.json").read_text()),
+        "result_schema": {}, "instructions": "isolated",
+    }
+    calls = []
+
+    class Client:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def dispatch(self, **kwargs):
+            assert self.settings.agent_id == fresh_id
+            assert kwargs["task_id"] == task_id
+            calls.append("dispatch")
+            return {"should_run": True, "task_id": task_id, "lease_token": "isolated-lease",
+                    "bundle_url": "/isolated", "prompt": "frozen worker prompt"}
+
+        def bundle(self, url, token):
+            assert (url, token) == ("/isolated", "isolated-lease")
+            return bundle
+
+        def confirm_claim(self, actual_task_id, token, agent_id):
+            assert self.settings.agent_id == "mpt-codex-image"
+            assert (actual_task_id, token, agent_id) == (task_id, "isolated-lease", fresh_id)
+            calls.append("confirm-claim")
+            return {"status": "LEASED"}
+
+    # Each launcher invocation reloads its base identity; dispatch's override is process-local.
+    monkeypatch.setattr(cli, "settings", lambda: config.model_copy())
+    monkeypatch.setattr(cli, "AgentClient", Client)
+    runner = CliRunner()
+    dispatched = runner.invoke(cli.app, ["dispatch", "--wait", "0", "--task-id", task_id,
+                                         "--task-type", "asset_generate_image", "--agent-id", fresh_id])
+    assert dispatched.exit_code == 0, dispatched.output
+    assert dispatched.output.strip() == "frozen worker prompt"
+    confirmed = runner.invoke(cli.app, ["confirm-claim", task_id])
+    assert confirmed.exit_code == 0, confirmed.output
+    immutable = {path: path.read_bytes() for path in [source, *(directory / name for name in ("task.json", "input.json", ".lease.json"))]}
+    monkeypatch.setattr(cli, "AgentClient", lambda *a, **kw: pytest.fail("preparation must remain local"))
+    args = ["prepare-image", task_id, str(source), "--segment-index", "3"]
+    prepared = runner.invoke(cli.app, args)
+    assert prepared.exit_code == 0, prepared.output
+    receipt = json.loads(prepared.output)
+    with Image.open(receipt["path"]) as actual:
+        assert actual.format == "PNG" and actual.size == (1080, 1920)
+    repeated = runner.invoke(cli.app, args)
+    assert repeated.exit_code == 0, repeated.output
+    assert json.loads(repeated.output) == receipt
+    assert receipt["source_sha256"] == hashlib.sha256(immutable[source]).hexdigest()
+    assert all(path.read_bytes() == value for path, value in immutable.items())
+    assert calls == ["dispatch", "confirm-claim"]
+
+
+@pytest.mark.parametrize("agent_id", ["other-agent", "mpt-other-image-5d1ed7f343ce",
+                                    "image-test-5d1ed7f343c", "image-test-5d1ed7f343ce-extra",
+                                    "image-test-5D1ED7F343CE", "image-test-5d1ed7f343cg", None])
+def test_cli_refuses_foreign_or_malformed_fresh_identity(workspace, agent_id):
+    directory, source, _ = workspace
+    lease_path = directory / ".lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease["agent_id"] = agent_id
+    lease_path.write_text(json.dumps(lease))
+    result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output)["status"] == "REJECTED"
+    assert not (directory / "prepared-images").exists()
+
+
+def test_cli_refuses_other_role(workspace):
+    directory, source, config = workspace
+    config.role_id = "research"
+    result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
+    assert result.exit_code == 2, result.output
+    assert "requires the image role" in json.loads(result.output)["detail"]
+    assert not (directory / "prepared-images").exists()
+
+
+@pytest.mark.parametrize("field,value", [("task_id", "agt_other"), ("lease_token", "")])
+def test_cli_preserves_exact_lease_task_and_token_checks(workspace, field, value):
+    directory, source, _ = workspace
+    lease_path = directory / ".lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease[field] = value
+    lease_path.write_text(json.dumps(lease))
+    result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
+    assert result.exit_code == 2, result.output
+    assert "local task lease" in json.loads(result.output)["detail"]
+    assert not (directory / "prepared-images").exists()
+
+
 @pytest.mark.parametrize("arguments", [["../outside"], ["agt_unrelated"], ["agt_image_prepare", "--segment-index", "4"]])
 def test_cli_rejects_invalid_tasks_and_segments(workspace, arguments):
     _, source, _ = workspace

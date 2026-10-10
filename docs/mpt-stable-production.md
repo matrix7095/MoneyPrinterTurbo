@@ -146,3 +146,10 @@ NO_TASK 且无活动 handle 时结束；DISABLED、BLOCKED、HANDOFF_ERROR 停�
 使用现有业务方法 `repair_stalled_asset_generation` 创建谱系关联的新任务 `agt_8063b6337aad401c9f81fe39eb6ccfd9`，原失败任务 ID 保存在 `manual_repair_source_task_id`，8 项冻结请求和最低尺寸保持不变。该版本当前 PENDING，尚未领取、上传、质检或发布；证明文件为主目录 `storage/smoke/stable-production-20261010/image-authorized-repair-proof.json`。这次恢复是正常业务方法创建新版本，不是直接改写旧任务或数据库放行。
 
 为代码更新暂时通过正式调度配置关闭新派发，已有原生 Worker 自然结束，最新只读检查无 LEASED 任务。服务和界面仍在线；完成受管部署核验后必须恢复调度 enabled=true，保持原容量与每日 1 条、120 分钟间隔限制。
+00:17 补丁 `396424e5674a5c5f843a510d3f3c3798c89d55b9` 已快进部署到主目录并推送 origin/main；停止前租约数为 0。API 新监听 PID 20060、启动 PID 8848，UI 原健康 PID 16940 保留。正式内容接口授权 200、匿名 401，UI 健康 200；Watchdog 已恢复 Ready，正式调度配置 enabled=true、容量 2。部署证明：主目录 storage/smoke/stable-production-20261010/opening-identity-release-runtime-proof.json；最终测试日志和最新六次真实渲染证据已复制保留在主目录证明目录。
+
+00:18 主线程开始新的契约 2 调度轮，READY 返回图片修复任务与另一个 RECOVERY 任务；均已使用计划原文创建全新当前任务原生 Worker，实际继承 Sol/high。原生 spawn 接口只提供合法 task_name，不提供标题字段，服务端要求标题保存在计划元数据中，未把含冒号的标题误传为 task_name。新图片 Worker 会直接继承本线程的真实用户授权，未向旧聊天发送消息或修改冻结交接文件。
+00:24 图片修复 Worker 已直接收到并确认用户的本机准备授权，成功领取新任务后原生生成首图；因此授权传递已不再阻塞当前周期。但真实 `prepare-image` 调用暴露本地租约识别故障，返回 `Image preparation requires this agent''s local task lease`。Worker 未绕行、重复领取或上传，正常 fail --retryable 上报 `IMAGE_PREPARATION_LOCAL_LEASE_REJECTED`，服务端任务回到 PENDING；其余 7 图未生成。首图原件保留在该 Worker 的原生生成目录，不能把本次记为已生成全套或已完成素材审核。
+
+同轮另一个 RECOVERY Worker 已 COMPLETED/CONSUMED，正常创建另一条内容的脚本修复计划。两个当前 Worker 均已终态；控制面下一轮返回契约 2 DISABLED。为修复本地租约识别暂时关闭新派发，代码诊断正在进行；服务和界面保持在线。此处记录的是部署后发现的新运行缺陷，816 项既有绿测未覆盖真实新 Worker 身份的准备命令调用链。
+本地租约缺陷已修复：dispatch 使用一次性 Worker 身份，后续 CLI 恢复启动器基础身份，prepare-image 原先未读取租约身份。现仅接受基础身份或其合法 12 位十六进制派发后缀，继续使用既有精确任务、身份、令牌与文件校验。修改前同路径回归复现 1 failed / 35 passed；修改后四模块联合 172 passed，独立复审 36 passed、APPROVE、0 问题，Ruff、编译与 diff 检查通过。此改动仅影响新 CLI 进程，无需重启 API 或 UI；816 项完整回归属于前一渲染器版本，不能宣称覆盖本次 CLI 改动。正式新 Worker 的图片准备、后续质检与真实发布仍待运行验收。
