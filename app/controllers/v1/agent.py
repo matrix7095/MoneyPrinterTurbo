@@ -622,6 +622,18 @@ def retry_failure_recovery(*, task_id: str, request: Request):
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
+@router.post("/agent/tasks/{task_id}/content-qc-recovery", dependencies=[Depends(require_admin)])
+def retry_content_qc_recovery(*, task_id: str, request: Request):
+    try:
+        return get_runtime(request).schedule_content_qc_recovery(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found") from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except RuntimeSettingsError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
 def content_root(content: Content, runtime) -> Path:
     root = Path(content.content_dir).resolve()
     if not root.is_relative_to(runtime.settings.content_dir.resolve()):

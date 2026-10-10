@@ -16,6 +16,7 @@ from sqlmodel import Session, select
 
 from glance_core.models import (
     AgentTask,
+    Artifact,
     AuditEvent,
     Candidate,
     Content,
@@ -86,6 +87,23 @@ class ArchiveService:
         content = self.session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
+        content_root = Path(content.content_dir).resolve()
+        final_artifact = self.session.exec(
+            select(Artifact)
+            .where(Artifact.content_id == content_id, Artifact.artifact_type == "final_video")
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+        ).first()
+        final_video = content_root / (
+            final_artifact.relative_path if final_artifact else "render/final.mp4"
+        )
+        if final_artifact and (
+            not final_video.resolve().is_relative_to(content_root)
+            or not final_video.is_file()
+            or final_video.stat().st_size != final_artifact.size_bytes
+            or _sha256_file(final_video) != final_artifact.sha256
+        ):
+            raise ArchiveError("Current final video failed archive integrity validation")
+        video_sha256 = _sha256_file(final_video) if final_video.is_file() else ""
         candidate = self.session.get(Candidate, content.candidate_id)
         tasks = self.session.exec(
             select(AgentTask)
@@ -98,7 +116,6 @@ class ArchiveService:
             .order_by(PublicationRecord.published_at)
         ).all()
         self.ensure_repo()
-        content_root = Path(content.content_dir).resolve()
         target = self.repo_dir / str(content.created_at.year) / content.id
         target.mkdir(parents=True, exist_ok=True)
 
@@ -153,13 +170,12 @@ class ArchiveService:
             if source_path.is_file():
                 shutil.copy2(source_path, target / name)
 
-        final_video = content_root / "render" / "final.mp4"
         entry = {
             "content_id": content.id,
             "title": content.title,
             "title_fp": normalize_title(content.title),
             "normalized_url": candidate.normalized_url if candidate else "",
-            "video_sha256": _sha256_file(final_video) if final_video.is_file() else "",
+            "video_sha256": video_sha256,
             "packaged_at": utc_now().isoformat(),
         }
         with (self.repo_dir / "index.jsonl").open("a", encoding="utf-8") as handle:

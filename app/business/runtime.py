@@ -11,10 +11,11 @@ from fastapi import Depends, HTTPException, Request
 from glance_collector.service import CollectionService
 from glance_core.database import begin_immediate, build_engine, create_db
 from glance_core.models import AgentSubmission, AgentTask, AgentWorker, Artifact, AuditEvent, Content, ContentStatus, SchedulerOffer, Source, TaskStatus, TaskType, as_utc, utc_now
-from glance_core.runtime_config import effective_settings
+from glance_core.runtime_config import RuntimeSettingsError, effective_settings
 from glance_core.settings import Settings
 from glance_core.task_service import AgentTaskService, TaskConflictError, stable_hash
 from glance_core.workflow import WorkflowService, parse_platform_domains
+from glance_media.executor import NonRetryableMediaError
 from sqlmodel import Session, select
 
 from app.business.consumption import content_operation_lock
@@ -31,6 +32,7 @@ CONSUMED = "mpt_discovery_consumed"
 AGENT_CONSUMED = "mpt_agent_consumed"
 OWNED = "mpt_task_owned"
 FAILURE_RECOVERY = "mpt_failure_recovery_created"
+QC_RECOVERY = "mpt_content_qc_recovery_created"
 
 
 def _require_owned_input(session, task, *, consumed=False):
@@ -389,6 +391,222 @@ class BusinessRuntime:
                 finally:
                     session.rollback()
 
+    def _require_accepted_native_task(self, session, task, *, consumed):
+        from glance_core.content_acceptance import _unchanged_material_task
+
+        _require_owned_input(session, task, consumed=consumed)
+        _unchanged_material_task(session, task, owned=True, consumed=consumed)
+        self._require_native_deployment(session, task)
+        submission = session.exec(select(AgentSubmission).where(
+            AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+            AgentSubmission.validation_status == "ACCEPTED",
+        )).one()
+        raw = (self.settings.agent_submission_dir / task.id / str(task.attempt) / "result.json").resolve()
+        if (Path(submission.raw_result_path).resolve() != raw
+                or not raw.is_relative_to(self.settings.agent_submission_dir.resolve())
+                or stable_hash(json.loads(raw.read_text(encoding="utf-8"))) != stable_hash(task.result_data)):
+            raise TaskConflictError("RECOVERY_ACCEPTED_RESULT_CHANGED")
+
+    def _content_qc_source(self, session, task_id, *, consumed=True, recovery_id=None):
+        from glance_core.content_acceptance import verify_acceptance
+        from glance_core.task_schemas import ContentAcceptanceResult
+        from app.business.pipeline import _render_voice_path
+        from app.business.bundles import sha256_file
+
+        task = session.get(AgentTask, task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if (task.task_type != TaskType.CONTENT_QC or task.schema_version != "2"
+                or not isinstance(task.input_data, dict)
+                or task.status != TaskStatus.COMPLETED or not isinstance(task.result_data, dict)
+                or task.result_data.get("passed") is not False
+                or task.input_data.get("source_context_version") != 1
+                or task.input_data.get("audio_evidence_version") != 1):
+            raise TaskConflictError("RECOVERY_REQUIRES_FAILED_V2_CONTENT_QC")
+        ContentAcceptanceResult.model_validate(task.result_data)
+        self._require_accepted_native_task(session, task, consumed=consumed)
+        _require_current_revision(session, task)
+        _require_reconciled_content(session, task.content_id)
+        content = session.get(Content, task.content_id)
+        if content is None or content.business_status in {
+            ContentStatus.ARCHIVED, ContentStatus.PUBLISHED, ContentStatus.REJECTED, ContentStatus.PACKAGED,
+        }:
+            raise TaskConflictError("RECOVERY_CONTENT_NOT_CURRENT")
+        if session.exec(select(AgentTask.id).where(
+            AgentTask.content_id == task.content_id, AgentTask.id != recovery_id,
+            AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+        )).first() or session.exec(select(SchedulerOffer.request_id).where(
+            SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == task.content_id)),
+            SchedulerOffer.task_id != recovery_id, SchedulerOffer.expires_at > utc_now(),
+        )).first():
+            raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+        root = Path(content.content_dir).resolve()
+        if not root.is_relative_to(self.settings.content_dir.resolve()):
+            raise TaskConflictError("RECOVERY_CONTENT_STORAGE_CHANGED")
+        verify_acceptance(session, task, task.result_data)
+        script = session.get(AgentTask, task.input_data["upstream_task_ids"]["script"])
+        plan = session.get(AgentTask, task.input_data["upstream_task_ids"]["visual_plan"])
+        for parent in (script, plan):
+            _require_owned_input(session, parent, consumed=True)
+            _require_current_revision(session, parent)
+        _render_voice_path(session, content, plan.input_data.get("visual_timing_evidence"),
+                           plan.input_data.get("voice_artifact"))
+        frozen = deepcopy(task.input_data)
+        receipt_id = frozen.get("acceptance_receipt_artifact_id")
+        receipts = session.exec(select(Artifact).where(
+            Artifact.content_id == content.id, Artifact.artifact_type == "acceptance_input",
+            Artifact.id == receipt_id if receipt_id else Artifact.relative_path == "render/acceptance-input.json",
+        )).all()
+        if len(receipts) != 1:
+            raise TaskConflictError("RECOVERY_ACCEPTANCE_RECEIPT_MISSING")
+        receipt = receipts[0]
+        path = (root / receipt.relative_path).resolve()
+        if (not path.is_relative_to(root) or not path.is_file()
+                or path.stat().st_size != receipt.size_bytes or sha256_file(path) != receipt.sha256):
+            raise TaskConflictError("RECOVERY_ACCEPTANCE_RECEIPT_CHANGED")
+        original_receipt = json.loads(path.read_text(encoding="utf-8"))
+        if "audio_evidence" not in original_receipt:
+            frozen.pop("audio_evidence_version")
+            frozen.pop("audio_evidence")
+            frozen["acceptance_subject"].pop("audio_evidence_sha256")
+        if original_receipt != frozen:
+            raise TaskConflictError("RECOVERY_ACCEPTANCE_RECEIPT_CHANGED")
+        audio = task.input_data["audio_evidence"]
+        path = (root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json").resolve()
+        if (not path.is_relative_to(root) or not path.is_file()
+                or json.loads(path.read_text(encoding="utf-8")) != audio):
+            raise TaskConflictError("RECOVERY_AUDIO_EVIDENCE_CHANGED")
+        return task, script
+
+    def _create_content_qc_recovery(self, session, task):
+        from app.business.pipeline import create_content_qc_recovery, workflow
+
+        current = effective_settings(session, self.settings)
+        flow = workflow(session, current)
+        flow.tasks = self.task_service(session)
+        script = session.get(AgentTask, task.input_data["upstream_task_ids"]["script"])
+        before = set(session.exec(select(AgentTask.id).where(AgentTask.task_type == TaskType.RECOVERY)).all())
+        owned = select(AuditEvent.entity_id).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.action == OWNED,
+            AuditEvent.metadata_json["input_hash"].as_string() == AgentTask.input_hash,
+        )
+        with filter_task_reads(session, eligible_task_clause() & (
+            (AgentTask.task_type != TaskType.RECOVERY) | AgentTask.id.in_(owned)
+        )):
+            recovery = create_content_qc_recovery(flow, task, script)
+        if recovery is not None:
+            if recovery.id in before:
+                self._check_content_qc_recovery_receipt(session, recovery, task, script)
+            else:
+                session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                       entity_id=recovery.id, action=OWNED,
+                                       metadata_json={"input_hash": recovery.input_hash}))
+                session.add(AuditEvent(actor_type="system", actor_id="mpt-content-qc", entity_type="agent_task",
+                                       entity_id=recovery.id, action=QC_RECOVERY, metadata_json={
+                                           "source_task_id": task.id, "source_input_hash": task.input_hash,
+                                           "source_result_hash": stable_hash(task.result_data), "source_attempt": task.attempt,
+                                           "recovery_input_hash": recovery.input_hash, "target_task_id": script.id,
+                                           "target_input_hash": script.input_hash, "target_result_hash": stable_hash(script.result_data),
+                                       }))
+        return {"recovery_status": recovery.status.value if recovery else
+                "DEFERRED" if flow.recovery_capacity_deferred else "BLOCKED",
+                "recovery_task_id": recovery.id if recovery else None}
+
+    def _check_content_qc_recovery_receipt(self, session, recovery, source, script):
+        _require_owned_input(session, recovery)
+        receipts = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == QC_RECOVERY,
+        )).all()
+        expected = {"source_task_id": source.id, "source_input_hash": source.input_hash,
+                    "source_result_hash": stable_hash(source.result_data), "source_attempt": source.attempt,
+                    "recovery_input_hash": recovery.input_hash, "target_task_id": script.id,
+                    "target_input_hash": script.input_hash, "target_result_hash": stable_hash(script.result_data)}
+        if (len(receipts) != 1 or receipts[0].metadata_json != expected or recovery.content_id != source.content_id
+                or recovery.input_data.get("failure", {}).get("source_task_id") != source.id
+                or recovery.input_data.get("failure", {}).get("source_attempt") != source.attempt
+                or recovery.input_data.get("failure", {}).get("failure_class") != "BUSINESS_QC"
+                or recovery.input_data.get("lineage", {}).get("repair_target_task_id") != script.id):
+            raise TaskConflictError("RECOVERY_QC_RECEIPT_CHANGED")
+
+    def schedule_content_qc_recovery(self, task_id, *, consuming=False):
+        with Session(self.engine) as session:
+            task = session.get(AgentTask, task_id)
+            if task is None:
+                raise KeyError(task_id)
+            key = task.content_id or task.id
+        with content_operation_lock(self.settings, key):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    task, _ = self._content_qc_source(session, task_id, consumed=not consuming)
+                    marker = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_id == task.id, AuditEvent.action == AGENT_CONSUMED,
+                    )).first()
+                    if consuming and marker is not None:
+                        if marker.metadata_json.get("result_hash") != stable_hash(task.result_data):
+                            raise TaskConflictError("RECOVERY_SOURCE_RESULT_CHANGED")
+                        return False
+                    result = self._create_content_qc_recovery(session, task)
+                    if consuming:
+                        session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                               entity_id=task.id, action=AGENT_CONSUMED,
+                                               metadata_json={"result_hash": stable_hash(task.result_data)}))
+                    Session.commit(session)
+                    return True if consuming else result
+                except RuntimeSettingsError:
+                    raise
+                except (OSError, ValueError, KeyError, TypeError, NonRetryableMediaError) as exc:
+                    if isinstance(exc, KeyError) and str(exc).strip("'") == task_id:
+                        raise
+                    raise TaskConflictError(str(exc)) from exc
+                finally:
+                    session.rollback()
+
+    def _consume_content_qc_recovery(self, task_id):
+        with Session(self.engine) as session:
+            task = session.get(AgentTask, task_id)
+            key = task.content_id or task.id
+        with content_operation_lock(self.settings, key):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    recovery = session.get(AgentTask, task_id)
+                    marker = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_id == task_id, AuditEvent.action == AGENT_CONSUMED,
+                    )).first()
+                    if marker is not None:
+                        if marker.metadata_json.get("result_hash") != stable_hash(recovery.result_data):
+                            raise TaskConflictError("RECOVERY_SOURCE_RESULT_CHANGED")
+                        return False
+                    self._require_accepted_native_task(session, recovery, consumed=False)
+                    source, script = self._content_qc_source(session, recovery.input_data.get("failure", {}).get("source_task_id"),
+                                                             recovery_id=recovery.id)
+                    self._check_content_qc_recovery_receipt(session, recovery, source, script)
+                    result = recovery.result_data or {}
+                    if (result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
+                            and (result.get("target_task_type") or "short_script") != "short_script"):
+                        raise TaskConflictError("RECOVERY_QC_TARGET_CHANGED")
+                    from app.business.pipeline import workflow
+                    flow = workflow(session, effective_settings(session, self.settings))
+                    flow.tasks = self.task_service(session)
+                    repair = flow.apply_recovery_plan(recovery)
+                    if repair is not None:
+                        session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                               entity_id=repair.id, action=OWNED,
+                                               metadata_json={"input_hash": repair.input_hash}))
+                    session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                           entity_id=recovery.id, action=AGENT_CONSUMED,
+                                           metadata_json={"result_hash": stable_hash(recovery.result_data)}))
+                    Session.commit(session)
+                    return True
+                except RuntimeSettingsError:
+                    raise
+                except (OSError, ValueError, KeyError, TypeError, NonRetryableMediaError) as exc:
+                    raise TaskConflictError(str(exc)) from exc
+                finally:
+                    session.rollback()
+
     def _failure_recovery_needs_apply(self, session, recovery):
         receipt = session.exec(select(AuditEvent).where(
             AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
@@ -478,6 +696,16 @@ class BusinessRuntime:
                 ):
                     raise ValueError("Consumed Agent result changed")
                 return False
+        if kind == TaskType.CONTENT_QC and task.schema_version == "2" and (task.result_data or {}).get("passed") is False:
+            return self.schedule_content_qc_recovery(task_id, consuming=True)
+        if kind == TaskType.RECOVERY:
+            with Session(self.engine) as session:
+                native_qc = session.exec(select(AuditEvent.id).where(
+                    AuditEvent.entity_id == task_id, AuditEvent.action.in_([QC_RECOVERY, "recovery_task_created"]),
+                    AuditEvent.actor_id == "mpt-content-qc",
+                )).first()
+            if native_qc:
+                return self._consume_content_qc_recovery(task_id)
         if kind == TaskType.SOURCE_DISCOVERY:
             return self.consume_discovery(task_id)
         if kind not in self.supported_task_types:

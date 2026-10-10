@@ -1,7 +1,11 @@
 """Glance acquisition/QC helpers with MPT's real deterministic render backend."""
 
 import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from glance_media.executor import (
     FONT_ASSET_DIR,
@@ -12,7 +16,6 @@ from glance_media.executor import (
     _encoder_args,
     _finite_seconds,
     _image_dimensions,
-    _promote_render_output,
     _select_timing_boundaries,
     _stream_dimensions,
     _with_transition,
@@ -26,7 +29,7 @@ from glance_media.executor import (
 )
 from glance_media.render_plan import RenderPlan
 
-from app.services.video_project import VideoProject, _atomic_json
+from app.services.video_project import VideoProject, _atomic_json, _lock
 
 
 class MptMediaExecutor(MediaExecutor):
@@ -169,7 +172,12 @@ class MptMediaExecutor(MediaExecutor):
 
         project = VideoProject(self.root / "render" / "mpt-project")
         request = {"project_id": self.root.name, "scenes": project_scenes}
+        if bgm_path is not None and not Path(bgm_path).is_file():
+            raise NonRetryableMediaError("Requested BGM file is missing")
         request_receipt = {
+            "voice_sha256": sha256_file(voice_path),
+            "bgm_sha256": sha256_file(Path(bgm_path)) if bgm_path else None,
+            "bgm_volume": bgm_volume,
             "request": request,
             "prepared_sha256": [
                 [sha256_file(Path(scene["footage"])), sha256_file(Path(scene["audio"]))]
@@ -180,15 +188,20 @@ class MptMediaExecutor(MediaExecutor):
         revision = project.revision() if metadata.get("current_revision") else None
         # Match the frozen request before reusing an interrupted revision; never reuse replacement assets.
         receipt = self.root / "render" / "mpt-render-request.json"
-        if revision is None or not receipt.is_file() or json.loads(receipt.read_text(encoding="utf-8")) != request_receipt:
+        if revision is None or not receipt.is_file() or json.loads(receipt.read_text(encoding="utf-8")) != {
+            **request_receipt, "revision_id": revision["revision_id"],
+        }:
             revision = project.create_revision(request)
-            _atomic_json(receipt, request_receipt)
+            _atomic_json(receipt, {**request_receipt, "revision_id": revision["revision_id"]})
         else:
             for scene in revision["scenes"]:
                 for key in ("footage", "audio"):
                     project._asset_path(scene[key])
         status = project.render(revision["revision_id"], retry=True)
-        temporary = self.root / "render" / ".final.tmp.mp4"
+        output_dir = self.root / "render" / "revisions" / revision["revision_id"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        final, preview = output_dir / "final.mp4", output_dir / "preview.mp4"
+        output_receipt = output_dir / "outputs.json"
         parameters = VideoParams(
             video_subject=narration,
             video_script=narration,
@@ -197,25 +210,69 @@ class MptMediaExecutor(MediaExecutor):
             bgm_file=str(bgm_path or ""),
             bgm_volume=bgm_volume,
         )
-        if bgm_path is not None and not Path(bgm_path).is_file():
-            raise NonRetryableMediaError("Requested BGM file is missing")
-        bgm_succeeded = generate_video(
-            video_path=status["export"]["path"], audio_path=str(voice_path), subtitle_path="",
-            output_file=str(temporary), params=parameters,
-            bgm_file_override=str(bgm_path) if bgm_path else None,
-        )
-        if bgm_path and not bgm_succeeded:
-            raise NonRetryableMediaError("Requested BGM could not be mixed")
-        if bgm_path:
-            self._write_bgm_receipt(Path(bgm_path), bgm_meta)
-        final = self.root / "render" / "final.mp4"
-        _promote_render_output(temporary, final)
-        preview = self.root / "render" / "preview.mp4"
-        preview_temporary = self.root / "render" / ".preview.tmp.mp4"
-        run_command(
-            ["ffmpeg", "-y", "-i", str(final), "-vf", "scale=720:1280", "-c:v", "libx264",
-             "-preset", "veryfast", "-crf", "28", "-c:a", "aac", str(preview_temporary)],
-            cwd=self.root,
-        )
-        _promote_render_output(preview_temporary, preview)
+        # A failed QC still owns these bytes; a retry may verify them, never replace them.
+        with _lock(output_dir / ".outputs.lock"):
+            if output_receipt.is_file():
+                expected = json.loads(output_receipt.read_text(encoding="utf-8"))
+                if expected != {
+                    path.name: sha256_file(self._local_asset(path)) for path in (final, preview)
+                }:
+                    raise NonRetryableMediaError("Committed render output failed integrity validation")
+                return final, preview
+            with tempfile.TemporaryDirectory(prefix=".render-", dir=output_dir) as directory:
+                temporary = Path(directory) / "final.mp4"
+                bgm_succeeded = generate_video(
+                    video_path=status["export"]["path"], audio_path=str(voice_path), subtitle_path="",
+                    output_file=str(temporary), params=parameters,
+                    bgm_file_override=str(bgm_path) if bgm_path else None,
+                )
+                if bgm_path and not bgm_succeeded:
+                    raise NonRetryableMediaError("Requested BGM could not be mixed")
+                self._promote_immutable_output(temporary, final)
+                preview_temporary = Path(directory) / "preview.mp4"
+                run_command(
+                    ["ffmpeg", "-y", "-i", str(final), "-vf", "scale=720:1280", "-c:v", "libx264",
+                     "-preset", "veryfast", "-crf", "28", "-c:a", "aac", str(preview_temporary)],
+                    cwd=self.root,
+                )
+                self._promote_immutable_output(preview_temporary, preview)
+            if bgm_path:
+                self._write_bgm_receipt(Path(bgm_path), bgm_meta)
+            _atomic_json(output_receipt, {path.name: sha256_file(path) for path in (final, preview)})
         return final, preview
+
+    def _promote_immutable_output(self, temporary: Path, destination: Path) -> None:
+        if not isinstance(probe(temporary).get("format"), dict):
+            raise NonRetryableMediaError("Rendered output has no readable media metadata")
+        if destination.exists():
+            if sha256_file(self._local_asset(destination)) != sha256_file(temporary):
+                raise NonRetryableMediaError("Retry would replace an immutable render output")
+            return
+        try:
+            os.link(temporary, destination)
+        except OSError:
+            # Render temporaries share this filesystem; rename exposes only complete bytes.
+            os.rename(temporary, destination)
+
+    def extract_review_frames(self, video_path, count=5, *, plan_data=None):
+        video_path = self._local_asset(Path(video_path))
+        evidence = MediaExecutor(self.root / "review-frames" / uuid4().hex)
+        paths = evidence.extract_review_frames(video_path, count, plan_data=plan_data)
+        return [(evidence.root / path).relative_to(self.root).as_posix() for path in paths]
+
+    def package(self, metadata, *, final_path=None):
+        final = self._local_asset(
+            Path(final_path) if final_path is not None else self.root / "render" / "final.mp4"
+        )
+        publish_dir = self.root / "publish"
+        publish_dir.mkdir(parents=True, exist_ok=True)
+        destination = publish_dir / "final.mp4"
+        destination.unlink(missing_ok=True)
+        try:
+            os.link(final, destination)
+        except OSError:
+            shutil.copy2(final, destination)
+        (publish_dir / "publish.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        return publish_dir

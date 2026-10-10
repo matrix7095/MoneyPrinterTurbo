@@ -107,7 +107,7 @@ def _verify_rights(session: Session, content: Content) -> None:
         raise NonRetryableMediaError("Candidate rights do not authorize this production mode")
 
 
-def verify_publish_ready(session: Session, settings: Settings, content_id: str) -> None:
+def verify_publish_ready(session: Session, settings: Settings, content_id: str) -> Path:
     """MPT's release boundary: old manual QC warnings never authorize publishing."""
     content = session.get(Content, content_id)
     if content is None:
@@ -137,6 +137,7 @@ def verify_publish_ready(session: Session, settings: Settings, content_id: str) 
     path = (root / artifact.relative_path).resolve()
     if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size != artifact.size_bytes or sha256_file(path) != artifact.sha256:
         raise NonRetryableMediaError("Content QC video failed file-integrity validation")
+    return path
 
 
 def _require_media_tools(*names: str) -> None:
@@ -322,8 +323,14 @@ def _fallback_cover_base(
                 )
             except Exception:
                 pass
-    final_video = executor.root / "render" / "final.mp4"
-    if final_video.is_file():
+    final_artifact = session.exec(select(Artifact).where(
+        Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
+    ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+    if final_artifact is not None:
+        final_video = (executor.root / final_artifact.relative_path).resolve()
+        if (not final_video.is_relative_to(executor.root.resolve()) or not final_video.is_file()
+                or final_video.stat().st_size != final_artifact.size_bytes or sha256_file(final_video) != final_artifact.sha256):
+            raise NonRetryableMediaError("Cover final video failed file-integrity validation")
         try:
             from glance_media.executor import probe
 
@@ -1114,6 +1121,13 @@ _TASK_OUTPUT_ORDER = {
     TaskType.ASSET_GENERATE_IMAGE: 70, TaskType.ASSET_QC: 80,
     TaskType.CONTENT_QC: 110,
 }
+
+
+def create_content_qc_recovery(flow: WorkflowService, task: AgentTask, script: AgentTask) -> AgentTask | None:
+    """The runtime validates native acceptance and holds the claim lock before this action."""
+    flow.set_error(task.content_id, "CONTENT_QC_FAILED", "成片验收未通过")
+    flow.mark_status(task.content_id, ContentStatus.WAITING_AGENT, "content_qc_failed")
+    return flow.create_qc_recovery_task(task, script, actor_id="mpt-content-qc")
 
 
 def advance_after_agent(engine: Engine, settings: Settings, task_id: str) -> str | None:
@@ -2734,18 +2748,28 @@ def render_content(engine: Engine, settings: Settings, content_id: str, *, consu
         )
         research_id = review_input["acceptance_subject"]["research_task_id"]
         review_input["research"] = session.get(AgentTask, research_id).result_data
-        receipt = root / "render" / "acceptance-input.json"
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        receipt.write_text(json.dumps(review_input, ensure_ascii=False), encoding="utf-8")
-        register_artifact(
-            session,
-            content=content,
-            executor=executor,
-            path=receipt,
-            artifact_type="acceptance_input",
-            stage="render",
-        )
+        _write_acceptance_receipt(session, content, executor, review_input)
+        session.commit()
         return _issue_acceptance(session, settings, content, review_input)
+
+
+def _write_acceptance_receipt(session, content, executor, review_input):
+    """Each server snapshot owns a new file; a failed acceptance keeps its original bytes."""
+    artifact = Artifact(content_id=content.id, artifact_type="acceptance_input", relative_path="",
+                        sha256="", size_bytes=0, mime_type="application/json", producer_stage="render")
+    relative = f"render/acceptance-input-{artifact.id}.json"
+    path = (executor.root / relative).resolve()
+    if not path.is_relative_to(executor.root.resolve()):
+        raise NonRetryableMediaError("Acceptance receipt path is outside content storage")
+    review_input["acceptance_receipt_artifact_id"] = artifact.id
+    encoded = json.dumps(review_input, ensure_ascii=False).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as output:
+        output.write(encoded)
+    artifact.relative_path, artifact.sha256, artifact.size_bytes = relative, sha256_file(path), len(encoded)
+    session.add(artifact)
+    session.flush()
+    return artifact
 
 
 def _issue_acceptance(
@@ -2943,14 +2967,7 @@ def transition_pending_acceptance_evidence(session: Session, settings: Settings)
             AgentTask, review_input["acceptance_subject"]["research_task_id"]
         ).result_data
         executor = MediaExecutor(Path(content.content_dir).resolve())
-        receipt = executor.root / "render" / "acceptance-input.json"
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        receipt.write_text(json.dumps(review_input, ensure_ascii=False), encoding="utf-8")
-        receipt_artifact = Artifact(
-            content_id=content.id,
-            **executor.artifact_metadata(receipt, "acceptance_input", "render"),
-        )
-        session.add(receipt_artifact)
+        receipt_artifact = _write_acceptance_receipt(session, content, executor, review_input)
         content.current_stage = "audio_evidence_waiting"
         content.error_code = "AUDIO_EVIDENCE_UNAVAILABLE"
         content.error_message = "旧未执行验收已撤销，同一成片自动补充独立媒体证据"
@@ -2997,19 +3014,16 @@ def resume_content_acceptance(engine: Engine, settings: Settings, content_id: st
             select(Artifact).where(
                 Artifact.content_id == content_id,
                 Artifact.artifact_type == "acceptance_input",
-                Artifact.relative_path == "render/acceptance-input.json",
-            )
+            ).order_by(Artifact.created_at.desc(), Artifact.id.desc())
         ).all()
         root = Path(content.content_dir).resolve()
-        path = root / "render" / "acceptance-input.json"
+        receipt = receipts[0] if receipts else None
+        path = (root / receipt.relative_path).resolve() if receipt else root / "render" / "missing-receipt"
         if (
-            not path.is_file()
-            or not path.resolve().is_relative_to(root)
-            or sum(
-                a.sha256 == sha256_file(path) and a.size_bytes == path.stat().st_size
-                for a in receipts
-            )
-            != 1
+            receipt is None or not path.is_file() or not path.is_relative_to(root)
+            or not root.is_relative_to(settings.content_dir.resolve())
+            or sum(a.relative_path == receipt.relative_path for a in receipts) != 1
+            or receipt.sha256 != sha256_file(path) or receipt.size_bytes != path.stat().st_size
         ):
             flow = workflow(session, settings)
             flow.set_error(
@@ -3031,6 +3045,8 @@ def resume_content_acceptance(engine: Engine, settings: Settings, content_id: st
                        for key in ("script", "visual_plan"))
                 or not isinstance(review_input.get("acceptance_subject"), dict)
                 or not isinstance(review_input.get("video_artifact_id"), str)
+                or ("acceptance_receipt_artifact_id" in review_input
+                    and review_input["acceptance_receipt_artifact_id"] != receipt.id)
             ):
                 raise ValueError("Invalid v2 acceptance receipt")
         except (ValueError, TypeError, OSError):
@@ -3055,7 +3071,7 @@ def approve_final(engine: Engine, settings: Settings, content_id: str) -> Conten
             raise KeyError(content_id)
         settings = effective_settings(session, settings)
         flow = workflow(session, settings)
-        verify_publish_ready(session, settings, content_id)
+        final_path = verify_publish_ready(session, settings, content_id)
         acceptance = flow.completed_task_for(content_id, TaskType.CONTENT_QC)
         if acceptance is not None and acceptance.schema_version == "2":
             verify_acceptance(session, acceptance, acceptance.result_data or {})
@@ -3081,7 +3097,8 @@ def approve_final(engine: Engine, settings: Settings, content_id: str) -> Conten
                     "cover_title": _effective_cover_title(content, script),
                     "narration": script["full_narration"],
                     "sources": research["primary_sources"] + research["secondary_sources"],
-                }
+                },
+                final_path=final_path,
             ),
         )
         register_artifact(

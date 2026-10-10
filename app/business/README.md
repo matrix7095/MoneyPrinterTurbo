@@ -83,6 +83,26 @@ Startup replays only completed tasks with an MPT ownership audit matching the si
 
 Existence of `mpt_migration_quarantined_content` or `mpt_migration_quarantined_task` AuditEvents blocks the corresponding task/content writes regardless of metadata or its original terminal status. Shared task/runtime guards protect claim, dispatch, lease actions, uploads, completion/failure, consumption/recovery, approval and publishing. Explicit task claims query persisted eligibility/ownership so a cached Session object cannot bypass the historical lease boundary. A historical task without a content ID is also isolated. Admin GETs preserve original records/status and expose quarantined tasks only as metadata, input/result hashes and concise isolation reasons; instructions, input/result/schema payloads remain frozen in the database. Normal current tasks keep their full context. Importers must retain these markers until an explicitly reviewed migration proves the work can be handled.
 
+Native schema-v2 CONTENT_QC with `passed=false` enters the existing core's
+budgeted BUSINESS_QC Recovery with the current SHORT_SCRIPT as its repair target.
+Authenticated `POST /api/v1/agent/tasks/{id}/content-qc-recovery` admits an already
+consumed failure through that same path; it is distinct from terminal task-failure
+recovery. Admission and consumption verify the unchanged accepted source, current
+native parents, deployment, audio/video/voice/receipt files and publication state.
+Content locks and one SQLite transaction serialize claims, core budget decisions,
+new ownership receipts and consumption markers. Changed or missing proof blocks
+repair; old failed results remain immutable. Recovery does not approve publication.
+
+MPT render output is retained under its actual VideoProject revision, with a
+request receipt binding that revision and committed output hashes. Interrupted
+receipt writes cannot reuse a different revision; promotion exposes complete
+files only. Review frames and server acceptance receipts use separate paths.
+Audio-evidence resume validates the latest registered receipt without falling
+back to older valid bytes. Packaging, cover-frame fallback and archive hashes use
+the verified current final-video Artifact, rather than the old fixed render alias.
+The legacy visual-plan restoration endpoint remains limited to its documented
+old mutation; it is not an alternate route for failed semantic QC.
+
 ## Upstream sync and validation
 
 Handsfree automatic publication additionally uses the shared policy in

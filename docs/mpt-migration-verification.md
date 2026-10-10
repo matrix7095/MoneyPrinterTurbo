@@ -238,3 +238,53 @@ consumption case was added. Root's fresh full run of the exact approved revision
 passed 449 tests in 221.11 seconds; the log is
 `storage/business-visual-projection-exact-final-20261010.log`. These code checks
 do not establish live restoration, final QC approval or external publication.
+
+The exact approved repair was committed as `7d7bea0` and deployed only to the
+isolated 8010 runtime. Authenticated restoration returned 200; anonymous access
+returned 401. The original visual-plan result again matches its accepted and
+consumed hash. The old, unexecuted QC was cancelled with its input hash unchanged;
+a separate receipt and QC `agt_ba00d61131904cd084906a5266fc723d` were created.
+The physical final-video and original voice hashes remained unchanged. The source
+8000 service and 8510 UI were retained. Actual restoration proof is under
+`storage/smoke/visual-plan-restoration-20261010/`.
+
+That fresh independent CONTENT_QC completed and was consumed with `passed=false`.
+It reviewed all 15 frozen frames plus 64 frames across the full timeline, decoded
+all 953 video frames, and reproduced the frozen final-track PCM hash. Seven hard
+checks passed; audio and subtitle consistency did not. The product-name reading
+at 6.10–7.56 seconds had low ASR confidence without independent disambiguation.
+This is an evidence gap, not proof of a physical mispronunciation. The original
+failed result and complete review evidence are retained under
+`storage/smoke/episode-final-qc-20261010/`.
+
+A separate verifier ran cached small-model full-track ASR and small/medium-model
+English recognition of the brand interval, without script, subtitles, initial
+prompt or hotwords. Neither model resolved the product name reliably. Both the
+final video and newly decoded PCM hashes match the frozen QC input. No native
+listening or successful publication is claimed. Independent evidence is under
+`storage/smoke/episode-audio-disambiguation-20261010/`. A new script/voice revision
+through the existing budgeted recovery and QC chain remains necessary.
+
+The render-history repair received independent approval for four fixed files.
+Initial review reproduced two real interruption failures: a partial canonical
+file after interrupted copying, and an old request receipt paired with another
+current VideoProject revision. Atomic same-filesystem promotion and an explicit
+revision binding closed both. Independent real process termination before/after
+promotion leaves either no canonical file or complete recoverable bytes. The
+red/blue revision-mismatch reproduction now returns the requested red picture.
+The final independent run passed 31 tests without skips, including actual MPT
+rendering, complete video decoding, subtitles, audio, review frames and archive
+checks; before/after hashes of all four reviewed files matched. Evidence is under
+`storage/render-media-independent-review/`.
+
+Root also ran all 16 new media/archive tests on Python 3.11 and 3.13: both passed
+without skips (6.36 and 7.03 seconds). The native QC Recovery and revised receipt
+callers separately passed 75 new tests on both versions and 253 related tests on
+Python 3.12. Final independent caller/Recovery review approved all five fixed
+files after reproducing and fixing the optional null recovery target. Its 135
+tests and actual native claim/confirm/complete/consume probe passed. Root then
+passed the exact final full business suite: 542 tests, 2903 warnings, 259.22
+seconds, with all nine reviewed file hashes unchanged. Evidence is in
+`storage/content-qc-recovery-independent-review-final.md` and
+`storage/business-qc-recovery-render-exact-final-v2-20261010.log`. These checks
+do not approve the failed video or prove a new publication.
