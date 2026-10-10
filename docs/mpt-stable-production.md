@@ -2,7 +2,7 @@
 
 更新日期：2026-10-11。本文随稳定生产修复提交，最终验收证据以文末记录为准。
 
-当前结论：尚未完成稳定生产验收。代码修复已在主目录部署并推送，但新周期成片审核存在观看与音频证据缺口，另一内容的脚本审核合同存在冲突；不能承诺后续无人值守稳定产出。
+当前结论：尚未完成稳定生产验收。代码修复已在主目录部署并推送，脚本审核合同冲突已修复并通过新周期运行验证；当前新成片审核仍存在完整动态观看与关键产品名音频消歧的证据缺口，不能承诺后续无人值守稳定产出。
 
 ## 目标与验收边界
 
@@ -207,3 +207,11 @@ Eve 的冲突已定位到提示词配置上下文：已有 Handsfree 必要适�
 配置修复已提交、部署并推送：`f97c6f5`。主目录 API 新监听PID3592、启动器PID11976，WebUI仍是主目录PID16940；API授权200/匿名401、UI健康200，守护任务Ready/last_result=0。正式调度已恢复enabled=true、max_parallel=2，Handsfree三开关保持开启，日限1、间隔120分钟保持。部署证明 `prompt-settings-release-runtime-proof.json`、完整944项日志 `business-tests-prompt-settings-final.log` 位于主目录稳定生产证据目录。
 
 通过现有管理员reject-script正规创建Eve第4版脚本任务 `agt_6cbc55da601744baa38a9da92fff1f08`（初始PENDING，input_hash=20421c3a9ad6d9526ff6bd0df6a1910c6a176e24ec0294798be454e20ab077a0）。实际服务端新任务已包含Handsfree必要事实边界规则；旧第三轮Recovery `agt_61e21b2292344ee2a9ac2d3dd61560cc` 仍COMPLETED，结果哈希不变。此动作是驳回并要求新修订，不是批准、旧QC重写或恢复预算重置。正规修订证明 `eve-config-repair-normal-revision-proof.json`。新版本尚未通过业务质检或真实发布，当前稳定生产结论仍为未完成验收。
+
+### 2026-10-11 03:21 新周期运行验收
+
+上述第4版脚本随后通过 SCRIPT_QC（passed=true、issues=[]）和独立 SCRIPT_REVIEW_ASSIST（APPROVE/high）；视觉计划及独立视觉计划质检通过。五张原创纸艺概念图已由原生工具生成，原生941×1672图片按本轮真实用户授权经prepare-image准备为1080×1920，保留原图和哈希。独立素材质检 `agt_bf202f0897cf4e96910e6bc85e73c5f7` 实际逐张核验并通过；其submit响应超时，未重复提交。随后只读数据库证实该任务COMPLETED，服务端实际渲染并签发CONTENT_QC，证明提交已被接受。
+
+独立成片质检 `agt_8e5be968168c4e26ab8ca786918d875c` 已COMPLETED并返回passed=false：30.27秒成片的冻结帧、最终SHA、完整解码与PCM一致性通过，但缺完整动态观看证据；开头0–0.48秒Eve被两次独立无提示ASR识别为低置信“If”，尚未消歧，不能认定物理错读或放行。正常Recovery `agt_ec27c7e32c0e42e08a6db7b1d89e216e` 已COMPLETED，并实际创建第5版SHORT_SCRIPT `agt_89f4861844994f7c9e264adabb82332b`（PENDING），以已核验中文类别承载口播，保留正式身份和必要陪护条件，再正常重制、重新质检。该口播修复不会自动补齐动态审核能力。
+
+Root本轮使用实际mpt-codex.ps1执行契约2调度，完成16轮后停止新增并等待全部原生Worker终态；没有重领、重提、修改失败质检或提高预算。另一个发现任务已提交三条NO_SIMILAR候选，仍为OFFICIAL_REFERENCE，不表示厂商转载许可。运行证明已保存主目录 `storage/smoke/stable-production-20261010/eve-production-cycle-4-proof.json`。03:21实查主目录API监听3592、UI监听16940，UI健康200，守护任务最近执行结果0。最新真实发布仍是旧作品7695010253280234779，未产生本周期新发布ID。
