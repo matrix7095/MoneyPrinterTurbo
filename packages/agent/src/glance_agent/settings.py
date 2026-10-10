@@ -7,7 +7,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PUBLISH_REQUIRED_CAPABILITIES = (
     "浏览器控制",
     "本机 Chrome 会话",
-    "social-auto-upload",
     "截图",
     "结构化 JSON",
 )

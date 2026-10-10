@@ -399,7 +399,7 @@ def _create_cover_generation_task(
     style = str(settings.cover_style_preset or "").strip() or DEFAULT_COVER_STYLE_PRESET
     request = {
         "information": (
-            f"封面底图：{brief}。主体置下三分之二或左侧，上部四分之一保持简洁以供大字叠加"
+            f"封面底图：{brief}。主体置下半部或左侧，画面高度的五分之一至五分之二保持简洁以供大字叠加"
         ),
         "style_direction": style,
         "subject": brief,

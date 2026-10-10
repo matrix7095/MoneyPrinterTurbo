@@ -141,6 +141,7 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         required=False,
         requirement_tags=("普通", "图片生成"),
         recommended_wake_minutes=30,
+        skill_version="1.2.0",
     ),
     AgentRole.VIDEO: AgentRoleSpec(
         role=AgentRole.VIDEO,
@@ -159,7 +160,7 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         role=AgentRole.PUBLISH,
         label="发布 Agent",
         description=(
-            "读取完整发布任务，在本机浏览器使用 social-auto-upload 直接完成平台发布并回传证据。"
+            "读取完整发布任务，在本机已登录浏览器分步核验并完成平台发布，回传证据。"
         ),
         task_types=frozenset({TaskType.DOUYIN_PUBLISH}),
         recommended_model_tier="普通级",
@@ -167,7 +168,6 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         required_host_capabilities=(
             "浏览器控制",
             "本机 Chrome 会话",
-            "social-auto-upload",
             "截图",
             "结构化 JSON",
         ),
@@ -175,7 +175,7 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         required=False,
         requirement_tags=("普通", "发布"),
         recommended_wake_minutes=0,
-        skill_version="1.2.0",
+        skill_version="1.3.0",
     ),
 }
 

@@ -62,7 +62,7 @@ TASK_TYPE_DESCRIPTIONS: dict[str, str] = {
     TaskType.ASSET_GENERATE_VIDEO.value: "按镜头规范生成并上传受控 AI 视频素材。",
     TaskType.PUBLISH_PREPARE.value: "生成标题、简介、标签和封面建议，不执行发布。",
     TaskType.DOUYIN_PUBLISH.value: (
-        "由本机发布 Agent 使用浏览器或 social-auto-upload 完成抖音发布并回传证据。"
+        "由本机发布 Agent 使用已登录浏览器分步核验并完成抖音发布，回传证据。"
     ),
     TaskType.SCRIPT_REVIEW_ASSIST.value: "对照研究和质检结果，为人工脚本审批提供建议。",
     TaskType.FINAL_REVIEW_ASSIST.value: "检查成片的画面、声音、字幕和脚本一致性并标注时间点。",

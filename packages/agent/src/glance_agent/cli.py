@@ -1529,6 +1529,30 @@ def upload_artifact(task_id: str, file: Path) -> None:
     output(_task_response(response, task_id, resolved_task_id))
 
 
+@app.command("prepare-image")
+def prepare_image(
+    task_id: str,
+    file: Path,
+    segment_index: Annotated[int, typer.Option("--segment-index", min=0)],
+) -> None:
+    """Prepare image dimensions from a frozen segment request, without uploading."""
+    from glance_agent.image_preparation import prepare_image as prepare
+
+    with _api_errors():
+        config = settings()
+        try:
+            directory, resolved_task_id = _task_workspace(config, task_id)
+            if config.role_id != "image":
+                raise ValueError("prepare-image requires the image role")
+            response = prepare(directory, resolved_task_id, config.agent_id, file, segment_index)
+        except typer.Exit:
+            raise
+        except (ValueError, RuntimeError) as exc:
+            output({"status": "PREPARATION_UNAVAILABLE" if isinstance(exc, RuntimeError) else "REJECTED", "detail": str(exc)})
+            raise typer.Exit(2) from None
+    output(_task_response(response, task_id, resolved_task_id))
+
+
 @app.command()
 def fail(
     task_id: str,

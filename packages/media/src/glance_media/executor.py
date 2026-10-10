@@ -1656,7 +1656,8 @@ class MediaExecutor:
             outline=8,
             shadow=0,
             alignment=8,
-            marginv=120,
+            # Keep both title lines inside the centered 1080 x 1440 platform preview.
+            marginv=360,
         )
         subs.append(
             pysubs2.SSAEvent(

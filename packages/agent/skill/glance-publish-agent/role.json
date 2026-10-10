@@ -1,1 +1,1 @@
-{"role_id":"publish","skill_name":"glance-publish-agent","skill_version":"1.2.0","protocol_version":"1","task_types":["douyin_publish"]}
+{"role_id":"publish","skill_name":"glance-publish-agent","skill_version":"1.3.0","protocol_version":"1","task_types":["douyin_publish"]}

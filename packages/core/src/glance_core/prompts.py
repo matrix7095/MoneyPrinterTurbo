@@ -308,6 +308,13 @@ def resolve_instructions(
         from glance_core.workflow import TASK_INSTRUCTIONS
 
         template = TASK_INSTRUCTIONS[task_type]
+    if task_type in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE} and row is not None and row.instructions.strip():
+        from glance_core.task_instructions import TASK_INSTRUCTIONS
+
+        # Legacy overrides must retain the current preparation and final-click boundaries.
+        boundary = "发布" if task_type == TaskType.DOUYIN_PUBLISH else "图片"
+        template += f"\n## 固定{boundary}执行边界：以下规则覆盖自定义提示词中冲突的执行方式\n"
+        template += TASK_INSTRUCTIONS[task_type]
     current = effective_settings(session, Settings())
     use_handsfree = current.handsfree_enabled if handsfree is None else handsfree
     if use_handsfree:

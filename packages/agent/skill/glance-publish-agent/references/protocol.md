@@ -1,13 +1,15 @@
-# Glance 发布 Agent 协议 1.2.0
+# Glance 发布 Agent 协议 1.3.0
 
-本文件随 `glance-publish-agent` `skill_version=1.2.0` 发布；`role.json` 的共享
+本文件随 `glance-publish-agent` `skill_version=1.3.0` 发布；`role.json` 的共享
 `protocol_version` 仍为 `1`。
 
 Handsfree 任务遇到登录、验证码或风控挑战时不得等待人工：若尚未最终点击，返回 `FAILED` 并结束；
 若发布意图已存在或点击后结果不明，只读核验外部结果，无法证实时返回 `UNKNOWN`，禁止再次点击。
 普通手动任务仍可按任务指令返回 `NEEDS_USER`。
 
-发布最终点击前，必须运行：
+使用已登录浏览器分步操作，禁止一键发布 CLI。最终点击前读取实际账号、标题、完整正文、全部标签和
+AI 声明；保存封面后检查实际预览的完整文字与主体。文本只规范化空白和零宽字符，任何遗漏均禁止授权。
+保存预检截图后，必须运行：
 
 ```text
 glance-agent register-publish-intent <task_id>

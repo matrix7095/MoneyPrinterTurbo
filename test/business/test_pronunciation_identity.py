@@ -123,7 +123,7 @@ def test_unrelated_stages_do_not_receive_identity_rule(tmp_path, task_type, hand
             session.commit()
             text = resolve_instructions(session, task_type, handsfree=handsfree)
             assert RULE_HEADING not in text
-            if not handsfree:
+            if not handsfree and task_type not in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE}:
                 assert text == "保留本角色授权边界。"
     finally:
         runtime.close()

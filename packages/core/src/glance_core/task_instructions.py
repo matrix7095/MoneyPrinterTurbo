@@ -1024,9 +1024,14 @@ TASK_INSTRUCTIONS: dict[TaskType, str] = {
 `forbidden_elements` 同时作自检与人工审核对照。
 
 ## 尺寸
-使用支持任意分辨率的工具（如 gpt-image-2，最大 3840 x 2160）时直接按
-`min_width x min_height` 生成；仅支持固定档位的工具（如 gpt-image-1 竖图上限
-1024 x 1536）需先生成再无损放大至达标尺寸后上传，或改用满足尺寸的工具。
+原生生成器优先按冻结的 `min_width`、`min_height` 和 `aspect_ratio` 生成。
+宿主已明确授权本机尺寸准备时，原生图片不足最低尺寸且比例相近，可通过任务启动器执行
+`prepare-image <task_id> <原图路径> --segment-index <segment_index>`。
+它只读取本任务冻结请求，在任务工作区保留原图与准备凭据，输出真实 PNG 路径、尺寸和哈希；
+按返回的 `path` 上传，不覆盖原图或修改冻结输入。比例明显错误则重新生成，不能裁掉主体或拉伸。
+尺寸放大不增加原始细节，不能称为“无损增清”或通过质量审核。`tool_name` 如实说明原生生成工具及
+Pillow 尺寸准备，`style_notes` 记录原始/实际尺寸、哈希和准备方法；独立素材 QC 仍必须逐图通过。
+未获本机处理授权时遵守宿主原生工具规则；工具缺失或冻结请求不完整时如实 fail，不猜测尺寸。
 方向必须与 `aspect_ratio` 一致（竖屏要求 height > width），非标准比例不拒。
 
 ## 输出
@@ -1083,8 +1088,8 @@ TASK_INSTRUCTIONS: dict[TaskType, str] = {
 ## 任务
 
 这是由服务端在“发布到抖音”按钮或用户明确打开的 Handsfree 策略下创建的一次性直发布任务。
-你是唯一允许执行外部发布的 `publish` 角色 Agent；必须在本机使用已登录的浏览器会话或
-`social-auto-upload` 完成抖音视频发布，并回传平台证据。普通语义 Agent 没有这个权限。
+你是唯一允许执行外部发布的 `publish` 角色 Agent；必须在本机使用已登录的浏览器会话
+分步完成抖音视频发布，并回传平台证据。普通语义 Agent 没有这个权限。
 
 ## 输入
 
@@ -1092,10 +1097,8 @@ TASK_INSTRUCTIONS: dict[TaskType, str] = {
 
 - `platform`、`account`、`video_artifact_id`、`cover_artifact_id` 和 `video_sha256` 是服务端在任务
   创建时固化的目标与成片，不得替换为其它平台、账号或视频。
-- `account.account_id` 是服务端固化的 SAU `--account` 值，必须原样使用；`account.account_name`
-  只是展示名称，不能拿它替代 `account.account_id`。
-- 当前 Windows 宿主的登录凭据来自本机扫码；`upload-video` 必须显式使用 `--headed`，不能依赖
-  CLI 默认的无头模式。
+- `account.account_id` 是服务端固化的本机账号映射，`account.account_name` 是展示名称。
+  核对已登录页面与该账号映射，不用展示名称替换账号 ID，也不发布到其它已登录账号。
 - `content`、`candidate`、`script`、`research` 和 `publish_prepare` 是已经下发的完整上下文；不要让
   Subagent 自己猜标题、事实或成片位置。
 - `context_files` 的文件名就是 `context/` 中的成片和封面；使用它们，不读取任务工作区以外的文件。
@@ -1110,14 +1113,17 @@ TASK_INSTRUCTIONS: dict[TaskType, str] = {
 ## 执行顺序
 
 1. 先确认任务，再保持心跳；NO_TASK 或 AT_CAPACITY 时直接结束本轮。
-2. 优先检查并使用 `sau`：使用输入中的 `account.account_id`，执行
-   `sau douyin check --account <account.account_id>`，随后使用
-   `sau douyin upload-video --account <account.account_id> --file <video> --title <title>`
-   `--desc <description> --tags <tags> --headed`。
-   命令实际参数以当前宿主 `sau douyin --help` 为准。不要同时启动 CLI 和浏览器两条发布路径。
-3. 如果 CLI 不可用或失败，使用本机已登录的 Chrome/Chromium 浏览器完成同一任务；遇到登录、扫码、
-   短信、
-   验证码或风控验证时停下来让用户在本机处理，并持续心跳，不能伪造成功。
+2. 使用本机已登录浏览器，先核对账号和已存在的发布意图；有意图或结果不明时只读核实外部结果。
+   禁止运行一键发布 CLI（包括 `sau douyin upload-video`），因为它不能在最终点击前保证正文、封面
+   和发布意图检查。不要同时启动两条上传路径，不在任务中安装依赖。
+3. 上传冻结成片和封面，分步填写并读取页面实际标题、完整正文、全部标签与 AI 内容声明。
+   保存封面后打开实际预览，确认裁切后文字完整、主体可见；不能用文件存在或上传成功代替预览检查。
+   页面文本只可规范化空白和零宽字符，缺字、正文遗漏、错误账号、未保存的封面或 AI 声明缺失均禁止授权。
+   先保存这些检查的截图证据，再运行 `glance-agent register-publish-intent <task_id>`；只有响应同时为
+   `status=AUTHORIZED` 和 `click_authorized=true` 才能执行一次最终发布点击。
+   `RECONCILE_REQUIRED`、`UNKNOWN`、响应丢失或 `LEASE_EXPIRED` 只读核实，禁止再次上传或点击。
+   遇到登录、扫码、短信、验证码或风控挑战，不绕过。Handsfree 在点击前返回 `FAILED`；普通手动任务
+   返回 `NEEDS_USER`，不能伪造成功。
 4. 点击平台最终发布后，不要盲目重试。成功必须从抖音页面取得外部链接或内容 ID，并截图保存发布结果；
    点击后无法确认结果时返回 `UNKNOWN`，由用户检查平台后再决定下一步。
 5. 将结果截图运行 `glance-agent upload-artifact <task_id> <截图文件>`，只把返回的
