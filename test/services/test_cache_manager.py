@@ -1,7 +1,9 @@
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.services import cache_manager
@@ -93,6 +95,48 @@ class TestVideoCacheManager(unittest.TestCase):
         self.assertEqual(result.failed_count, 1)
         self.assertTrue(first.exists())
         self.assertFalse(second.exists())
+
+    def test_cleanup_preserves_regular_file_marked_as_reparse_point(self):
+        cache_file = self._create_cache_file("a" * 32, 10, 1_000_000_000.0)
+        reparse = SimpleNamespace(
+            st_mode=stat.S_IFREG,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+        with patch.object(cache_manager.os, "stat", return_value=reparse):
+            result = cache_manager.clean_video_cache()
+
+        self.assertEqual(result.deleted_count, 0)
+        self.assertEqual(cache_file.read_bytes(), b"x" * 10)
+
+    def test_scan_captures_real_file_identity(self):
+        cache_file = self._create_cache_file("a" * 32, 10, 1_000_000_000.0)
+        expected = os.stat(cache_file, follow_symlinks=False)
+
+        entry, = cache_manager._iter_video_cache_entries()
+
+        self.assertEqual((entry.device, entry.inode), (expected.st_dev, expected.st_ino))
+
+    def test_cleanup_preserves_same_metadata_replacement_after_scan(self):
+        cache_file = self._create_cache_file("a" * 32, 10, 1_000_000_000.0)
+        original_iterator = cache_manager._iter_video_cache_entries
+
+        def replace_after_scan(include_temp=False):
+            scanned_entries = list(original_iterator(include_temp=include_temp))
+            original = os.stat(cache_file, follow_symlinks=False)
+            replacement = self.cache_dir / "new-download.tmp"
+            replacement.write_bytes(b"new-video!")
+            os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+            os.replace(replacement, cache_file)
+            yield from scanned_entries
+
+        with patch.object(
+            cache_manager, "_iter_video_cache_entries", side_effect=replace_after_scan
+        ):
+            result = cache_manager.clean_video_cache()
+
+        self.assertEqual(result.deleted_count, 0)
+        self.assertEqual(result.failed_count, 0)
+        self.assertEqual(cache_file.read_bytes(), b"new-video!")
 
     def test_cleanup_preserves_file_replaced_after_scan(self):
         """A fresh atomic download must survive a cleanup that scanned its old file."""

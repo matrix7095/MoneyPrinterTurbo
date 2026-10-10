@@ -1,10 +1,12 @@
 import json
 import os
+import stat
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app.models.schema import MaterialInfo, VideoAspect
@@ -19,6 +21,12 @@ class TestMaterialSearchCache(unittest.TestCase):
             return_value=self.temp_dir.name,
         )
         self.cache_dir_patch.start()
+        # Keep newly written files inside the TTL despite Windows mtime rounding.
+        reader_time = time.time() + 60
+        clock = SimpleNamespace(time=lambda: reader_time, monotonic=time.monotonic)
+        reader_clock_patch = patch.object(material_cache, "time", clock)
+        reader_clock_patch.start()
+        self.addCleanup(reader_clock_patch.stop)
 
     def tearDown(self):
         self.cache_dir_patch.stop()
@@ -619,6 +627,58 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertFalse(orphan_path.exists())
         # 前缀不匹配的其它文件属于用户，不能被清理逻辑删除。
         self.assertTrue(unrelated_path.exists())
+
+    def test_cleanup_preserves_regular_file_marked_as_reparse_point(self):
+        cache_path = self._cache_path()
+        cache_path.write_bytes(b"expired")
+        expected = os.stat(cache_path, follow_symlinks=False)
+        reparse = SimpleNamespace(
+            st_mode=stat.S_IFREG,
+            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+        )
+        with patch.object(material_cache.os, "stat", return_value=reparse):
+            self.assertFalse(material_cache._is_same_cache_file(cache_path, expected))
+            deleted = material_cache.cleanup_expired_material_search_cache(force=True)
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(cache_path.read_bytes(), b"expired")
+
+    def test_cleanup_preserves_same_metadata_replacements(self):
+        now = 2_000_000_000.0
+        stale_mtime = now - material_cache.MATERIAL_SEARCH_CACHE_TTL_SECONDS - 1
+        original_check = material_cache._is_same_cache_file
+        for name in ("a" * 64 + ".json", "." + "b" * 64 + "-worker.tmp"):
+            with self.subTest(name=name):
+                cache_path = Path(self.temp_dir.name) / name
+                cache_path.write_bytes(b"expired")
+                os.utime(cache_path, (stale_mtime, stale_mtime))
+                original = os.stat(cache_path, follow_symlinks=False)
+
+                def replace_before_check(path, expected):
+                    self.assertEqual(
+                        (expected.st_dev, expected.st_ino),
+                        (original.st_dev, original.st_ino),
+                    )
+                    replacement = Path(self.temp_dir.name) / "replacement"
+                    replacement.write_bytes(b"current")
+                    os.utime(
+                        replacement, ns=(original.st_atime_ns, original.st_mtime_ns)
+                    )
+                    os.replace(replacement, path)
+                    return original_check(path, expected)
+
+                with patch.object(
+                    material_cache,
+                    "_is_same_cache_file",
+                    side_effect=replace_before_check,
+                ):
+                    deleted = material_cache.cleanup_expired_material_search_cache(
+                        now=now, force=True
+                    )
+
+                self.assertEqual(deleted, 0)
+                self.assertEqual(cache_path.read_bytes(), b"current")
+                cache_path.unlink()
 
     def test_cleanup_keeps_recent_temp_files(self):
         """

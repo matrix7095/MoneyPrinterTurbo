@@ -68,8 +68,8 @@ def _iter_video_cache_entries(include_temp: bool = False) -> Iterator[_VideoCach
     """
     顺序扫描默认缓存目录第一层。
 
-    使用 ``os.scandir`` 是为了在缓存达到数万文件时复用目录遍历返回的元数据，
-    避免 ``Path.iterdir`` 后再次查询文件类型。这里不递归、不打开视频，也不调用
+    使用 ``os.scandir`` 先过滤文件名和链接，再查询真实路径的文件身份。
+    这里不递归、不打开视频，也不调用
     FFmpeg，因此耗时主要与文件数量线性相关，而不是与视频总容量相关。
     """
 
@@ -95,7 +95,13 @@ def _iter_video_cache_entries(include_temp: bool = False) -> Iterator[_VideoCach
                 # 不跟随符号链接，确保清理逻辑不会越过默认缓存目录边界。
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                stat_result = entry.stat(follow_symlinks=False)
+                # Windows DirEntry.stat() omits the file ID needed to detect replacement.
+                stat_result = os.stat(entry.path, follow_symlinks=False)
+                if not stat.S_ISREG(stat_result.st_mode) or (
+                    getattr(stat_result, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                ):
+                    continue
             except OSError as exc:
                 logger.warning(
                     f"failed to inspect video cache file: file={entry.name}, error={exc}"
@@ -223,6 +229,9 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
                 # Another cleanup already removed the scanned candidate.
                 continue
             if not stat.S_ISREG(current.st_mode) or (
+                getattr(current, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            ) or (
                 current.st_dev,
                 current.st_ino,
                 current.st_mtime_ns,
