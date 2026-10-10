@@ -168,11 +168,31 @@ independent 8010 service: listener PID 22564, launcher PID 4556 and authenticate
 PID 19020 and 18684. Admin retry admitted `agt_740daeea825b4f2fb06fe963c7a6cda9`;
 the native assistant returned VALID and COMPLETED/CONSUMED. Core created the new
 visual plan `agt_48c51962d064498493df1466cf64ee76`, which also returned
-COMPLETED/CONSUMED and awaits independent plan QC. The failed source task remains
+COMPLETED/CONSUMED. Independent plan QC `agt_677846b767824d99bae6b65bbc84524e`
+then passed with zero errors and four warnings. The failed source task remains
 FAILED with its original frozen hash, and the approved narration still has SHA
 `8050b68f644208e5fa59ec2225f71969cc24f5a6cfdb9e76dfed432e48bda5dd`.
 Actual proofs are under `storage/smoke/image-failure-recovery-20261010/`;
 assistant and visual results are separately preserved under
 `storage/smoke/episode-recovery-plan-20261010/` and
 `storage/smoke/episode-visual-repair-20261010/`. This is recovery progress,
-not image acceptance, final acceptance or publication evidence.
+not final acceptance or publication evidence.
+
+Fresh image task `agt_792007f708534648bd88ef87e8f299fc` generated five native
+941-by-1672 images. The operator explicitly authorized local enlargement and
+continuing independent QC/publication. Only Pillow LANCZOS resizing to
+1080-by-1920 was applied locally; semantic revisions used the native image tool.
+All five actual uploads returned Artifact IDs, and validation/submission returned
+VALID and COMPLETED/CONSUMED. Root verified the physical hashes and dimensions
+of all ten selected original/final files against the saved provenance.
+
+Independent asset QC `agt_4f579e80493a47e19c83a80982a48d14` viewed all five
+final PNGs and returned PASS, zero errors and three warnings; the server consumed
+the result. Enlargement does not establish additional native detail. Final QC
+must still inspect actual motion/cropping, subtitle safety and continuous AI
+concept disclosure. The last two images show a single plant-display surface
+from above, without pretending to prove stool hardware or assembly geometry.
+Production evidence is under `storage/smoke/native-image-repaired-20261010/`;
+independent evidence is under `storage/smoke/episode-asset-qc-20261010/`.
+The real render was requested only after this consumed asset QC. Final audio/QC,
+publication review and a new external publication ID remain outstanding.
