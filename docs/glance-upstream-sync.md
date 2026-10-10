@@ -7,6 +7,7 @@
 - `origin` 固定指向用户 fork：`https://github.com/matrix7095/MoneyPrinterTurbo.git`。
 - `upstream` 固定指向原仓库：`https://github.com/harry0703/MoneyPrinterTurbo.git`。
 - Bootstrap 已 fetch 的 `upstream/main` 为 `b819f7e1213ca2bc444cbf53ad3e0e3080c8a866`，与本轮完整 MPT 基线相同。每次同步都要重新记录 SHA；不得把这个快照当作以后永远不变的头部。
+- 2026-10-10 再次 fetch 得到 `7c80ca0b14407966a4fa3cc5bfc428868b186f5f`，已在独立工作区完成实际合并、完整业务 Python 矩阵及服务回归。树一致性、真实成片验证与未运行的 Redis/外部测试边界见 [upstream-sync-log.md](upstream-sync-log.md)；不代表生产切换或发布完成。
 
 ## 固定 SHA 的集成流程
 

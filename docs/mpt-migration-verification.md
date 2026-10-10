@@ -47,6 +47,12 @@ No business self-test task or synthetic completion was created. Publish and
 video roles have not been registered; capability declarations are not evidence
 of actual generation or publication.
 
+After the verified upstream merge, 8010 was restarted again from code commit
+`f106108c45d5f2425dfb85af537d94f7fae3a2c8`: listener PID 14352, launcher PID
+16452. Authentication remained 200/401, all six roles were freshly VERIFIED,
+and the image task stayed PENDING with zero publications for the new episode.
+The later proof is `storage/smoke/live-8010-upstream-20261010/proof.json`.
+
 ## Remaining delivery gates
 
 The new IKEA episode has approved research, script, voice and visual plan, but
@@ -56,6 +62,7 @@ user's explicit exception to the image-editing tool rule; it has not been
 performed. Asset/final QC, rendering, publish review, real external publication
 ID/URL and screenshot evidence remain required.
 
-An actual merge rehearsal between two distinct upstream SHAs, final fresh data
-and configuration transfer, production release/restart, and external LAN checks
-also remain. This checkpoint does not satisfy those gates.
+The later actual upstream merge rehearsal and its limits are recorded in
+`upstream-sync-log.md`. Final fresh data and configuration transfer, production
+release/restart, and external LAN checks remain. This checkpoint does not
+satisfy those gates.
