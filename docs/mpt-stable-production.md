@@ -202,3 +202,8 @@ Eve 的冲突已定位到提示词配置上下文：已有 Handsfree 必要适�
 最终冻结补丁的完整业务回归已完成：944 passed / 424.35 秒，0 failed，3819 条既有依赖弃用警告，进程exit0。日志为稳定工作树 `.artifacts/business-tests-prompt-settings-final.log`。该结果覆盖原919项及新增24项真实HTTP配置合同矩阵、1项媒体审核指引合同。此次修复不修改既有事实边界、历史冻结任务、恢复预算或质检通过状态；将在主目录部署后通过正规reject-script生成新脚本修订。
 
 本轮Root原生调度在四个Worker终态后，第6轮因调用了不存在的mpt-codex-scheduler.ps1而按HANDOFF_ERROR停止，未重复交接或提交业务结果；实际通用控制启动器为现存mpt-codex.ps1。下一次控制运行应从该启动器scheduler-plan --scheduler-id mpt-codex --contract-version 2开始，不复用旧offer。
+
+
+配置修复已提交、部署并推送：`f97c6f5`。主目录 API 新监听PID3592、启动器PID11976，WebUI仍是主目录PID16940；API授权200/匿名401、UI健康200，守护任务Ready/last_result=0。正式调度已恢复enabled=true、max_parallel=2，Handsfree三开关保持开启，日限1、间隔120分钟保持。部署证明 `prompt-settings-release-runtime-proof.json`、完整944项日志 `business-tests-prompt-settings-final.log` 位于主目录稳定生产证据目录。
+
+通过现有管理员reject-script正规创建Eve第4版脚本任务 `agt_6cbc55da601744baa38a9da92fff1f08`（初始PENDING，input_hash=20421c3a9ad6d9526ff6bd0df6a1910c6a176e24ec0294798be454e20ab077a0）。实际服务端新任务已包含Handsfree必要事实边界规则；旧第三轮Recovery `agt_61e21b2292344ee2a9ac2d3dd61560cc` 仍COMPLETED，结果哈希不变。此动作是驳回并要求新修订，不是批准、旧QC重写或恢复预算重置。正规修订证明 `eve-config-repair-normal-revision-proof.json`。新版本尚未通过业务质检或真实发布，当前稳定生产结论仍为未完成验收。
