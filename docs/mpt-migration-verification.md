@@ -323,3 +323,19 @@ approved both fixed files: 97 new cases, 175 related cases and 504 resolver
 equivalence cases, plus real leased HTTP immutable/quarantine probes. The report
 is `storage/manual-pronunciation-independent-review-final.md`. Root owns the
 separate deployment, fresh budgeted repair and actual publication gates.
+
+Revision review deduplication now uses the existing complete input/contract hash
+at the three migrated script-review and package call sites. Nine regression
+cases reproduce old pending/leased/completed task reuse before the fix and pass
+after it, preserving old rows and identical-input deduplication. Independent
+acceptance reports zero issues with 111 distinct connected/native cases in
+`storage/revision-review-dedup-independent-review.md`. Root's exact business
+suite passes 648 tests (2938 existing warnings, 281.43 seconds), recorded in
+`storage/business-review-dedup-exact-final-20261010.log`. The nine new cases also
+pass on Python 3.11 and 3.13, together with two actual-render cases.
+The existing filtered maintenance domain scan created current script review
+`agt_bb03b32fbd574c84974f02f6f7db4cfc`; it did not replay its consumed QC or
+alter the 20 previous task rows. A repeat scan created no additional task.
+Public recovery evidence is in
+`storage/smoke/episode-current-review-recovery-20261010/`. These checks do not
+approve final media or establish a new publication.

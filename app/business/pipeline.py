@@ -466,6 +466,7 @@ def _queue_post_package_tasks(
                 "cover_artifact_id": cover_artifact_id or "",
             },
             priority=35,
+            allow_multiple=True,
         )
     else:
         # With no metadata-preparation Agent enabled, build the review input directly.
@@ -488,6 +489,7 @@ def _queue_post_package_tasks(
                 ),
             ),
             priority=40,
+            allow_multiple=True,
         )
     if settings.archive_enabled:
         try:
@@ -1652,6 +1654,7 @@ def _advance_after_agent(
                     },
                 },
                 priority=50,
+                allow_multiple=True,
             )
             flow.set_error(content_id, None, None)
             flow.mark_status(content_id, ContentStatus.SCRIPT_REVIEW, "script_review")

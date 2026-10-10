@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import wave
+from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,7 +24,8 @@ from sqlmodel import Session, select
 
 from app.business.media_executor import MptMediaExecutor
 from app.business.pipeline import (
-    _require_current_qc, advance_after_agent, approve_script, verify_publish_ready, workflow,
+    _queue_post_package_tasks, _require_current_qc, advance_after_agent, approve_script,
+    verify_publish_ready, workflow,
 )
 from app.services.video_project import VideoProject
 
@@ -160,6 +162,76 @@ def test_packaged_publish_metadata_completion_still_schedules_review(media_contr
                         lambda self, **kwargs: calls.append(kwargs))
     assert advance_after_agent(engine, settings, task.id) is None
     assert calls == [{"publish_policy": None, "settings": settings}]
+
+
+@pytest.mark.parametrize("old_status", [TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED])
+def test_new_script_qc_creates_current_review_without_reusing_old_revision(media_contract, old_status):
+    engine, session, settings, content, _, research, script, qc, _, _, _ = media_contract
+    flow = workflow(session, settings)
+    old = flow.create_agent_task(content.id, TaskType.SCRIPT_REVIEW_ASSIST, {
+        "script": {"full_narration": "上一版脚本。"}, "script_qc": {"passed": True},
+        "research": research.result_data,
+        "upstream_task_ids": {"script": "old-script", "script_qc": "old-qc", "research": research.id},
+    })
+    old.status = old_status
+    old.result_data = {"verdict": "APPROVE"} if old_status == TaskStatus.COMPLETED else None
+    session.add(old)
+    content.current_stage = "script_qc"
+    session.add(content)
+    session.commit()
+    session.refresh(old)
+    original = deepcopy(old.model_dump())
+
+    assert advance_after_agent(engine, settings, qc.id) is None
+    session.expire_all()
+    reviews = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content.id, AgentTask.task_type == TaskType.SCRIPT_REVIEW_ASSIST,
+    )).all()
+    assert len(reviews) == 2
+    current = next(task for task in reviews if task.id != old.id)
+    assert current.status == TaskStatus.PENDING
+    assert current.input_data["script"] == script.result_data
+    assert current.input_data["upstream_task_ids"] == {
+        "script": script.id, "script_qc": qc.id, "research": research.id,
+    }
+    assert session.get(AgentTask, old.id).model_dump() == original
+    # Same accepted QC replay and the existing repair scan both preserve one current review.
+    assert advance_after_agent(engine, settings, qc.id) is None
+    scanned = workflow(session, settings).schedule_manual_assist_tasks(settings=settings)
+    assert all(task.id == current.id for task in scanned)
+    assert len(session.exec(select(AgentTask).where(
+        AgentTask.content_id == content.id, AgentTask.task_type == TaskType.SCRIPT_REVIEW_ASSIST,
+    )).all()) == 2
+
+
+@pytest.mark.parametrize("prepare_enabled", [True, False])
+@pytest.mark.parametrize("old_status", [TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED])
+def test_new_package_creates_current_metadata_or_review_and_deduplicates_exact_input(
+    media_contract, prepare_enabled, old_status,
+):
+    _, session, settings, content, _, research, script, _, _, _, _ = media_contract
+    settings = settings.model_copy(update={"publish_prepare_enabled": prepare_enabled, "archive_enabled": False})
+    flow = workflow(session, settings)
+    kind = TaskType.PUBLISH_PREPARE if prepare_enabled else TaskType.PUBLISH_REVIEW_ASSIST
+    old = flow.create_agent_task(content.id, kind, {"script": {"full_narration": "上一版脚本。"}})
+    old.status = old_status
+    old.result_data = {"title": "上一版标题"} if old_status == TaskStatus.COMPLETED else None
+    session.add(old)
+    session.commit()
+    session.refresh(old)
+    original = deepcopy(old.model_dump())
+
+    for _ in range(2):
+        _queue_post_package_tasks(session, flow, content, settings, script.result_data, research.result_data)
+    tasks = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content.id, AgentTask.task_type == kind,
+    )).all()
+    assert len(tasks) == 2
+    current = next(task for task in tasks if task.id != old.id)
+    assert current.status == TaskStatus.PENDING
+    assert current.input_data["script"] == script.result_data
+    assert current.input_data["research"] == research.result_data
+    assert session.get(AgentTask, old.id).model_dump() == original
 
 
 @pytest.mark.parametrize("stage,status", [("visual_plan", ContentStatus.WAITING_AGENT),

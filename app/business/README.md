@@ -49,6 +49,14 @@ Bundle and download share effective file indices without changing the signed inp
 
 Completion durably accepts validated results first. Consumption errors return `advanced: PENDING` and retain accepted results for replay. `CONSUMED` means consumption, not external publication. Idempotent completion retries still require the original lease token.
 
+Script-review, publish-preparation and direct publish-review creation use the
+existing full-input/instructions/version deduplication. A changed revision creates
+a fresh task; an identical bundle reuses its task without rewriting old rows.
+For an already-consumed script QC whose review was incorrectly reused, the
+existing manual-assist domain scan can rebuild the current review under the
+content lock and filtered maintenance transaction. It preserves ownership,
+consumption and quarantine checks; it does not replay or approve the QC.
+
 Terminal Agent failure commits the original `FAILED` state before requesting durable Recovery. The fail response adds `recovery_status` and `recovery_task_id`: a task ID accompanies an actual core Recovery status; `DEFERRED` records core capacity deferral, `BLOCKED` preserves core policy/budget refusal, and `PENDING` with no ID means recovery admission needs retry. Retryable failures keep the original core backoff without creating Recovery. Authenticated admin `POST /api/v1/agent/tasks/{id}/retry-recovery` retries admission for an already failed source and deduplicates its current attempt. It accepts no agent-selected classification, target or action override.
 
 Admission requires current MPT ownership and frozen input, a terminal authenticated failure audit, unchanged verified native staging, current content and parent revisions, and no other leased/submitted task on that content. Current scene-analysis references retain the portable single-ID/list and per-batch revision contracts. Content-wide durable publication intents must be reconciled; unknown, outstanding, published or malformed targets cannot enter failure recovery. Imported/quarantined sources remain isolated. Core classification, round limits, capacity and action whitelist remain authoritative.
