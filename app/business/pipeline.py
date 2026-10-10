@@ -309,6 +309,7 @@ def workflow(session: Session, settings: Settings) -> WorkflowService:
     return WorkflowService(
         session,
         base_settings=settings,
+        opening_identity_overlay=getattr(MediaExecutor, "OPENING_IDENTITY_OVERLAY", False),
         data_dir=settings.data_dir,
         submission_root=settings.agent_submission_dir,
         lease_minutes=settings.agent_lease_minutes,

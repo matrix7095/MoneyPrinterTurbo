@@ -19,6 +19,7 @@ from glance_media.executor import NonRetryableMediaError
 from sqlmodel import Session, select
 
 from app.business.consumption import content_operation_lock
+from app.business.media_executor import MptMediaExecutor
 from app.business.quarantine import (
     IsolatedTaskService,
     assert_allowed,
@@ -958,6 +959,7 @@ class BusinessRuntime:
         return WorkflowService(
             session,
             base_settings=settings,
+            opening_identity_overlay=getattr(MptMediaExecutor, "OPENING_IDENTITY_OVERLAY", False),
             data_dir=settings.data_dir,
             submission_root=settings.agent_submission_dir,
             lease_minutes=settings.agent_lease_minutes,

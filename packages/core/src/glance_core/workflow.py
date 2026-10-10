@@ -387,9 +387,11 @@ class WorkflowService:
         recovery_unknown_attempts: int = 1,
         recovery_max_parallel: int = 1,
         base_settings: Settings | None = None,
+        opening_identity_overlay: bool = False,
     ) -> None:
         self.session = session
         self.base_settings = base_settings
+        self.opening_identity_overlay = opening_identity_overlay is True
         self.data_dir = data_dir
         self.tasks = AgentTaskService(session, submission_root, lease_minutes)
         self.recovery_enabled = bool(recovery_enabled)
@@ -1103,6 +1105,12 @@ class WorkflowService:
     ) -> AgentTask:
         if task_type == TaskType.VISUAL_PLAN_QC:
             input_data = self._visual_qc_generation_policy(content_id, input_data)
+        if task_type in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC}:
+            input_data = dict(input_data)
+            input_data.pop("opening_identity_overlay", None)
+            overlay = self.opening_identity_input(content_id, task_type, input_data)
+            if overlay:
+                input_data["opening_identity_overlay"] = overlay
         if not allow_multiple:
             existing = self.session.exec(
                 select(AgentTask).where(
@@ -1121,6 +1129,7 @@ class WorkflowService:
             instructions=resolve_instructions(
                 self.session, task_type, handsfree=handsfree, schema_version=schema_version,
                 base_settings=self.base_settings,
+                opening_identity_overlay=self.opening_identity_overlay,
             ),
             input_data=input_data,
             priority=priority,
@@ -1147,10 +1156,57 @@ class WorkflowService:
                     "asset_image_enabled",
                     "image_only_gen_budget",
                     "visual_timing_evidence",
+                    "opening_identity_overlay",
                 )
                 if key in plan.input_data
             },
         }
+
+    def opening_identity_input(self, content_id: str, task_type: TaskType, input_data: dict) -> dict:
+        """Describe an existing renderer mechanism without approving its future pixels."""
+        if not self.opening_identity_overlay or task_type not in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC}:
+            return {}
+        from glance_core.content_acceptance import _unchanged_material_task
+
+        refs = input_data.get("upstream_task_ids") or {}
+        if task_type == TaskType.VISUAL_PLAN_QC:
+            ref = refs.get("visual_plan")
+            plan = self.session.get(AgentTask, ref) if isinstance(ref, str) else None
+            if (plan is None or plan.content_id != content_id or plan.task_type != TaskType.VISUAL_PLAN
+                or plan.status != TaskStatus.COMPLETED):
+                return {}
+            try:
+                _unchanged_material_task(self.session, plan, owned=True,
+                                         consumed=plan.id != self.session.info.get("consuming_agent_task_id"))
+            except ValueError:
+                return {}
+            overlay = self.opening_identity_input(content_id, TaskType.VISUAL_PLAN, plan.input_data)
+            if (refs.get("script", overlay.get("script_task_id")) != overlay.get("script_task_id")
+                or ("opening_identity_overlay" in plan.input_data
+                    and plan.input_data["opening_identity_overlay"] != overlay)):
+                return {}
+            return overlay
+        ref = refs.get("script")
+        script = self.session.get(AgentTask, ref) if isinstance(ref, str) else None
+        if (script is None or script.content_id != content_id or script.task_type != TaskType.SHORT_SCRIPT
+            or script.status != TaskStatus.COMPLETED):
+            return {}
+        try:
+            _unchanged_material_task(self.session, script, owned=True)
+        except ValueError:
+            return {}
+        opening = (script.result_data or {}).get("opening")
+        identity = opening.get("product_identity") if isinstance(opening, dict) else None
+        duration = input_data.get("voice_duration_sec")
+        if (not isinstance(identity, str) or not any(char.isprintable() and not char.isspace() for char in identity)
+            or type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0):
+            return {}
+        end_sec = int(min(8, duration) * 100) / 100
+        if end_sec <= 0:
+            return {}
+        return {"renderer": "mpt", "source_field": "script.opening.product_identity",
+                "script_task_id": script.id, "script_result_sha256": stable_hash(script.result_data),
+                "text": identity, "start_sec": 0, "end_sec": end_sec}
 
     def script_audience_inputs(
         self,
@@ -1262,6 +1318,11 @@ class WorkflowService:
         current = {
             key: task.input_data[key] for key in _RECOVERY_INPUT_FIELDS if key in task.input_data
         }
+        overlay = self.opening_identity_input(task.content_id or "", task.task_type, task.input_data)
+        if overlay:
+            field = ("opening_identity_overlay" if "opening_identity_overlay" in task.input_data
+                     else "opening_identity_overlay_read_only")
+            current[field] = overlay
         gaps: list[str] = []
         subject = task.input_data.get("acceptance_subject")
         if task.task_type == TaskType.CONTENT_QC and isinstance(subject, dict):
@@ -2093,7 +2154,7 @@ class WorkflowService:
         recovery = self.tasks.create_task(
             task_type=TaskType.RECOVERY,
             content_id=source_task.content_id,
-            instructions=resolve_instructions(self.session, TaskType.RECOVERY, base_settings=self.base_settings),
+            instructions=resolve_instructions(self.session, TaskType.RECOVERY, base_settings=self.base_settings, opening_identity_overlay=self.opening_identity_overlay),
             input_data=input_data,
             priority=60,
         )
@@ -3066,7 +3127,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=TaskType.SHORT_SCRIPT,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, TaskType.SHORT_SCRIPT, base_settings=self.base_settings),
+            instructions=resolve_instructions(self.session, TaskType.SHORT_SCRIPT, base_settings=self.base_settings, opening_identity_overlay=self.opening_identity_overlay),
             input_data=input_data,
             priority=52,
         )
@@ -3143,7 +3204,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=TaskType.SCRIPT_REVIEW_ASSIST,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, TaskType.SCRIPT_REVIEW_ASSIST, base_settings=self.base_settings),
+            instructions=resolve_instructions(self.session, TaskType.SCRIPT_REVIEW_ASSIST, base_settings=self.base_settings, opening_identity_overlay=self.opening_identity_overlay),
             input_data=input_data,
             priority=50,
         )
@@ -3858,7 +3919,7 @@ class WorkflowService:
         repair = self.tasks.create_task(
             task_type=repair_type,
             content_id=content.id,
-            instructions=resolve_instructions(self.session, repair_type, base_settings=self.base_settings),
+            instructions=resolve_instructions(self.session, repair_type, base_settings=self.base_settings, opening_identity_overlay=self.opening_identity_overlay),
             input_data=input_data,
             priority=52,
         )

@@ -33,6 +33,8 @@ from app.services.video_project import VideoProject, _atomic_json, _lock
 
 
 class MptMediaExecutor(MediaExecutor):
+    OPENING_IDENTITY_OVERLAY = True
+
     def _local_asset(self, path: Path) -> Path:
         resolved = path.resolve()
         if not resolved.is_relative_to(self.root.resolve()) or not resolved.is_file():

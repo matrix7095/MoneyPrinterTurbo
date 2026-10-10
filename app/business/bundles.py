@@ -393,8 +393,15 @@ def build_bundle(
         handsfree=handsfree_publish,
         schema_version=task.schema_version,
         base_settings=flow.base_settings,
+        opening_identity_overlay=flow.opening_identity_overlay,
     )
     bundle_input = dict(task.input_data)
+    overlay = flow.opening_identity_input(task.content_id or "", task.task_type, task.input_data)
+    if "opening_identity_overlay" in task.input_data:
+        if task.input_data["opening_identity_overlay"] != overlay:
+            raise HTTPException(status_code=409, detail="Opening identity execution evidence changed")
+    elif overlay:
+        bundle_input["opening_identity_overlay_read_only"] = overlay
     if task.task_type == TaskType.RECOVERY:
         failure = task.input_data.get("failure") or {}
         source_id = failure.get("source_task_id") if isinstance(failure, dict) else None
@@ -418,6 +425,7 @@ def build_bundle(
                     source.task_type,
                     schema_version=source.schema_version,
                     base_settings=flow.base_settings,
+                    opening_identity_overlay=flow.opening_identity_overlay,
                     handsfree=_is_handsfree_publish_policy(
                         source.input_data.get("publish_policy")
                     )

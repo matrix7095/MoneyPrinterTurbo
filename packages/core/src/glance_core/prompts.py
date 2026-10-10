@@ -114,6 +114,27 @@ purpose 中写概念不等于屏幕有标识；最终成片没有可见标识仍
 开场兑现、画面/字幕质量、UI 与图像禁用元素、rights、budget、音频及技术硬门槛均不因标签放宽。
 """
 
+_MPT_OPENING_IDENTITY_RULE = """
+## MPT 开场身份叠加执行边界（覆盖历史及自定义的机制缺失推断）
+本规则仅由已声明支持此能力的 MPT renderer 注入；不代表其他 renderer 具备该能力。
+pipeline 正常通过当前脚本质检/审核门禁后，将确切脚本 opening.product_identity 传入
+MptMediaExecutor；它沿既有 ASS OpeningIdentity 层独立显示正式身份，
+从0秒到 min(8秒,实际配音时长)，与 Default 旁白字幕和 Concept 概念标签分层。
+不自动拼接中文类别或陪护条件；类别、功能、价值及必要条件仍须实际旁白和同期字幕兑现。
+VISUAL_PLAN / VISUAL_PLAN_QC 以服务端 opening_identity_overlay 的确切 script_task_id、
+script_result_sha256、text 与时间区间核对可执行性；空身份或证据缺失不保证可见身份。
+旧任务的 opening_identity_overlay_read_only 仅为现行只读执行说明，不改冻结材料、
+输入 hash、旧结果、预算或 subject，不是旧成片已经显示身份的证明。
+原图仍 text_rendering_enabled=false 且保留全部禁字禁logo禁项；正式身份由视频后期显示，
+不能仅因纯概念素材无品牌文字或不仿真实外观而认定这个后期机制不可执行。
+计划阶段不要求尚未产生的素材ID或成片像素；purpose 自述仍不是执行能力证据。
+空白身份不生成身份层，超出可读安全区域则渲染失败关闭；缺失或不清身份仍不能通过。
+最终成片必须实际核验正式身份、同期类别与价值、字幕及概念标签的可读性和时间覆盖，
+不能凭代码、计划、标题或本规则推定成片通过；完整动态、音频及全部事实硬项保持不变。
+Recovery 使用现行确切合同核对历史建议，不因旧合同未声明该机制而强制恢复难读品牌口播，
+但不能用可执行身份层替代真实声音硬项或将旧视频、旧通过结果当作新版本证据。
+"""
+
 _HANDSFREE_SCRIPT_VISUAL_RULE = """
 
 ## Handsfree 渲染前脚本画面可执行性（写作/质检/审核共同硬规则）
@@ -300,6 +321,7 @@ def resolve_instructions(
     handsfree: bool | None = None,
     schema_version: str = "1",
     base_settings: Settings | None = None,
+    opening_identity_overlay: bool = False,
 ) -> str:
     """当前有效指令：共同身份规则，并按模式叠加无人值守规则。"""
     row = session.get(TaskPrompt, task_type.value)
@@ -317,6 +339,12 @@ def resolve_instructions(
         template += f"\n## 固定{boundary}执行边界：以下规则覆盖自定义提示词中冲突的执行方式\n"
         template += TASK_INSTRUCTIONS[task_type]
     current = effective_settings(session, base_settings if base_settings is not None else Settings())
+    if opening_identity_overlay and task_type in {
+        TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC, TaskType.SCRIPT_REVIEW_ASSIST,
+        TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC, TaskType.ASSET_QC,
+        TaskType.CONTENT_QC, TaskType.FINAL_REVIEW_ASSIST, TaskType.RECOVERY,
+    }:
+        template += _MPT_OPENING_IDENTITY_RULE
     use_handsfree = current.handsfree_enabled if handsfree is None else handsfree
     if use_handsfree:
         template += _HANDSFREE_INSTRUCTIONS.get(task_type, "")
