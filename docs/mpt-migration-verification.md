@@ -43,8 +43,8 @@ Nine local launchers passed executable staging checks in
 deployment requests returned VERIFIED for assistant, research, script, visual,
 image and discovery. Host capacity is two; supported models are GPT-6.1 Sol and
 GPT-6 Luna. Discovery uses Luna/max; the other registered roles use Sol/high.
-No business self-test task or synthetic completion was created. Publish and
-video roles have not been registered; capability declarations are not evidence
+No business self-test task or synthetic completion was created. At that point,
+publish and video roles had not been registered; capability declarations are not evidence
 of actual generation or publication.
 
 After the verified upstream merge, 8010 was restarted again from code commit
@@ -73,6 +73,18 @@ API responses. For a future publish, uniquely match the frozen new description
 and publication time, recheck its visible platform status, and upload that
 specific screenshot as an Artifact. Missing or ambiguous evidence remains
 UNKNOWN and never permits another upload or final click.
+
+After that actual preflight, fresh launchers were staged under
+`storage/agent-launcher-staging/publish-preflight-20261010/` with the five
+demonstrated publish capabilities. Registration authenticated the publish role
+and returned VERIFIED without findings, using GPT-6.1 Sol/high and host
+capacity two with the same two supported models. Executable `selftest` then
+returned READY, valid launcher/skill and pending count zero. The actual
+registration and selftest reports are saved in that staging directory. This
+raises the registered role count to seven; the video-generation role remains
+unregistered because native video generation is unavailable. No publish task,
+business selftest, publish intent or external mutation was created by these
+deployment checks.
 
 ## Remaining delivery gates
 
