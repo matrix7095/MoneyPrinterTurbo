@@ -152,3 +152,9 @@ provenance, file size/hash and content-root checks. Bundle manifests bind image
 filenames to Artifact IDs; Windows filename collisions fail closed. Future image
 requests need no fabricated bytes. Transport repair leaves frozen task inputs and
 previous QC results unchanged, and does not approve image or final-video quality.
+Recovery current-version checks reject distinct noncancelled revisions with the
+same creation timestamp: random UUID ordering cannot prove which is current.
+The existing scene-batch filter still applies, and cancelled/strictly older
+versions retain their prior behavior. This protects the shared failure, QC,
+parent-chain and visual-restoration guards without changing stored task IDs,
+timestamps, input hashes or recovery budgets.

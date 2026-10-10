@@ -1,7 +1,7 @@
 """Native failed v2 acceptance uses the existing bounded Recovery contract."""
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from threading import Event
@@ -16,10 +16,10 @@ from glance_core.workflow import WorkflowService
 from glance_media.executor import sha256_file
 from sqlmodel import Session, select
 
-from app.business.runtime import AGENT_CONSUMED, OWNED, QC_RECOVERY
+from app.business.runtime import AGENT_CONSUMED, OWNED, QC_RECOVERY, _require_current_revision
 from test.business.test_agent_failure_recovery import registered_client, record_intent, recovery_rows
 from test.business.test_deployment_http import app_for
-from test.business.test_discovery_http import ADMIN
+from test.business.test_discovery_http import ADMIN, make_runtime
 from test.business import test_visual_plan_materialization as materialization
 
 image_contract = materialization.image_contract
@@ -208,6 +208,8 @@ def damage_source(session, runtime, content_id, qc_id, plan_id, root, damage):
         target = script if damage == "new_script" else qc
         newer = runtime.workflow_service(session).create_agent_task(content_id, target.task_type,
                                                                     {**target.input_data, "revision": 2}, allow_multiple=True)
+        newer.created_at = target.created_at + timedelta(microseconds=1)
+        session.add(newer)
         if damage in {"leased", "submitted"}:
             newer.status = TaskStatus.LEASED if damage == "leased" else TaskStatus.SUBMITTED
             session.add(newer)
@@ -240,6 +242,75 @@ def test_admin_rejects_noncurrent_changed_or_unproven_acceptance(failed_qc, dama
     response = http.post(f"/api/v1/agent/tasks/{qc_id}/content-qc-recovery", headers=ADMIN)
     assert response.status_code == 409, response.text
     assert recovery_rows(runtime) == []
+
+
+@pytest.mark.parametrize("sibling_id", ["agt_00000000000000000000000000000000", "agt_ffffffffffffffffffffffffffffffff"])
+@pytest.mark.parametrize("sibling_status", [TaskStatus.PENDING, TaskStatus.COMPLETED])
+def test_equal_timestamp_qc_revisions_reject_both_without_recovery_side_effects(failed_qc, sibling_id, sibling_status):
+    runtime, http, content_id, qc_id, _, _ = failed_qc
+    with Session(runtime.engine) as session:
+        consumed(session, qc_id)
+        qc = session.get(AgentTask, qc_id)
+        sibling = AgentTask(**{**qc.model_dump(), "id": sibling_id, "status": sibling_status, "dedup_key": None})
+        session.add(sibling)
+        session.commit()
+        if sibling_status == TaskStatus.COMPLETED:
+            accept(session, runtime, sibling, qc.result_data, qc.assigned_agent_id, consumed=True)
+        else:
+            sibling.result_data, sibling.attempt, sibling.assigned_agent_id, sibling.completed_at = None, 0, None, None
+            session.commit()
+        assert sibling.created_at == qc.created_at
+        assert (sibling.id < qc.id) == sibling_id.startswith("agt_0")
+        # Recovery rounds and budgets are persisted in tasks and audit events.
+        before = {model: [row.model_dump(mode="json") for row in session.exec(select(model)).all()]
+                  for model in (AgentTask, AuditEvent, Content, RuntimeSetting)}
+    for task_id in (qc_id, sibling_id):
+        response = http.post(f"/api/v1/agent/tasks/{task_id}/content-qc-recovery", headers=ADMIN)
+        assert response.status_code == 409, response.text
+    with Session(runtime.engine) as session:
+        for task_id in (qc_id, sibling_id):
+            with pytest.raises(TaskConflictError, match="RECOVERY_SOURCE_SUPERSEDED"):
+                _require_current_revision(session, session.get(AgentTask, task_id))
+        assert {model: [row.model_dump(mode="json") for row in session.exec(select(model)).all()]
+                for model in before} == before
+        assert session.get(Content, content_id).current_stage == "content_qc"
+    assert recovery_rows(runtime) == []
+
+
+@pytest.mark.parametrize("case, rejected", [
+    ("older", False), ("newer", True), ("equal", True), ("cancelled", False),
+    ("different_content", False), ("different_type", False), ("different_scene_batch", False),
+    ("same_scene_batch", True), ("default_scene_batch", True),
+])
+def test_current_revision_guard_preserves_revision_boundaries(tmp_path, case, rejected):
+    runtime = make_runtime(tmp_path)
+    runtime.initialize()
+    with Session(runtime.engine) as session:
+        kind = TaskType.SCENE_ANALYZE if "scene_batch" in case else TaskType.CONTENT_QC
+        task = AgentTask(id="agt_f", content_id="content", task_type=kind, status=TaskStatus.FAILED,
+                         prompt_name="fixture", instructions="fixture", input_hash="fixture",
+                         input_data={"batch_index": 1} if kind == TaskType.SCENE_ANALYZE else {},
+                         created_at=datetime(2026, 10, 10, tzinfo=timezone.utc))
+        sibling = AgentTask(**{**task.model_dump(), "id": "agt_0", "status": TaskStatus.PENDING})
+        if case in {"older", "newer"}:
+            sibling.created_at += timedelta(microseconds=-1 if case == "older" else 1)
+        elif case == "cancelled":
+            sibling.status = TaskStatus.CANCELLED
+        elif case == "different_content":
+            sibling.content_id = "other-content"
+        elif case == "different_type":
+            sibling.task_type = TaskType.SHORT_SCRIPT
+        elif case == "different_scene_batch":
+            sibling.input_data = {"batch_index": 2}
+        elif case == "default_scene_batch":
+            sibling.input_data = {}
+        session.add_all([task, sibling])
+        session.commit()
+        if rejected:
+            with pytest.raises(TaskConflictError, match="RECOVERY_SOURCE_SUPERSEDED"):
+                _require_current_revision(session, task)
+        else:
+            _require_current_revision(session, task)
 
 
 def test_qc_recovery_creates_one_owned_new_script_with_original_false_immutable(failed_qc):

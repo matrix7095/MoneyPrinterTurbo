@@ -351,3 +351,20 @@ passes to three per five-image bundle. The 26 new cases pass on Python 3.11 and
 `storage/visual-context-py313-20261010.log`. Live plan QC still requires a fresh
 leased attempt with the actual supplied pixels; transport checks are not image
 or publication approval.
+A full transport regression exposed a real equal-timestamp recovery bug:
+`new_qc` intermittently selected the old QC by random UUID order (673 other
+cases passed). Read-only persisted-state diagnosis is recorded in
+`storage/qc-revision-failure-diagnosis.md`. The shared current-version guard now
+rejects ambiguous same-time siblings after the existing scene-batch filter.
+Deterministic pre-fix evidence has seven failing tie cases; the repaired QC and
+failure suites pass 139 tests. The 13 new cases also pass on Python 3.11 and 3.13.
+Independent acceptance passes 187 connected cases and real TCP API probes:
+both ID directions and pending/completed siblings return 409 with persisted
+state and content bytes unchanged; strictly older/cancelled siblings retain
+idempotent recovery. Reports: `storage/qc-revision-tie-independent-review.md`
+and `storage/qc-revision-tie-{py311,py313}-20261010.log`. No historical task
+input, timestamp, result or budget was rewritten.
+Root's exact final combined business suite passes 687 tests (3120 warnings,
+298.30 seconds) with all six accepted source hashes unchanged. Log:
+`storage/business-visual-context-tie-exact-final-20261010.log`. This closes the
+code regression gate; deployment and fresh actual-media publication are separate.

@@ -66,7 +66,9 @@ def _require_current_revision(session, task):
         revisions = [row for row in revisions if (row.input_data.get("batch_index") or 1)
                      == (task.input_data.get("batch_index") or 1)]
     latest = revisions[0] if revisions else None
-    if latest is None or latest.id != task.id:
+    # UUID order cannot establish which equal-timestamp revision is current.
+    if (latest is None or latest.id != task.id
+            or any(row.id != task.id and as_utc(row.created_at) == as_utc(task.created_at) for row in revisions)):
         raise TaskConflictError("RECOVERY_SOURCE_SUPERSEDED")
 
 
