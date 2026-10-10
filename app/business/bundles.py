@@ -515,6 +515,11 @@ def build_bundle(
             }:
                 upstream_result = _compact_scene_analysis(upstream_result)
             bundle_input[field] = upstream_result
+    if task.task_type == TaskType.VISUAL_PLAN_QC and "prepared_visual_plan" in task.input_data:
+        if (stable_hash(task.input_data) != task.input_hash
+                or task.input_data.get("visual_plan_result_sha256") != stable_hash(bundle_input.get("visual_plan"))):
+            raise HTTPException(status_code=409, detail="Prepared visual plan source changed")
+        bundle_input["visual_plan"] = task.input_data["prepared_visual_plan"]
     materialized = bundle_input.pop("materialized_context", {})
     if materialized and task.content_id:
         content = session.get(Content, task.content_id)

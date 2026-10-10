@@ -213,3 +213,28 @@ and the original render/acceptance/audio evidence were retained before repair.
 This state boundary must be repaired without rewriting frozen inputs or treating
 the old pending acceptance subject as a new one. Final acceptance, publication
 review and a new external publication ID remain outstanding.
+
+## Immutable visual-plan repair acceptance, 2026-10-10
+
+The repair keeps accepted results immutable and resolves prepared plans and
+QC-approved image bindings separately for rendering and acceptance. The narrow
+admin recovery preserves old submissions, receipts and pending-task inputs,
+then creates a new acceptance subject and QC offer for the unchanged final video.
+It rejects stale/missing parent proof, active content tasks/offers, and unresolved
+publication intents. Reused generated images require the same origin proof.
+
+Independent review initially rejected five groups of missing guards. Seven
+isolated adversarial cases now reject; normal first consumption and historical
+portable context remain valid, including a fresh independent publication process.
+Final review approved six fixed files with matching before/after physical SHA.
+Its fresh focused run passed 49 tests. The 48 new materialization/recovery tests
+also passed on Python 3.11 (16.34 seconds) and 3.13 (16.32 seconds); Python 3.12
+is covered by that independent run. Ruff, syntax compilation and diff checks
+passed. Evidence is `storage/visual-projection-independent-final-v2-*` and
+`storage/visual-projection-py{311,313}-final.log`.
+
+The earlier full business run passed 448 before the last first-generation
+consumption case was added. Root's fresh full run of the exact approved revision
+passed 449 tests in 221.11 seconds; the log is
+`storage/business-visual-projection-exact-final-20261010.log`. These code checks
+do not establish live restoration, final QC approval or external publication.

@@ -238,6 +238,20 @@ def resume_acceptance(*, content_id: str, request: Request):
     )
 
 
+@router.post("/contents/{content_id}/restore-visual-plan")
+def restore_visual_plan(*, content_id: str, request: Request):
+    runtime = get_runtime(request)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Content not found")
+        content_root(content, runtime)
+    try:
+        return runtime.restore_consumed_visual_plan(content_id)
+    except (ValueError, OSError, KeyError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 @router.post("/contents/{content_id}/publications/douyin/publish")
 def publish(
     *,

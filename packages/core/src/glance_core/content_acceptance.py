@@ -1,6 +1,7 @@
 """Deterministic binding of a v2 Agent acceptance to its exact current materials."""
 
 import hashlib
+from copy import deepcopy
 from math import isfinite
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -76,6 +77,198 @@ def candidate_source_context(session: Session, candidate: Candidate) -> dict:
     return context
 
 
+def _unchanged_material_task(session: Session, task: AgentTask, *, owned: bool = False, consumed: bool = True) -> None:
+    from glance_core.task_service import stable_hash
+
+    if stable_hash(task.input_data) != task.input_hash:
+        raise ValueError("visual material task input changed")
+    submissions = session.exec(select(AgentSubmission).where(
+        AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+        AgentSubmission.validation_status == "ACCEPTED",
+    )).all()
+    receipts = session.exec(select(AuditEvent).where(
+        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+        AuditEvent.action.in_(["completed", "mpt_agent_consumed", "mpt_task_owned"]),
+    )).all()
+    completed = [event for event in receipts if event.action == "completed"]
+    markers = [event for event in receipts if event.action == "mpt_agent_consumed"]
+    if owned and (len(submissions) != 1 or not any(event.action == "mpt_task_owned" for event in receipts)
+                  or len(completed) != 1 or completed[0].actor_type != "agent"
+                  or completed[0].actor_id != submissions[0].agent_id
+                  or submissions[0].agent_id != task.assigned_agent_id
+                  or completed[0].metadata_json.get("result_hash") != submissions[0].result_hash
+                  or (consumed and not markers)):
+        raise ValueError("visual material accepted/consumed proof missing")
+    if (submissions and (len(submissions) != 1
+                         or submissions[0].result_hash != stable_hash(task.result_data))) or any(
+        event.metadata_json.get("input_hash" if event.action == "mpt_task_owned" else "result_hash")
+        != (task.input_hash if event.action == "mpt_task_owned" else stable_hash(task.result_data))
+        for event in receipts if event.action != "completed"
+    ):
+        raise ValueError("visual material task accepted result/ownership changed")
+
+
+def prepared_visual_plan(session: Session, plan: AgentTask) -> dict:
+    """Use only the current PlanQC's frozen server preparation; keep Agent bytes intact."""
+    from glance_core.task_service import stable_hash
+
+    _unchanged_material_task(session, plan)
+    current = session.exec(select(AgentTask).where(
+        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+    if current is None or current.id != plan.id or plan.status != TaskStatus.COMPLETED:
+        raise ValueError("visual material plan missing/stale")
+    qc = session.exec(select(AgentTask).where(
+        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+    result = plan.result_data or {}
+    if qc is not None and "prepared_visual_plan" in qc.input_data:
+        _unchanged_material_task(session, qc)
+        if (qc.status != TaskStatus.COMPLETED or (qc.result_data or {}).get("passed") is not True
+                or qc.input_data.get("upstream_task_ids", {}).get("visual_plan") != plan.id
+                or qc.input_data.get("visual_plan_result_sha256") != stable_hash(result)
+                or not isinstance(qc.input_data["prepared_visual_plan"], dict)):
+            raise ValueError("prepared visual plan approval missing/stale")
+        result = qc.input_data["prepared_visual_plan"]
+    return deepcopy(result)
+
+
+def _owned_visual_chain(session: Session, plan: AgentTask) -> bool:
+    # Downstream publication ownership must not reclassify a portable visual graph.
+    rows = session.exec(select(AgentTask).where(AgentTask.content_id == plan.content_id)).all()
+    ids = [row.id for row in rows if row.id == plan.id or (
+        row.task_type in {TaskType.VISUAL_PLAN_QC, TaskType.ASSET_GENERATE_IMAGE, TaskType.ASSET_QC}
+        and row.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id
+        and row.input_data.get("asset_purpose") != "cover")]
+    return session.exec(select(AuditEvent.id).where(
+        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id.in_(ids),
+        AuditEvent.action.in_(["mpt_task_owned", "mpt_agent_consumed"]),
+    )).first() is not None
+
+
+def _visual_parent_chain(session: Session, plan: AgentTask, *, owned: bool) -> None:
+    def current(kind, ref=None):
+        row = session.exec(select(AgentTask).where(
+            AgentTask.content_id == plan.content_id, AgentTask.task_type == kind,
+            AgentTask.status != TaskStatus.CANCELLED,
+        ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+        if row is None or row.status != TaskStatus.COMPLETED or (ref is not None and row.id != ref):
+            raise ValueError(f"visual material {kind.value} lineage missing/stale")
+        _unchanged_material_task(session, row, owned=owned)
+        return row
+
+    script_id = plan.input_data.get("upstream_task_ids", {}).get("script")
+    if not script_id:
+        raise ValueError("visual material script lineage missing")
+    script = current(TaskType.SHORT_SCRIPT, script_id)
+    research_id = script.input_data.get("upstream_task_ids", {}).get("research")
+    if not research_id:
+        raise ValueError("visual material research lineage missing")
+    current(TaskType.CONTENT_RESEARCH, research_id)
+    qc = current(TaskType.SCRIPT_QC)
+    if (qc.result_data or {}).get("passed") is not True or qc.input_data.get("upstream_task_ids", {}).get("script") != script.id or (
+            qc.input_data.get("upstream_task_ids", {}).get("research", research_id) != research_id):
+        raise ValueError("visual material script QC lineage missing/stale")
+
+
+def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
+    """Derive requested images from exact current generation and passed QC, without writes."""
+    result = prepared_visual_plan(session, plan)
+    owned = _owned_visual_chain(session, plan)
+    if owned:
+        _visual_parent_chain(session, plan, owned=True)
+    _unchanged_material_task(session, plan, owned=owned)
+    plan_qc = session.exec(select(AgentTask).where(
+        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+    consuming = session.info.get("consuming_agent_task_id")
+    if plan_qc is None and owned:
+        raise ValueError("Current VISUAL_PLAN_QC missing")
+    if plan_qc is not None:
+        _unchanged_material_task(session, plan_qc, owned=owned, consumed=plan_qc.id != consuming)
+        if (plan_qc.status != TaskStatus.COMPLETED or (plan_qc.result_data or {}).get("passed") is not True
+                or plan_qc.input_data.get("upstream_task_ids", {}).get("visual_plan") != plan.id):
+            raise ValueError("Current VISUAL_PLAN_QC must be completed and passed")
+    content = session.get(Content, plan.content_id)
+    tasks = session.exec(select(AgentTask).where(
+        AgentTask.content_id == plan.content_id,
+        AgentTask.task_type.in_([TaskType.ASSET_GENERATE_IMAGE, TaskType.ASSET_QC]),
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
+    reused = {}
+    for index, segment in enumerate(result.get("segments", [])):
+        request = segment.get("asset_request")
+        if not request:
+            artifact = session.get(Artifact, segment["asset_id"]) if segment.get("asset_id") else None
+            if artifact is not None and artifact.artifact_type == "agent_generated_image":
+                material = generated_image_material(session, content, artifact.id)
+                reused[index] = material
+                if owned:
+                    _unchanged_material_task(session, session.get(AgentTask, material["generation_task_id"]), owned=True)
+                    _unchanged_material_task(session, session.get(AgentTask, material["generation_plan_id"]), owned=True)
+                if material["generation_plan_id"] != plan.id and artifact.id not in plan.input_data.get("allowed_asset_ids", []):
+                    raise ValueError("visual material reuse declaration missing")
+            continue
+        generation = next((task for task in tasks if task.task_type == TaskType.ASSET_GENERATE_IMAGE
+                           and task.input_data.get("asset_purpose") != "cover"
+                           and task.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id
+                           and any(entry.get("segment_index") == index for entry in task.input_data.get("requests", []))), None)
+        if generation is None or generation.status != TaskStatus.COMPLETED:
+            raise ValueError(f"Current plan image generation is incomplete: {index}")
+        _unchanged_material_task(session, generation, owned=owned)
+        requests = [entry for entry in generation.input_data.get("requests", []) if entry.get("segment_index") == index]
+        images = [image for image in (generation.result_data or {}).get("images", []) if image.get("segment_index") == index]
+        if len(requests) != 1 or requests[0].get("asset_request") != request or len(images) != 1:
+            raise ValueError("visual material generation request/coverage changed")
+        image = images[0]
+        qc = next((task for task in tasks if task.task_type == TaskType.ASSET_QC
+                   and task.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id
+                   and (task.input_data.get("full_generated_assets") is True
+                        or task.input_data.get("upstream_task_ids", {}).get("asset_generate_image") == generation.id)), None)
+        if qc is None or qc.status != TaskStatus.COMPLETED or (qc.result_data or {}).get("passed") is not True:
+            raise ValueError("Current ASSET_QC must be completed and passed")
+        _unchanged_material_task(session, qc, owned=owned, consumed=qc.id != consuming)
+        checked = [entry for entry in qc.input_data.get("assets", []) if entry.get("segment_index") == index]
+        if (len(checked) != 1 or checked[0].get("artifact_id") != image.get("artifact_id")
+                or checked[0].get("request") != request or checked[0].get("generation") != image):
+            raise ValueError("visual material asset QC coverage changed")
+        artifact = session.get(Artifact, image.get("artifact_id"))
+        if (content is None or artifact is None or artifact.content_id != content.id
+                or artifact.artifact_type != "agent_generated_image" or not artifact.mime_type.startswith("image/")
+                or artifact.producer_stage != generation.id):
+            raise ValueError("visual material artifact lineage changed")
+        root = Path(content.content_dir).resolve()
+        path = (root / artifact.relative_path).resolve()
+        if (not path.is_relative_to(root) or not path.is_file()
+                or path.stat().st_size != artifact.size_bytes or _file_sha256(path) != artifact.sha256):
+            raise ValueError("visual material artifact bytes changed")
+        segment.pop("asset_request")
+        segment["asset_id"] = artifact.id
+    # Full-composition approval must also cover reused assets and reject extras/duplicates.
+    full = next((task for task in tasks if task.task_type == TaskType.ASSET_QC
+                 and task.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id
+                 and task.input_data.get("full_generated_assets") is True), None)
+    if owned and reused and full is None:
+        raise ValueError("Full current asset QC required for reused images")
+    if full is not None:
+        _unchanged_material_task(session, full, owned=owned, consumed=full.id != consuming)
+        expected = {index: segment["asset_id"] for index, segment in enumerate(result.get("segments", []))
+                    if segment.get("asset_id")}
+        entries = full.input_data.get("assets", [])
+        if (full.status != TaskStatus.COMPLETED or (full.result_data or {}).get("passed") is not True
+                or len(entries) != len(expected)
+                or {entry.get("segment_index"): entry.get("artifact_id") for entry in entries} != expected):
+            raise ValueError("Full current asset QC materials/coverage changed")
+        for index, material in reused.items():
+            entry = next(entry for entry in entries if entry.get("segment_index") == index)
+            if any(entry.get(key) != value for key, value in material.items()):
+                raise ValueError("Full current asset QC reuse lineage changed")
+    return result
+
+
 def source_context(
     session: Session, content_id: str, refs: dict, *, include_references: bool = False
 ) -> dict:
@@ -135,6 +328,12 @@ def source_context(
     ):
         gaps.append("visual_plan: script/source lineage mismatch")
         plan = None
+    material_plan = plan.result_data if plan else {}
+    if plan:
+        try:
+            material_plan = resolved_visual_plan(session, plan)
+        except ValueError as exc:
+            gaps.append(str(exc))
     if script:
         upstream = script.input_data.get("upstream_task_ids", {})
         research = completed(upstream.get("research"), TaskType.CONTENT_RESEARCH)
@@ -205,7 +404,7 @@ def source_context(
         if plan:
             used = {
                 s.get("scene_id")
-                for s in plan.result_data.get("segments", [])
+                for s in material_plan.get("segments", [])
                 if isinstance(s, dict) and s.get("scene_id")
             }
             if not used.issubset(seen):
@@ -213,13 +412,13 @@ def source_context(
             context["scenes"] = [scene for scene in context["scenes"] if scene["scene_id"] in used]
     assets = {
         s.get("asset_id")
-        for s in (plan.result_data.get("segments", []) if plan else [])
+        for s in material_plan.get("segments", [])
         if isinstance(s, dict) and s.get("asset_id")
     }
     references = []
     if include_references and plan:
         allowed = plan.input_data.get("allowed_reference_artifact_ids", [])
-        for index, segment in enumerate(plan.result_data.get("segments", [])):
+        for index, segment in enumerate(prepared_visual_plan(session, plan).get("segments", [])):
             request = segment.get("asset_request") if isinstance(segment, dict) else None
             if not isinstance(request, dict) or not request.get("reference_artifact_id"):
                 continue
@@ -383,6 +582,10 @@ def generated_image_material(session: Session, content: Content, artifact_id: st
         or stable_hash(plan.input_data) != plan.input_hash
     ):
         raise ValueError("generated image plan unavailable")
+    if _owned_visual_chain(session, plan):
+        _unchanged_material_task(session, plan, owned=True)
+        _unchanged_material_task(session, generation, owned=True,
+                                 consumed=generation.id != session.info.get("consuming_agent_task_id"))
     images = [
         i
         for i in generation.result_data.get("images", [])
@@ -446,7 +649,7 @@ def _original_image_lineage(
         or plan.input_data.get("allowed_reference_artifact_ids")
     ):
         raise ValueError("original_media: image-only plan required")
-    segments = plan.result_data.get("segments", [])
+    segments = resolved_visual_plan(session, plan).get("segments", [])
     if not segments or any(
         not isinstance(segment, dict)
         or segment.get("layout") != "image_card"
@@ -711,6 +914,8 @@ def acceptance_subject(
         != tasks["script"].id
     ):
         raise ValueError("acceptance plan/script mismatch")
+    if _owned_visual_chain(session, tasks["visual_plan"]):
+        resolved_visual_plan(session, tasks["visual_plan"])
     research_id = tasks["script"].input_data.get("upstream_task_ids", {}).get("research")
     research = session.get(AgentTask, research_id) if isinstance(research_id, str) else None
     if (

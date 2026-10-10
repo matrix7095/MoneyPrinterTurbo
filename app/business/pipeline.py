@@ -12,6 +12,8 @@ from glance_core.content_acceptance import (
     acceptance_origin,
     acceptance_subject,
     is_handsfree_content,
+    prepared_visual_plan,
+    resolved_visual_plan,
     source_context,
     verify_acceptance,
 )
@@ -997,7 +999,7 @@ def _asset_qc_input(
     generated_by_index = {i["segment_index"]: i["artifact_id"] for i in images}
     content = session.get(Content, plan_task.content_id)
     assets = []
-    for index, segment in enumerate(plan_task.result_data.get("segments", [])):
+    for index, segment in enumerate(prepared_visual_plan(session, plan_task).get("segments", [])):
         asset_id = generated_by_index.get(index) or segment.get("asset_id")
         artifact = session.get(Artifact, asset_id) if asset_id else None
         if artifact and artifact.artifact_type == "agent_generated_image":
@@ -1169,6 +1171,7 @@ def _advance_after_agent(
     task_id: str,
 ) -> str | None:
     with Session(engine) as session:
+        session.info["consuming_agent_task_id"] = task_id
         task = session.get(AgentTask, task_id)
         if task is None or task.status != TaskStatus.COMPLETED:
             return
@@ -1688,6 +1691,7 @@ def _advance_after_agent(
                 flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "short_script")
                 return
             content = session.get(Content, content_id)
+            plan_preparation = {}
             if content is not None and content.production_mode == ProductionMode.IMAGE_ONLY:
                 original_plan = dict(task.result_data or {})
                 augmented_plan, asset_stats = _ensure_image_only_asset_requests(
@@ -1697,8 +1701,10 @@ def _advance_after_agent(
                     script=script_task.result_data or {},
                 )
                 if augmented_plan != original_plan:
-                    task.result_data = augmented_plan
-                    session.add(task)
+                    plan_preparation = {
+                        "prepared_visual_plan": augmented_plan,
+                        "visual_plan_result_sha256": stable_hash(original_plan),
+                    }
                     session.add(
                         AuditEvent(
                             actor_type="system",
@@ -1732,6 +1738,7 @@ def _advance_after_agent(
                 content_id,
                 TaskType.VISUAL_PLAN_QC,
                 {
+                    **plan_preparation,
                     "upstream_task_ids": {
                         "visual_plan": task.id,
                         "script": script_task.id,
@@ -1760,7 +1767,7 @@ def _advance_after_agent(
                 flow.create_qc_recovery_task(task, plan_task)
                 return
             flow.set_error(content_id, None, None)
-            segments = (plan_task.result_data or {}).get("segments", []) if plan_task else []
+            segments = prepared_visual_plan(session, plan_task).get("segments", []) if plan_task else []
             requests = [
                 (index, segment["asset_request"])
                 for index, segment in enumerate(segments)
@@ -1883,51 +1890,18 @@ def _advance_after_agent(
                     or stable_hash(task.input_data) != task.input_hash
                 ):
                     raise ValueError("Full current asset QC materials/coverage changed")
-            asset_tasks = session.exec(
-                select(AgentTask)
-                .where(
-                    AgentTask.content_id == content_id,
-                    AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
-                    AgentTask.status == TaskStatus.COMPLETED,
-                )
-                .order_by(AgentTask.created_at)
-            ).all()
-            # 按 segment_index 取最新一张：后续重生任务的图覆盖早期图。
-            latest_by_segment: dict[int, dict] = {}
-            for asset_task in asset_tasks:
-                if asset_task.input_data.get("asset_purpose") == "cover":
-                    continue
-                asset_plan_id = _upstream_task_id(asset_task, "visual_plan")
-                if asset_plan_id:
-                    if asset_plan_id != plan_task.id:
-                        continue
-                elif as_utc(asset_task.created_at) < as_utc(plan_task.created_at):
-                    continue
-                for image in (asset_task.result_data or {}).get("images", []):
-                    latest_by_segment[int(image["segment_index"])] = image
-            segments = [dict(segment) for segment in plan_task.result_data["segments"]]
-            missing_indexes: list[int] = []
-            for index, segment in enumerate(segments):
-                image = latest_by_segment.get(index)
-                if segment.get("asset_request") and image is None:
-                    missing_indexes.append(index)
-                    continue
-                if image is not None:
-                    segment.pop("asset_request", None)
-                    segment["asset_id"] = image["artifact_id"]
-
-            if missing_indexes:
+            try:
+                resolved_visual_plan(session, plan_task)
+            except ValueError as exc:
+                if not str(exc).startswith("Current plan image generation is incomplete"):
+                    raise
                 flow.set_error(
                     content_id,
                     "ASSET_GENERATION_INCOMPLETE",
-                    "仍有画面段缺少可用图片素材："
-                    + ",".join(str(index) for index in missing_indexes),
+                    str(exc),
                 )
                 flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "asset_qc_missing")
             else:
-                plan_task.result_data = {**plan_task.result_data, "segments": segments}
-                session.add(plan_task)
-                session.commit()
                 flow.set_error(content_id, None, None)
                 flow.mark_status(content_id, ContentStatus.PRODUCING, "render_ready")
         elif task.task_type == TaskType.CONTENT_QC:
@@ -2561,9 +2535,10 @@ def _render_voice_path(
     raise NonRetryableMediaError("Approved voice Artifact or its frozen timing pair is missing or changed")
 
 
-def render_content(engine: Engine, settings: Settings, content_id: str) -> Content:
+def render_content(engine: Engine, settings: Settings, content_id: str, *, consuming_task_id: str | None = None) -> Content:
     _require_media_tools("ffmpeg", "ffprobe")
     with Session(engine) as session:
+        session.info["consuming_agent_task_id"] = consuming_task_id
         content = session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
@@ -2579,7 +2554,7 @@ def render_content(engine: Engine, settings: Settings, content_id: str) -> Conte
             session, content_id, TaskType.VISUAL_PLAN_QC,
             {"visual_plan": plan_task, "script": script_task},
         )
-        plan = plan_task.result_data if plan_task else None
+        plan = resolved_visual_plan(session, plan_task) if plan_task else None
         script = script_task.result_data if script_task else None
         if not plan or not script:
             missing = "、".join(

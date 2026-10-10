@@ -1,14 +1,16 @@
 """MPT-owned storage and consumption boundary around portable Glance services."""
 
 import logging
+import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
 from glance_collector.service import CollectionService
 from glance_core.database import begin_immediate, build_engine, create_db
-from glance_core.models import AgentTask, AgentWorker, AuditEvent, Content, ContentStatus, Source, TaskStatus, TaskType, as_utc
+from glance_core.models import AgentSubmission, AgentTask, AgentWorker, Artifact, AuditEvent, Content, ContentStatus, SchedulerOffer, Source, TaskStatus, TaskType, as_utc, utc_now
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import Settings
 from glance_core.task_service import AgentTaskService, TaskConflictError, stable_hash
@@ -285,6 +287,7 @@ class BusinessRuntime:
 
     def _failure_visual_target(self, session, flow, task):
         from app.business.pipeline import _current_visual_plan_for_asset_task
+        from glance_core.content_acceptance import prepared_visual_plan
 
         plan = _current_visual_plan_for_asset_task(session, flow, task)
         script = flow.completed_task_for(task.content_id or "", TaskType.SHORT_SCRIPT)
@@ -296,15 +299,16 @@ class BusinessRuntime:
         _require_current_revision(session, script)
         declared = task.input_data.get("upstream_task_ids") or {}
         frozen_plan = task.input_data.get("visual_plan")
+        current_plan = prepared_visual_plan(session, plan)
         requests = [{"segment_index": index, "asset_request": segment["asset_request"]}
-                    for index, segment in enumerate(plan.result_data.get("segments", []))
+                    for index, segment in enumerate(current_plan.get("segments", []))
                     if segment.get("asset_request")]
         actual = [{"segment_index": item.get("segment_index"), "asset_request": item.get("asset_request")}
                   for item in task.input_data.get("requests", [])]
         if (plan.input_data.get("upstream_task_ids", {}).get("script") != script.id
                 or task.input_data.get("script") != script.result_data
                 or actual != requests or not requests
-                or (frozen_plan is not None and frozen_plan != plan.result_data)
+                or (frozen_plan is not None and frozen_plan != current_plan)
                 or (not declared.get("visual_plan") and frozen_plan is None)):
             raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
         return plan
@@ -511,7 +515,10 @@ class BusinessRuntime:
                 operation = operations.get(action)
                 if operation is None or not task.content_id:
                     raise ValueError(f"Unsupported pipeline follow-up: {action}")
-                operation(self.engine, self.settings, task.content_id)
+                if action == "render":
+                    operation(self.engine, self.settings, task.content_id, consuming_task_id=task_id)
+                else:
+                    operation(self.engine, self.settings, task.content_id)
             with Session(self.engine) as session:
                 session.add(
                     AuditEvent(
@@ -548,6 +555,163 @@ class BusinessRuntime:
                 self.consume_agent(task_id, lock_timeout_seconds=lock_timeout_seconds)
             except Exception:
                 logger.exception("Agent consumption pending for %s", task_id)
+
+    def restore_consumed_visual_plan(self, content_id: str) -> dict:
+        """Restore ONLY a proven historical asset backfill, superseding an unexecuted QC offer."""
+        from glance_core.content_acceptance import acceptance_subject, resolved_visual_plan, source_context
+        from glance_media.executor import sha256_file
+
+        with content_operation_lock(self.settings, content_id):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    assert_allowed(session, content_id=content_id)
+                    content = session.get(Content, content_id)
+                    if content is None:
+                        raise KeyError(content_id)
+                    if (content.business_status, content.current_stage) != (ContentStatus.WAITING_AGENT, "content_qc"):
+                        raise ValueError("Visual restoration requires an unexecuted content QC offer")
+                    _require_reconciled_content(session, content_id)
+                    if session.exec(select(AgentTask.id).where(
+                        AgentTask.content_id == content_id,
+                        AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+                    )).first() or session.exec(select(SchedulerOffer.request_id).where(
+                        SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == content_id)),
+                        SchedulerOffer.expires_at > utc_now(),
+                    )).first():
+                        raise ValueError("Visual restoration content work is active or offered")
+                    if session.exec(select(AuditEvent.id).where(
+                        AuditEvent.entity_type == "publish_intent",
+                        AuditEvent.metadata_json["content_id"].as_string() == content_id,
+                    )).first():
+                        raise ValueError("Visual restoration cannot cross a publication intent")
+                    flow = self.workflow_service(session)
+                    plan = flow.completed_task_for(content_id, TaskType.VISUAL_PLAN)
+                    if plan is None:
+                        raise ValueError("Visual restoration plan missing")
+                    _require_owned_input(session, plan)
+                    _require_current_revision(session, plan)
+                    self._require_native_deployment(session, plan)
+                    submissions = session.exec(select(AgentSubmission).where(
+                        AgentSubmission.task_id == plan.id, AgentSubmission.attempt == plan.attempt,
+                        AgentSubmission.validation_status == "ACCEPTED",
+                    )).all()
+                    if len(submissions) != 1:
+                        raise ValueError("Visual restoration requires one accepted submission")
+                    submission = submissions[0]
+                    expected_path = (self.settings.agent_submission_dir / plan.id / str(plan.attempt) / "result.json").resolve()
+                    if (not expected_path.is_relative_to(self.settings.agent_submission_dir.resolve())
+                            or Path(submission.raw_result_path).resolve() != expected_path):
+                        raise ValueError("Visual restoration submission path changed")
+                    original = json.loads(expected_path.read_text(encoding="utf-8"))
+                    events = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == plan.id,
+                        AuditEvent.action.in_(["completed", AGENT_CONSUMED]),
+                    )).all()
+                    completed = [event for event in events if event.action == "completed"]
+                    consumed = [event for event in events if event.action == AGENT_CONSUMED]
+                    if (not isinstance(original, dict) or stable_hash(original) != submission.result_hash
+                            or len(completed) != 1 or completed[0].actor_type != "agent"
+                            or completed[0].actor_id != submission.agent_id
+                            or submission.agent_id != plan.assigned_agent_id
+                            or completed[0].metadata_json.get("result_hash") != submission.result_hash
+                            or not consumed or any(event.metadata_json.get("result_hash") != submission.result_hash for event in consumed)):
+                        raise ValueError("Visual restoration accepted/consumed proof changed")
+                    if plan.result_data == original:
+                        resolved_visual_plan(session, plan)
+                        return {"restored": False, "visual_plan_task_id": plan.id}
+                    before = deepcopy(plan.result_data)
+                    detached = plan.model_copy(update={"result_data": original})
+                    if resolved_visual_plan(session, detached) != before:
+                        raise ValueError("Visual restoration is not an exact approved asset backfill")
+                    offers = session.exec(select(AgentTask).where(
+                        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+                        AgentTask.status != TaskStatus.CANCELLED,
+                    )).all()
+                    if len(offers) != 1:
+                        raise ValueError("Visual restoration requires one unexecuted QC offer")
+                    offer = offers[0]
+                    assert_allowed(session, task_id=offer.id)
+                    if (offer.status != TaskStatus.PENDING or offer.attempt != 0 or offer.assigned_agent_id
+                            or offer.lease_token_hash or offer.started_at or offer.result_data
+                            or offer.schema_version != "2" or stable_hash(offer.input_data) != offer.input_hash
+                            or offer.input_data.get("acceptance_contract_version") != 2
+                            or offer.input_data.get("source_context_version") != 1
+                            or offer.input_data.get("audio_evidence_version") != 1):
+                        raise ValueError("Visual restoration QC offer has already executed or changed")
+                    if session.exec(select(AgentTask.id).where(
+                        AgentTask.content_id == content_id,
+                        AgentTask.task_type.in_([TaskType.FINAL_REVIEW_ASSIST, TaskType.PUBLISH_PREPARE,
+                                               TaskType.PUBLISH_REVIEW_ASSIST, TaskType.DOUYIN_PUBLISH]),
+                        AgentTask.status != TaskStatus.CANCELLED,
+                    )).first():
+                        raise ValueError("Visual restoration downstream work already exists")
+                    frozen = deepcopy(offer.input_data)
+                    root = Path(content.content_dir).resolve()
+                    if not root.is_relative_to(self.settings.content_dir.resolve()):
+                        raise ValueError("Visual restoration content root outside runtime")
+                    receipt_path = root / "render" / "acceptance-input.json"
+                    receipts = session.exec(select(Artifact).where(
+                        Artifact.content_id == content_id, Artifact.artifact_type == "acceptance_input",
+                        Artifact.relative_path == "render/acceptance-input.json",
+                    )).all()
+                    if (not receipt_path.resolve().is_relative_to(root) or not receipt_path.is_file()
+                            or sum(artifact.sha256 == sha256_file(receipt_path)
+                                   and artifact.size_bytes == receipt_path.stat().st_size for artifact in receipts) != 1):
+                        raise ValueError("Visual restoration original render receipt changed")
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    without_audio = deepcopy(frozen)
+                    without_audio.pop("audio_evidence")
+                    without_audio.pop("audio_evidence_version")
+                    without_audio["acceptance_subject"].pop("audio_evidence_sha256")
+                    if receipt != without_audio:
+                        raise ValueError("Visual restoration QC/render receipt mismatch")
+                    audio = frozen["audio_evidence"]
+                    audio_path = root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json"
+                    if (not audio_path.resolve().is_relative_to(root) or not audio_path.is_file()
+                            or json.loads(audio_path.read_text(encoding="utf-8")) != audio):
+                        raise ValueError("Visual restoration independent audio evidence changed")
+                    refs = {**frozen["upstream_task_ids"], "video_artifact_id": frozen["video_artifact_id"]}
+                    if refs.get("visual_plan") != plan.id:
+                        raise ValueError("Visual restoration QC plan lineage changed")
+                    plan.result_data = original
+                    session.add(plan)
+                    current = acceptance_subject(session, content_id, refs, source_context_version=1, audio_evidence=audio)
+                    expected = {**frozen["acceptance_subject"], "visual_plan_sha256": submission.result_hash}
+                    context = source_context(session, content_id, refs)
+                    if current != expected or context != frozen["source_context"] or context.get("evidence_gaps"):
+                        raise ValueError("Visual restoration current acceptance materials changed")
+                    artifact = Artifact(content_id=content_id, artifact_type="acceptance_input", relative_path="",
+                                        sha256="", size_bytes=0, mime_type="application/json",
+                                        producer_stage="visual_plan_restoration")
+                    new_input = {**frozen, "acceptance_subject": current, "previous_acceptance_task_id": offer.id,
+                                 "acceptance_receipt_artifact_id": artifact.id}
+                    relative = f"render/acceptance-input-restored-{stable_hash(new_input)}.json"
+                    new_path = root / relative
+                    encoded = json.dumps(new_input, ensure_ascii=False).encode("utf-8")
+                    if not new_path.resolve().is_relative_to(root) or (new_path.exists() and new_path.read_bytes() != encoded):
+                        raise ValueError("Visual restoration new receipt path changed")
+                    temporary = new_path.with_suffix(".tmp")
+                    if not temporary.resolve().is_relative_to(root):
+                        raise ValueError("Visual restoration temporary receipt path changed")
+                    temporary.write_bytes(encoded)
+                    temporary.replace(new_path)
+                    artifact.relative_path, artifact.sha256, artifact.size_bytes = relative, sha256_file(new_path), len(encoded)
+                    session.add(artifact)
+                    flow.tasks.cancel(offer.id, actor_id="admin-api", actor_type="human")
+                    replacement = flow.create_agent_task(content_id, TaskType.CONTENT_QC, new_input, priority=60,
+                                                         allow_multiple=True, schema_version="2")
+                    session.add(AuditEvent(actor_type="human", actor_id="admin-api", entity_type="content",
+                                           entity_id=content_id, action="mpt_visual_plan_restored",
+                                           metadata_json={"visual_plan_task_id": plan.id, "original_result_hash": submission.result_hash,
+                                                          "backfilled_result_hash": stable_hash(before), "cancelled_task_id": offer.id,
+                                                          "replacement_task_id": replacement.id, "receipt_artifact_id": artifact.id,
+                                                          "video_artifact_id": refs["video_artifact_id"], "video_sha256": current["video_sha256"]}))
+                    Session.commit(session)
+                    return {"restored": True, "visual_plan_task_id": plan.id, "content_qc_task_id": replacement.id,
+                            "receipt_artifact_id": artifact.id}
+                finally:
+                    session.rollback()
 
     def task_service(self, session: Session) -> AgentTaskService:
         return IsolatedTaskService(

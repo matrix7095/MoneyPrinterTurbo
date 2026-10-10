@@ -61,6 +61,22 @@ Other pipeline stages create their own sessions and perform media IO outside tha
 
 For a temporary ASR/audio-evidence failure, authenticated `POST /api/v1/contents/{id}/resume-acceptance` resumes `WAITING_AGENT/audio_evidence_waiting` or an orphaned `PRODUCING/audio_evidence_running`. It takes the same content OS lock as live collectors, verifies the registered v2 render receipt, explicit manual/Handsfree production ownership and current file/lineage hashes, then collects independent final-track evidence without rendering again. Process crashes release the lock; other running media stages are not recovered through this endpoint. Invalid receipts/materials close the snapshot; concurrent retries issue at most one QC v2 task. This endpoint does not approve that QC decision.
 
+Accepted visual-plan results remain immutable. Any automatic preparation is
+frozen separately in PlanQC input and shown in its bundle; rendering and source
+acceptance use the same verified asset projection. Missing or changed native
+parent/accepted/consumed evidence fails closed, including reused images. Internal
+consumption context only permits the exact current accepted image/QC task to
+finish before its consumed marker exists; it grants no ownership or acceptance.
+
+Authenticated `POST /api/v1/contents/{id}/restore-visual-plan` handles only a proven
+old asset-binding mutation with an unexecuted v2 QC offer. It verifies the original
+submission and complete current parent chain, rejects active leases/offers and
+unreconciled publication intents, then restores the original result under the
+content lock and one database transaction. It cancels the old offer while keeping
+its frozen input, writes a separate receipt and creates one fresh QC offer for
+the unchanged final video/audio. It does not render or approve QC. Historical
+augmentation without a complete frozen projection cannot use this recovery.
+
 Rendering uses the explicitly requested encoder once. The default remains libx264; an explicit hardware encoder may fail. The original failure is recorded in StageRun rather than silently retrying an unrelated RuntimeError with software encoding.
 
 Startup replays only completed tasks with an MPT ownership audit matching the signed input hash. Historical imported completed tasks do not become new work merely because their MPT marker is absent. Dispatch/planning first recover accepted owned results, then reap owned expired leases in a separate SQLite transaction. Unconfirmed reservations preserve the attempt budget; confirmed expiry preserves core backoff/exhaustion and publication intent reconciliation. Imported unowned expired leases are neither reaped nor directly reclaimed.
