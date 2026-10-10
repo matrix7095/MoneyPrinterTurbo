@@ -215,3 +215,9 @@ Eve 的冲突已定位到提示词配置上下文：已有 Handsfree 必要适�
 独立成片质检 `agt_8e5be968168c4e26ab8ca786918d875c` 已COMPLETED并返回passed=false：30.27秒成片的冻结帧、最终SHA、完整解码与PCM一致性通过，但缺完整动态观看证据；开头0–0.48秒Eve被两次独立无提示ASR识别为低置信“If”，尚未消歧，不能认定物理错读或放行。正常Recovery `agt_ec27c7e32c0e42e08a6db7b1d89e216e` 已COMPLETED，并实际创建第5版SHORT_SCRIPT `agt_89f4861844994f7c9e264adabb82332b`（PENDING），以已核验中文类别承载口播，保留正式身份和必要陪护条件，再正常重制、重新质检。该口播修复不会自动补齐动态审核能力。
 
 Root本轮使用实际mpt-codex.ps1执行契约2调度，完成16轮后停止新增并等待全部原生Worker终态；没有重领、重提、修改失败质检或提高预算。另一个发现任务已提交三条NO_SIMILAR候选，仍为OFFICIAL_REFERENCE，不表示厂商转载许可。运行证明已保存主目录 `storage/smoke/stable-production-20261010/eve-production-cycle-4-proof.json`。03:21实查主目录API监听3592、UI监听16940，UI健康200，守护任务最近执行结果0。最新真实发布仍是旧作品7695010253280234779，未产生本周期新发布ID。
+
+### 完整影音审核能力核对
+
+只读检查未发现项目中已启用且可确认的整段video+audio语义审核Provider：TwelveLabs的analyze_clip没有业务调用方，实际密钥为空且SDK未安装；当前moonshot配置也没有模型或密钥。faster-whisper与ffprobe仅提供识别、信号和技术证据。角色声明或换文本模型不能证明实际媒体理解能力。独立设计审查还指出，Handsfree提示允许充分的独立ASR/PCM联合音频证据，不能只因没有原生听回判失败；本轮存在具体产品名未消歧及完整动态画面缺口，两项必须分别处理，脚本重制不会补齐后者。
+
+浏览器只读检查发现现有已登录Gemini Pro入口及文件上传菜单；官方说明支持视频和音频文件（https://support.google.com/gemini/answer/14903178?hl=en）。这仍是待实测候选能力，并未接入或批准业务审核。已用现有FFmpeg制作6秒纯合成动态/音轨探针，不含业务素材、个人信息或凭据，完整解码exit0。文件 `av-capability-probe.mp4`、清单 `av-capability-probe.json` 位于主目录稳定生产证据目录，SHA256为4be91b53bfbf1bffcb3c0aa0af2497777b99e1fa2863433b075a10dcb9c765bb；入口截图为gemini-capability-entry.png。上传到Gemini属于此前本机图片准备和抖音发布授权以外的新外部传输，已提出明确授权问题，尚未得到答复；未上传任何文件，不能假称能力探针通过。
