@@ -1,6 +1,6 @@
 # MPT Agent 部署与 contract 2 接点
 
-当前已有独立启动器 staging、显式部署登记调用方和 MPT deployment/contract 2 服务接点。本切片仅用临时 ASGI/SQLite 验证登记，未修改现役 Glance launcher、宿主全局 Skills、Codex 自动化，也未调用在线 scheduler-plan。`STAGED` 只证明本地 CLI/技能可执行；`REGISTERED` 仅表示选定角色均收到服务端 VERIFIED，不代表 native Worker 已签发或业务完成。
+当前已有独立启动器 staging、显式部署登记调用方和 MPT deployment/contract 2 服务接点。本切片用临时 ASGI/SQLite 验证登记，用临时 loopback HTTP/代理与合成凭据验证传输隔离，未修改现役 Glance launcher、宿主全局 Skills、Codex 自动化，也未调用在线 scheduler-plan。`STAGED` 只证明本地 CLI/技能可执行；`REGISTERED` 仅表示选定角色均收到服务端 VERIFIED，不代表 native Worker 已签发或业务完成。
 
 ## 独立安装
 
@@ -11,11 +11,24 @@
   -StagingDirectory "$PWD\storage\agent-launcher-staging\review-001"
 ```
 
-目录必须为当前仓库 `storage/agent-launcher-staging/` 内的新目录；已存在目录拒绝覆盖。默认凭据文件是当前仓库 `storage/business-8010/private/runtime.json`，可用 `-RuntimeConfig` 指定当前仓库 storage 内的另一份独立 MPT 文件。安装器不复制、输出 token；每次启动读取私有文件，只把派生的角色或 scheduler token 放进子进程环境，固定 API 为 `http://127.0.0.1:8010`。CLI 包名和进程内 `GLANCE_AGENT_*` 协议变量暂时保留，但不会继承旧安装配置。
+目录必须为当前仓库 `storage/agent-launcher-staging/` 内的新目录；已存在目录拒绝覆盖。默认凭据文件是当前仓库 `storage/business-8010/private/runtime.json`，可用 `-RuntimeConfig` 指定当前仓库 storage 内的另一份独立 MPT 文件。安装时 `-ApiUrl` 默认 `http://127.0.0.1:8010`，写入各 launcher 的 manifest；启动和登记使用该绑定，不继承环境中的旧 API 地址。旧 manifest 没有 `api_url` 时继续使用 8010。安装器不复制、输出 token；每次启动读取私有文件，只把派生的角色或 scheduler token 放进子进程环境。CLI 包名和进程内 `GLANCE_AGENT_*` 协议变量暂时保留，但不会继承旧安装配置。
+
+例如服务最终使用 8000 时，在新的 staging 中同时指定该实例的凭据和地址：
+
+```powershell
+& '.\scripts\install-mpt-agent-launchers.ps1' `
+  -StagingDirectory "$PWD\storage\agent-launcher-staging\deployment-8000" `
+  -RuntimeConfig "$PWD\storage\business-8000\private\runtime.json" `
+  -ApiUrl 'http://127.0.0.1:8000'
+```
+
+API 地址只接受 `http://127.0.0.1:<port>`，port 为无前导零的 1..65535。远程 IP、域名、其他 loopback 写法、HTTPS、userinfo、路径（包括末尾 `/`）、query、fragment 和空白均拒绝。安装、启动或登记在读取凭据之前校验；登记批次先校验所有选定 manifest，避免前面的角色先发送凭据。`-ApiUrl` 是安装参数，`-Register` 只使用已保存的 manifest，不重绑地址。安装参数不会启动、停止服务或修改宿主全局部署。
+
+启动器移除继承的 HTTP/HTTPS/ALL/NO_PROXY 环境变量（不区分大小写），再设置可信 `NO_PROXY=*`，同时阻止 Windows 注册表代理回退。MPT 登记客户端显式使用 `AgentClient(..., trust_env=False)`，不会修改调用者全局环境。portable `AgentClient` 的默认 `trust_env=True` 保留，旧远程客户端的代理行为不变。
 
 生成 8 个业务角色 launcher、1 个 scheduler launcher、局部技能与 manifest。真实执行每个 PowerShell launcher 的 `skill-version`，不访问服务 API。没有默认认定 publish 宿主能力；只有实际验证过的能力才通过重复 `-PublishCapability` 参数声明。生产定时任务或全局技能安装需另一个经审查的部署切片。
 
-此前真实 staging 样本：`storage/agent-launcher-staging/verified-20261010-024048/`，9 个 executable selftests 通过，`deployment_verified=false`。当前专属测试 `test/business/test_agent_launcher_staging.py` 9 项通过：实际执行 PS staging launcher，再用登记 CLI 参数入口和真实临时 ASGI/SQLite 验证角色 token、fresh whoami、host 字段提交/保存及无业务自检任务。本切片没有重启现役服务或运行在线登记。
+此前真实 staging 样本：`storage/agent-launcher-staging/verified-20261010-024048/`，9 个 executable selftests 通过，`deployment_verified=false`。地址绑定与代理隔离切片的专属测试 `test/business/test_agent_launcher_staging.py` 在 Python 3.11/3.12/3.13 各 46 项通过：实际 PowerShell 安装将 8000 写入全部 manifest，实际 launcher 自检通过；通过临时 ASGI/SQLite 验证 8000/8010 两种登记地址、角色 token、fresh whoami、host 字段提交/保存及无业务自检任务。跨版本 ASGI 登记由当前解释器安装 wrapper；PowerShell 转发独立验证默认 `.venv`，不放宽服务端精确解释器校验。另覆盖旧 manifest 默认 8010、25 类非法地址在读取凭据前拒绝、批次内远程地址篡改阻止所有凭据读取和 HTTP。真实临时 HTTP 代理负对照证明旧客户端默认经过代理；实际 CLI 子进程和 MPT 登记只发送到直接端点，注册表代理回退也被拒绝。服务接点回归 `test/business/test_deployment_http.py` 32 项通过；Ruff、Python 编译和 PowerShell 解析检查通过。本切片没有重启现役服务或运行在线登记。
 
 ## 显式登记
 

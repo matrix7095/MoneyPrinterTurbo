@@ -18,6 +18,15 @@ from glance_core.security import issue_role_token, issue_scheduler_token
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 MPT_MODELS = {"gpt-6.1-sol", "gpt-6-luna"}
+DEFAULT_API_URL = "http://127.0.0.1:8010"
+
+
+def validated_api_url(value: str) -> str:
+    # Validate before loading credentials; no DNS, redirects or alternate URL spellings.
+    match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", value) if isinstance(value, str) else None
+    if match is None or int(match[1]) > 65535:
+        raise ValueError("API URL must be canonical HTTP 127.0.0.1 with a valid explicit port")
+    return value
 
 
 def controlled_stage(path: Path, workspace: Path = WORKSPACE) -> Path:
@@ -38,6 +47,7 @@ def read_root_token(path: Path) -> str:
 
 
 def launcher_environment(manifest: dict) -> dict[str, str]:
+    api_url = validated_api_url(manifest.get("api_url", DEFAULT_API_URL))
     role = manifest["role_id"]
     root_token = read_root_token(Path(manifest["runtime_config"]))
     token = (
@@ -48,9 +58,12 @@ def launcher_environment(manifest: dict) -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items()
         if not key.startswith("GLANCE_AGENT_") and key != "MPT_UPSTREAM_COMPATIBILITY"
+        and key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
     }
     environment.update({
-        "GLANCE_AGENT_API_URL": "http://127.0.0.1:8010",
+        # A trusted bypass also prevents urllib/httpx falling back to Windows registry proxies.
+        "NO_PROXY": "*",
+        "GLANCE_AGENT_API_URL": api_url,
         "GLANCE_AGENT_TOKEN": token,
         "GLANCE_AGENT_ID": manifest["agent_id"],
         "GLANCE_AGENT_ROLE_ID": role,
@@ -78,7 +91,9 @@ def check_launcher(manifest_path: Path, manifest: dict):
         raise ValueError("Staged launcher executable check failed")
 
 
-def install(stage: Path, runtime_config: Path, scheduler_id: str, capabilities: list[str]) -> dict:
+def install(stage: Path, runtime_config: Path, scheduler_id: str, capabilities: list[str],
+            api_url: str = DEFAULT_API_URL) -> dict:
+    api_url = validated_api_url(api_url)
     stage = controlled_stage(stage)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", scheduler_id):
         raise ValueError("Invalid scheduler identity")
@@ -105,6 +120,7 @@ def install(stage: Path, runtime_config: Path, scheduler_id: str, capabilities: 
         identity = scheduler_id if role == "scheduler" else f"{scheduler_id}-{role}"
         manifest = {
             "workspace": str(WORKSPACE), "runtime_config": str(runtime_config),
+            "api_url": api_url,
             "scheduler_id": scheduler_id, "agent_id": identity, "role_id": role,
             "skill_name": name, "skill_version": cli._required_skill_version(target),
             "skill_path": str(target),
@@ -129,6 +145,7 @@ def install(stage: Path, runtime_config: Path, scheduler_id: str, capabilities: 
         check_launcher(manifest_path, manifest)
     return {
         "status": "STAGED", "stage": str(stage), "launcher_count": len(roles),
+        "api_url": api_url,
         "executable_selftest": "PASS", "deployment_verified": False,
         "scheduler_launcher": str(stage / f"{scheduler_id}.ps1"),
         "publish_capabilities": capabilities,
@@ -138,7 +155,7 @@ def install(stage: Path, runtime_config: Path, scheduler_id: str, capabilities: 
 
 def register(stage: Path, roles: list[str], max_concurrency: int,
              supported_models: list[str], model_name: str, reasoning_effort: str,
-             client_factory=AgentClient) -> dict:
+             client_factory=None) -> dict:
     stage = controlled_stage(stage)
     if (type(max_concurrency) is not int or not 1 <= max_concurrency <= 16
             or not supported_models or len(set(supported_models)) != len(supported_models)
@@ -155,14 +172,15 @@ def register(stage: Path, roles: list[str], max_concurrency: int,
             raise ValueError("Staged role manifest is missing or ambiguous")
         path = candidates[0]
         manifest = json.loads(path.read_text(encoding="utf-8"))
+        validated_api_url(manifest.get("api_url", DEFAULT_API_URL))
         if manifest["workspace"] != str(WORKSPACE) or manifest["role_id"] != role:
             raise ValueError("Role manifest belongs to another MPT deployment")
         if role == "publish" and not set(PUBLISH_REQUIRED_CAPABILITIES).issubset(manifest["capabilities"]):
             raise ValueError("Publish capabilities must be explicitly verified and staged")
-        check_launcher(path, manifest)
         manifests.append((path, manifest))
     reports = []
     for path, manifest in manifests:
+        check_launcher(path, manifest)
         environment = launcher_environment(manifest)
         config = AgentSettings(
             _env_file=None, _env_prefix="MPT_STAGING_UNUSED_",
@@ -174,7 +192,7 @@ def register(stage: Path, roles: list[str], max_concurrency: int,
             model_name=model_name, reasoning_effort=reasoning_effort,
             capabilities=manifest["capabilities"],
         )
-        client = client_factory(config)
+        client = AgentClient(config, trust_env=False) if client_factory is None else client_factory(config)
         try:
             whoami = client.whoami()
             if whoami.get("role_id") != manifest["role_id"]:
@@ -219,12 +237,13 @@ def run(manifest_path: Path, command: list[str]):
     cli.app(args=command, prog_name="mpt-agent")
 
 
-def main(argv=None, *, client_factory=AgentClient):
+def main(argv=None, *, client_factory=None):
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     staging = actions.add_parser("install")
     staging.add_argument("--staging-directory", type=Path, required=True)
     staging.add_argument("--runtime-config", type=Path, required=True)
+    staging.add_argument("--api-url", default=DEFAULT_API_URL)
     staging.add_argument("--scheduler-id", default="mpt-codex")
     staging.add_argument("--publish-capability", action="append", default=[])
     registering = actions.add_parser("register")
@@ -241,7 +260,7 @@ def main(argv=None, *, client_factory=AgentClient):
     try:
         if args.action == "install":
             print(json.dumps(install(args.staging_directory, args.runtime_config,
-                                     args.scheduler_id, args.publish_capability), ensure_ascii=False))
+                                     args.scheduler_id, args.publish_capability, args.api_url), ensure_ascii=False))
         elif args.action == "register":
             result = register(args.staging_directory, args.role, args.max_concurrency,
                               args.supported_model, args.model_name, args.reasoning_effort,

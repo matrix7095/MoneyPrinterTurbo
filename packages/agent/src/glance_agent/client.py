@@ -11,12 +11,13 @@ from glance_agent.settings import AgentSettings
 
 
 class AgentClient:
-    def __init__(self, settings: AgentSettings) -> None:
+    def __init__(self, settings: AgentSettings, *, trust_env: bool = True) -> None:
         self.settings = settings
         self.client = httpx.Client(
             base_url=self.settings.api_url.rstrip("/"),
             timeout=self.settings.timeout_seconds,
             follow_redirects=False,
+            trust_env=trust_env,
         )
 
     def _client(self):

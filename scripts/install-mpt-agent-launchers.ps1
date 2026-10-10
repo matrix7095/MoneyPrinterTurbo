@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$StagingDirectory,
     [string]$RuntimeConfig,
+    [string]$ApiUrl = 'http://127.0.0.1:8010',
     [string]$SchedulerId = 'mpt-codex',
     [string[]]$PublishCapability = @(),
     [switch]$Register,
@@ -21,7 +22,7 @@ if (-not (Test-Path -LiteralPath $python)) { throw 'Install the locked MPT envir
 $arguments = @(
     (Join-Path $PSScriptRoot 'mpt_agent_launchers.py'), 'install',
     '--staging-directory', $StagingDirectory, '--runtime-config', $RuntimeConfig,
-    '--scheduler-id', $SchedulerId
+    '--scheduler-id', $SchedulerId, '--api-url', $ApiUrl
 )
 foreach ($capability in $PublishCapability) { $arguments += @('--publish-capability', $capability) }
 if ($Register) {

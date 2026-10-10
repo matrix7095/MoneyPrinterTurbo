@@ -88,14 +88,38 @@ deployment checks.
 
 ## Remaining delivery gates
 
-The new IKEA episode has approved research, script, voice and visual plan, but
-its image task remains pending. Two native image outputs were 941 by 1672,
-below the frozen minimum of 1080 by 1920. Local image enlargement requires the
-user's explicit exception to the image-editing tool rule; it has not been
-performed. Asset/final QC, rendering, publish review, real external publication
-ID/URL and screenshot evidence remain required.
+The new IKEA episode has approved research, script, voice and visual plan.
+The user explicitly authorized local image enlargement to 1080 by 1920. The
+second image attempt retained ten native 941 by 1672 outputs and three enlarged
+1080 by 1920 files with source/final hashes and actual prompts. The last two
+segments still failed the frozen matching-stool geometry requirements, so the
+task was truthfully failed with `GENERATED_IMAGE_CONSTRAINT_MISMATCH` and
+`retryable=false`. No generated image Artifact was uploaded and no result was
+submitted. Evidence is in the task's staged workspace
+`generation-provenance.json`. The missing terminal-failure recovery handoff is
+being repaired; the image constraints have not been silently weakened.
+Asset/final QC, rendering, publish review, real external publication ID/URL
+and screenshot evidence remain required.
 
 The later actual upstream merge rehearsal and its limits are recorded in
 `upstream-sync-log.md`. Final fresh data and configuration transfer, production
 release/restart, and external LAN checks remain. This checkpoint does not
 satisfy those gates.
+
+## Accepted launcher endpoint and proxy boundary
+
+The launcher now explicitly binds a canonical numeric-loopback HTTP endpoint
+at install time, so a final 8000 deployment can use its own credentials instead
+of silently contacting 8010. Legacy manifests remain 8010. Endpoint validation
+precedes credential reads and validates an entire registration batch first.
+MPT launcher execution bypasses inherited and Windows registry proxies;
+registration uses a transport with `trust_env=False`. The portable client's
+existing default remains compatible.
+
+Focused launcher tests passed 46 on each Python 3.11, 3.12 and 3.13. An
+independent review passed 78 focused tests and repeated actual isolated HTTP
+proxy negative/direct-only controls using synthetic credentials. Root's fresh
+full Python 3.12 business suite passed 343 in 186.21 seconds, recorded in
+`storage/business-launcher-endpoint-final-20261010.log`. Proxy evidence is
+`storage/endpoint-independent-proxy-fixed-proof.json`. These checks did not
+contact production or trigger a publish.
