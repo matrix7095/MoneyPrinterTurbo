@@ -53,6 +53,27 @@ After the verified upstream merge, 8010 was restarted again from code commit
 and the image task stayed PENDING with zero publications for the new episode.
 The later proof is `storage/smoke/live-8010-upstream-20261010/proof.json`.
 
+## Actual Douyin read-only evidence preflight
+
+The existing SAU `local-default` account passed a fresh `douyin check`. A
+read-only Chrome session using that account opened the actual content manager,
+saved its screenshot, and correlated six visible descriptions with the
+platform's observed `/janus/douyin/creator/pc/work_list` response. Both the
+`items.id` and `aweme_list.aweme_id` must agree before recording an ID. No
+upload, click, login challenge handling, or cookie write was performed; the
+cookie file hash remained unchanged.
+
+Proof, screenshot, visible text and whitelisted content IDs are under
+`storage/smoke/douyin-readonly-preflight-20261010/`. The latest observed item
+is the older Waydoo video, ID `7684644113731325235`, displayed as published on
+2026-09-12 at 21:44. These historical items prove the read-only evidence path,
+not a new publication. The probe consumes only the observed work-list response
+and stores no cookies, request headers, authentication query strings or raw
+API responses. For a future publish, uniquely match the frozen new description
+and publication time, recheck its visible platform status, and upload that
+specific screenshot as an Artifact. Missing or ambiguous evidence remains
+UNKNOWN and never permits another upload or final click.
+
 ## Remaining delivery gates
 
 The new IKEA episode has approved research, script, voice and visual plan, but
