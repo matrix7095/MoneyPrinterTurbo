@@ -194,5 +194,22 @@ concept disclosure. The last two images show a single plant-display surface
 from above, without pretending to prove stool hardware or assembly geometry.
 Production evidence is under `storage/smoke/native-image-repaired-20261010/`;
 independent evidence is under `storage/smoke/episode-asset-qc-20261010/`.
-The real render was requested only after this consumed asset QC. Final audio/QC,
-publication review and a new external publication ID remain outstanding.
+The real render was requested only after this consumed asset QC and returned
+HTTP 200, WAITING_AGENT/content_qc. The final H.264/AAC video is 1080-by-1920,
+31.766667 seconds, 4,733,696 bytes, with SHA-256
+`cf46f0d3b29dc0b3deefaa451bf8e55ac6fdd3ae8a524e0b0a8b68f1083aec96`.
+Technical QC passed. Actual final-track medium/CPU/int8 ASR and PCM evidence is
+available; peak amplitude is 0.546997 and full-scale sample fraction is zero.
+ASR contains product-name and Chinese homophone ambiguities; it is evidence for
+independent assessment, not native-listening proof or automatic approval.
+Root viewed the first and last extracted actual frames, including the visible
+AI concept label. Evidence is in `storage/smoke/episode-render-20261010/`.
+
+Final semantic QC has not been dispatched: maintenance exposed an existing
+post-consumption mutation of the visual-plan result when asset QC binds images.
+Its accepted submission and consumed-result hash remain preserved, but the
+stored projected plan has a different hash. A consistent private database backup
+and the original render/acceptance/audio evidence were retained before repair.
+This state boundary must be repaired without rewriting frozen inputs or treating
+the old pending acceptance subject as a new one. Final acceptance, publication
+review and a new external publication ID remain outstanding.
