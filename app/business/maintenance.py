@@ -14,6 +14,8 @@ from glance_core.models import (
     CollectionRun,
     Content,
     ContentStatus,
+    PublicationRecord,
+    SchedulerOffer,
     RuntimeSetting,
     Source,
     TaskStatus,
@@ -22,7 +24,8 @@ from glance_core.models import (
     utc_now,
 )
 from glance_core.runtime_config import effective_settings
-from glance_core.task_service import stable_hash
+from glance_core.task_service import TaskConflictError, stable_hash
+from glance_core.task_schemas import RecoveryPlan
 from app.business.topic_policy import (
     _auto_select,
     _handsfree_wip_count,
@@ -30,6 +33,7 @@ from app.business.topic_policy import (
 )
 from sqlalchemy import event
 from sqlalchemy.orm import aliased, with_loader_criteria
+from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlmodel import Session, select
 
 from app.business.consumption import content_operation_lock
@@ -43,6 +47,7 @@ from app.business.quarantine import (
 logger = logging.getLogger(__name__)
 TICK = "mpt_maintenance_last_run"
 INTERVAL = timedelta(minutes=5)
+TERMINAL_SCAN_CURSOR = "mpt_terminal_recovery_scan_cursor"
 
 
 class _Session(Session):
@@ -162,6 +167,204 @@ def _collector(runtime, session, settings, flow):
     return collector
 
 
+def _skip_terminal_recoveries(runtime):
+    # Use an unfiltered Session: quarantined/unowned siblings can still be live.
+    from app.business.runtime import (
+        _require_current_revision,
+        _require_reconciled_content,
+    )
+
+    with Session(runtime.engine) as session:
+        begin_immediate(session)
+        if not effective_settings(session, runtime.settings).handsfree_enabled:
+            return 0
+        cursor = session.get(RuntimeSetting, TERMINAL_SCAN_CURSOR)
+        query = (
+            select(Content.id)
+            .where(
+                Content.current_stage == "recovery_blocked",
+                Content.error_code == "RECOVERY_BLOCKED",
+                Content.business_status.in_(
+                    [ContentStatus.FAILED, ContentStatus.SCRIPT_REVIEW]
+                ),
+            )
+            .order_by(Content.id)
+        )
+        keys = session.exec(
+            query.where(Content.id > (cursor.value if cursor else "")).limit(20)
+        ).all()
+        if not keys and cursor is not None:
+            keys = session.exec(query.limit(20)).all()
+        if keys:
+            # Private keyset progress prevents rejected old evidence starving later topics.
+            cursor = cursor or RuntimeSetting(key=TERMINAL_SCAN_CURSOR, value="")
+            cursor.value, cursor.updated_at = keys[-1], utc_now()
+            session.add(cursor)
+            session.commit()
+    skipped = 0
+    for key in keys:
+        try:
+            with content_operation_lock(runtime.settings, key, timeout_seconds=0):
+                with Session(runtime.engine) as session:
+                    begin_immediate(session)
+                    if not effective_settings(
+                        session, runtime.settings
+                    ).handsfree_enabled:
+                        continue
+                    content = session.get(Content, key)
+                    if (
+                        content is None
+                        or content.current_stage != "recovery_blocked"
+                        or content.error_code != "RECOVERY_BLOCKED"
+                        or content.business_status
+                        not in {ContentStatus.FAILED, ContentStatus.SCRIPT_REVIEW}
+                    ):
+                        continue
+                    assert_allowed(session, content_id=key)
+                    selections = session.exec(
+                        select(AuditEvent).where(
+                            AuditEvent.entity_type == "content",
+                            AuditEvent.entity_id == key,
+                            AuditEvent.action == "handsfree_candidate_selected",
+                        )
+                    ).all()
+                    if not selections or any(
+                        row.actor_type != "system"
+                        or row.actor_id != "handsfree-coordinator"
+                        or row.metadata_json.get("candidate_id") != content.candidate_id
+                        for row in selections
+                    ):
+                        continue
+                    if session.exec(
+                        select(AuditEvent.id).where(
+                            AuditEvent.entity_type == "content",
+                            AuditEvent.entity_id == key,
+                            AuditEvent.action.in_(
+                                [
+                                    "manual_candidate_selected",
+                                    "handsfree_content_skipped",
+                                ]
+                            ),
+                        )
+                    ).first():
+                        continue
+                    tasks = session.exec(
+                        select(AgentTask)
+                        .where(AgentTask.content_id == key)
+                        .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
+                    ).all()
+                    if not tasks or any(
+                        row.status
+                        in {
+                            TaskStatus.PENDING,
+                            TaskStatus.LEASED,
+                            TaskStatus.SUBMITTED,
+                        }
+                        for row in tasks
+                    ):
+                        continue
+                    recovery = tasks[0]
+                    if (
+                        recovery.task_type != TaskType.RECOVERY
+                        or recovery.status != TaskStatus.COMPLETED
+                    ):
+                        continue
+                    if any(
+                        row.id != recovery.id
+                        and as_utc(row.created_at) == as_utc(recovery.created_at)
+                        for row in tasks
+                    ):
+                        continue
+                    _require_current_revision(session, recovery)
+                    runtime._require_accepted_native_task(
+                        session, recovery, consumed=True
+                    )
+                    plan = RecoveryPlan.model_validate(recovery.result_data)
+                    if plan.action != "mark_recovery_blocked":
+                        continue
+                    blocks = session.exec(
+                        select(AuditEvent).where(
+                            AuditEvent.entity_type == "agent_task",
+                            AuditEvent.entity_id == recovery.id,
+                            AuditEvent.actor_type == "system",
+                            AuditEvent.actor_id == "recovery-coordinator",
+                            AuditEvent.action == "recovery_blocked",
+                        )
+                    ).all()
+                    if (
+                        len(blocks) != 1
+                        or blocks[0].metadata_json.get("action") != plan.action
+                        or blocks[0].metadata_json.get("reason")
+                        != content.error_message
+                        or not 0
+                        <= (
+                            as_utc(blocks[0].created_at) - as_utc(content.updated_at)
+                        ).total_seconds()
+                        <= 1
+                    ):
+                        continue
+                    if session.exec(
+                        select(SchedulerOffer.request_id).where(
+                            SchedulerOffer.task_id.in_([row.id for row in tasks]),
+                            SchedulerOffer.expires_at > utc_now(),
+                        )
+                    ).first():
+                        continue
+                    if session.exec(
+                        select(PublicationRecord.id).where(
+                            PublicationRecord.content_id == key
+                        )
+                    ).first():
+                        continue
+                    _require_reconciled_content(session, key)
+                    previous = {
+                        "business_status": content.business_status.value,
+                        "current_stage": content.current_stage,
+                        "error_code": content.error_code,
+                    }
+                    content.business_status = ContentStatus.ARCHIVED
+                    content.current_stage = "archived"
+                    content.updated_at = utc_now()
+                    session.add(content)
+                    session.add(
+                        AuditEvent(
+                            actor_type="system",
+                            actor_id="handsfree-coordinator",
+                            entity_type="content",
+                            entity_id=key,
+                            action="handsfree_content_skipped",
+                            metadata_json={
+                                "candidate_id": content.candidate_id,
+                                "recovery_task_id": recovery.id,
+                                "result_hash": stable_hash(recovery.result_data),
+                                "previous": previous,
+                                "reason": plan.reason,
+                                "policy": "consumed_terminal_recovery",
+                            },
+                        )
+                    )
+                    session.commit()
+                    skipped += 1
+        except TimeoutError:
+            continue
+        except (
+            TaskConflictError,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            NoResultFound,
+            MultipleResultsFound,
+        ) as exc:
+            logger.warning(
+                "Terminal Recovery evidence rejected for content %s (%s): %s",
+                key,
+                type(exc).__name__,
+                exc,
+            )
+    return skipped
+
+
 class Maintenance:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -208,6 +411,7 @@ class Maintenance:
             "source_discovery_queued": 0,
             "blocked": 0,
             "prepared": 0,
+            "skipped": 0,
         }
         with _session(runtime) as session:
             tick = session.get(RuntimeSetting, TICK)
@@ -275,6 +479,7 @@ class Maintenance:
                                 },
                             )
                         )
+        result["skipped"] = _skip_terminal_recoveries(runtime)
         with _session(runtime) as session:
             settings = effective_settings(session, runtime.settings)
             if not settings.handsfree_enabled:
