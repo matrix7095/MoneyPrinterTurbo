@@ -35,6 +35,8 @@
 
 遗留Jackery消费修复 `a851c7b` 已提交、受管部署到主目录并推送。它保留执行白名单；对完成原生接受与全部来源重验后、确认为BUSINESS_QC修复动作指向非short_script目标的计划，原子写入服务器可信拒绝收据、blocked与consumed。归档维护只接受精确收据并保留既有人工、隔离、活跃任务、offer及发布保护。归档后的重复消费复用完整验收作只读重验；私有开关默认关闭，普通QC仍拒绝ARCHIVED，PUBLISHED始终拒绝。独立审查修复了收据删除加来源篡改、归档后活跃任务和来源/媒体漏检三项边界，最终409项独立回归通过（199.21秒）；Root完整业务回归1097项通过（548.78秒，退出码0）。05:23:44 UTC，真实Jackery已写入拒绝、阻断、消费审计；05:28:23 UTC维护周期已将其归档为ARCHIVED/archived，唯一跳过审计aud_9697911674a04e4bb2141d9558487941，拒绝代码与原失败记录保留；归档后72项旧任务输入/结果再次验证不变，同周期自动补入Fairphone主题content_a538cbb223004cc58fa904d3a824e1cc（WAITING_AGENT/agent_context）。API19344/launcher17996与原UI16940健康，授权200、匿名401、UI200；完整调度配置已恢复，Watchdog Ready。部署前后Eve与Jackery的72项旧任务输入/结果不变；另两条新主题Halo记录中，一条待办脚本在部署前由正式Worker正常完成，输入哈希不变，不能把这项正常结果变化算作历史篡改。当前证据 `rejected-recovery-release-proof.json` 与 `business-tests-rejected-recovery-final.log`。Halo已推进至visual_plan；本修复不证明完整影音审核或新视频发布成功。
 
+最终阻点复核：Halo图片任务第二次失败使用IMAGE_NATIVE_RESOLUTION_UNSUPPORTED并进入FAILED；Recovery agt_1b917d620e444d22b4051a3a16c90165已COMPLETED，明确mark_recovery_blocked，05:47:48 UTC已被服务端消费，当前内容已ARCHIVED/archived，未重置预算或恢复失败素材。Fairphone仍在正常视觉计划质检阶段，本轮仍无新PUBLISHED与外部ID。连续三轮核验后，剩余稳定生产验收依赖此前尚未答复的后续图片尺寸准备范围，以及Gemini探针/原创成片上传范围和实际完整媒体能力测试；自动Goal续跑不是这些范围的答复。现行代码修复、1097项完整回归、409项独立回归和文档提交均已完成，但完整稳定生产目标尚未完成，记为受阻。证据 `stable-production-remaining-blockers-proof.json`。
+
 ## 目标与验收边界
 
 目标是从来源发现、研究、脚本、原生图片、独立质检、渲染到真实抖音发布形成可恢复的日常流程。
