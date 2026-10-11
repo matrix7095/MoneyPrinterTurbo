@@ -10,9 +10,9 @@
 
 | 要求 | 实际证据 | 状态 |
 | --- | --- | --- |
-| 主目录生产API和新界面 | API PID22360的app-dir、UI PID16940的Main.py均指向主目录；授权API200、匿名401、UI健康200 | 通过 |
-| 守护与正式调度 | Watchdog最近执行结果0；身份叠加、名称交接与恢复终态消费修复均已部署，已再次恢复enabled=true、max_parallel=2，其他配置与维护前一致 | 通过运行配置检查 |
-| 修复代码与独立验证 | 已部署3c9726d；主目录源码与受审冻结版及Git blob一致（原始SHA差异仅换行表示）；992项完整业务回归通过，终态消费独立审查APPROVE及207项独立测试通过 | 通过 |
+| 主目录生产API和新界面 | API PID19344的app-dir、UI PID16940的Main.py均指向主目录；授权API200、匿名401、UI健康200 | 通过 |
+| 守护与正式调度 | Watchdog最近执行结果0；身份叠加、名称交接、恢复终态消费与可信拒绝修复均已部署，已再次恢复enabled=true、max_parallel=2，其他配置与维护前一致 | 通过运行配置检查 |
+| 修复代码与独立验证 | 已部署a851c7b；主目录源码与受审冻结版及Git blob一致（原始SHA差异仅换行表示）；1097项完整业务回归通过，可信拒绝独立审查APPROVE及409项独立测试通过 | 通过 |
 | 正确提交与文档 | 主目录干净，提交已快进并推送origin/main；本文与证明文件对应 | 通过当前提交检查 |
 | 第7版脚本与素材 | 中文类别口播脚本、SCRIPT_QC、SCRIPT_REVIEW_ASSIST及VISUAL_PLAN_QC通过；六张新图片完成，正式自动调度的ASSET_QC已COMPLETED且passed=true | 通过脚本和素材阶段 |
 | 新成片与影音审核 | 第6版实际画面已证明OpeningIdentity和Concept可见，但CONTENT_QC因关键品牌音频消歧及完整动态观看证据不足返回非通过；第7版音频、事实、权利和技术检查通过；完整动态观察缺失，CONTENT_QC passed=false，正常Recovery已完成并按3轮上限阻断 | 未通过 |
@@ -30,6 +30,8 @@
 第7版独立成片QC `agt_d26cda3f4bd24b30b780ca007ef9be55` 已COMPLETED，最终视频SHA256为 `94f54e5d77adf1a6ce3042bfb7f8469795dcfd16879d2ee5fdf558ae9343fee2`。批准中文类别口播与同片独立ASR/PCM联合证据支持audio=true，facts/rights/technical亦通过；未声称原生听回。整体仍passed=false：宿主没有可用完整动态理解，本地file播放被拒绝，17张抽帧不足以覆盖连续字幕、身份/概念标签、帧间对应和节奏；结尾轮椅局部出框另列warning。Recovery `agt_fe9cc9d53fdd4b17a89c912db506a87b` 已COMPLETED，action=mark_recovery_blocked，同一根因第3轮达到max_rounds=3；服务端已停止重制，但实际content状态为SCRIPT_REVIEW/current_stage=recovery_blocked，尚未证明自动跳过，不能把再次改脚本或播放器ended当作媒体能力补齐。证据 `production-cycle-7-content-qc-proof.json` 和 `production-cycle-7-recovery-terminal-proof.json`。正式调度本轮已NO_TASK且没有active handles。实际阻断状态仍带泛化人工处理提示，已确认MPT维护缺少Handsfree自动跳过消费并部署修复；04:52:05 UTC真实周期已将Eve归档并记录唯一跳过审计，不能把计划要求当成归档结果。未来启用完整动态媒体审核路径须先完成实际能力验证，不能重置本内容预算或恢复旧非通过结果。
 
 恢复终态消费修复 `3c9726d` 已提交、快进到主目录并推送。新增维护阶段在实际Handsfree开启且五分钟周期到期时、选题/WIP检查前运行；使用每批20条的持久化私有keyset游标，逐内容锁和BEGIN IMMEDIATE重新核验真实原生接受、MPT归属/消费、最新Recovery和阻断审计。人工/隔离内容、活跃任务、未过期offer、发布记录及未知或已授权发布意图均拒绝跳过；只归档已消费的mark_recovery_blocked终态，保留全部失败、预算与素材历史。独立审查最初发现扫描饥饿和日志丢失，修复后APPROVE，207项独立相关回归通过；Root21项专用测试通过，992项完整业务回归通过（454.40秒，退出码0）。API22360和既有UI16940正常，调度全配置与维护前备份相同；部署前后72项历史任务输入/结果字节哈希不变。主目录与Stable原始SHA因换行表示不同，但规范化字节与同一Git blob一致，证据 `terminal-recovery-release-proof.json`，完整日志 `business-tests-terminal-recovery-final.log`。真实归档与释放名额已验证：04:52:05 UTC，Eve状态ARCHIVED/archived，唯一审计aud_e5e82c59942c4cc3a62a78fc47a576ef，72历史任务哈希仍不变；当前Handsfree WIP=2，此修复不补齐动态媒体理解能力，也不恢复已阻断内容或放宽任何发布门槛。
+
+遗留Jackery消费修复 `a851c7b` 已提交、受管部署到主目录并推送。它保留执行白名单；对完成原生接受与全部来源重验后、确认为BUSINESS_QC修复动作指向非short_script目标的计划，原子写入服务器可信拒绝收据、blocked与consumed。归档维护只接受精确收据并保留既有人工、隔离、活跃任务、offer及发布保护。归档后的重复消费复用完整验收作只读重验；私有开关默认关闭，普通QC仍拒绝ARCHIVED，PUBLISHED始终拒绝。独立审查修复了收据删除加来源篡改、归档后活跃任务和来源/媒体漏检三项边界，最终409项独立回归通过（199.21秒）；Root完整业务回归1097项通过（548.78秒，退出码0）。05:23:44 UTC，真实Jackery已写入拒绝、阻断、消费审计；05:28:23 UTC维护周期已将其归档为ARCHIVED/archived，唯一跳过审计aud_9697911674a04e4bb2141d9558487941，拒绝代码与原失败记录保留；归档后72项旧任务输入/结果再次验证不变，同周期自动补入Fairphone主题content_a538cbb223004cc58fa904d3a824e1cc（WAITING_AGENT/agent_context）。API19344/launcher17996与原UI16940健康，授权200、匿名401、UI200；完整调度配置已恢复，Watchdog Ready。部署前后Eve与Jackery的72项旧任务输入/结果不变；另两条新主题Halo记录中，一条待办脚本在部署前由正式Worker正常完成，输入哈希不变，不能把这项正常结果变化算作历史篡改。当前证据 `rejected-recovery-release-proof.json` 与 `business-tests-rejected-recovery-final.log`。Halo已推进至visual_plan；本修复不证明完整影音审核或新视频发布成功。
 
 ## 目标与验收边界
 
