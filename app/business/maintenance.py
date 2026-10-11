@@ -172,6 +172,7 @@ def _skip_terminal_recoveries(runtime):
     from app.business.runtime import (
         _require_current_revision,
         _require_reconciled_content,
+        QC_TARGET_REJECTION,
     )
 
     with Session(runtime.engine) as session:
@@ -280,8 +281,10 @@ def _skip_terminal_recoveries(runtime):
                         session, recovery, consumed=True
                     )
                     plan = RecoveryPlan.model_validate(recovery.result_data)
+                    reason = plan.reason
                     if plan.action != "mark_recovery_blocked":
-                        continue
+                        runtime._check_content_qc_rejection_receipt(session, recovery)
+                        reason = QC_TARGET_REJECTION
                     blocks = session.exec(
                         select(AuditEvent).where(
                             AuditEvent.entity_type == "agent_task",
@@ -293,9 +296,10 @@ def _skip_terminal_recoveries(runtime):
                     ).all()
                     if (
                         len(blocks) != 1
-                        or blocks[0].metadata_json.get("action") != plan.action
+                        or blocks[0].metadata_json.get("action") != "mark_recovery_blocked"
                         or blocks[0].metadata_json.get("reason")
                         != content.error_message
+                        or (plan.action != "mark_recovery_blocked" and content.error_message != reason)
                         or not 0
                         <= (
                             as_utc(blocks[0].created_at) - as_utc(content.updated_at)
@@ -338,7 +342,7 @@ def _skip_terminal_recoveries(runtime):
                                 "recovery_task_id": recovery.id,
                                 "result_hash": stable_hash(recovery.result_data),
                                 "previous": previous,
-                                "reason": plan.reason,
+                                "reason": reason,
                                 "policy": "consumed_terminal_recovery",
                             },
                         )

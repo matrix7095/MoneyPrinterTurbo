@@ -34,6 +34,14 @@ AGENT_CONSUMED = "mpt_agent_consumed"
 OWNED = "mpt_task_owned"
 FAILURE_RECOVERY = "mpt_failure_recovery_created"
 QC_RECOVERY = "mpt_content_qc_recovery_created"
+QC_PLAN_REJECTED = "mpt_content_qc_recovery_plan_rejected"
+QC_TARGET_REJECTION = "RECOVERY_QC_TARGET_CHANGED"
+
+
+def _content_qc_target_changed(result):
+    return (isinstance(result, dict) and result.get("failure_class") == "BUSINESS_QC"
+            and result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
+            and (result.get("target_task_type") or "short_script") != "short_script")
 
 
 def _require_owned_input(session, task, *, consumed=False):
@@ -410,8 +418,9 @@ class BusinessRuntime:
                 or stable_hash(json.loads(raw.read_text(encoding="utf-8"))) != stable_hash(task.result_data)):
             raise TaskConflictError("RECOVERY_ACCEPTED_RESULT_CHANGED")
 
-    def _content_qc_source(self, session, task_id, *, consumed=True, recovery_id=None):
+    def _content_qc_source(self, session, task_id, *, consumed=True, recovery_id=None, archived_receipt=False):
         from glance_core.content_acceptance import verify_acceptance
+        from glance_core.models import PublicationRecord
         from glance_core.task_schemas import ContentAcceptanceResult
         from app.business.pipeline import _render_voice_path
         from app.business.bundles import sha256_file
@@ -430,9 +439,11 @@ class BusinessRuntime:
         self._require_accepted_native_task(session, task, consumed=consumed)
         _require_current_revision(session, task)
         _require_reconciled_content(session, task.content_id)
+        if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == task.content_id)).first():
+            raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
         content = session.get(Content, task.content_id)
-        if content is None or content.business_status in {
-            ContentStatus.ARCHIVED, ContentStatus.PUBLISHED, ContentStatus.REJECTED, ContentStatus.PACKAGED,
+        if content is None or (content.business_status == ContentStatus.ARCHIVED and not archived_receipt) or content.business_status in {
+            ContentStatus.PUBLISHED, ContentStatus.REJECTED, ContentStatus.PACKAGED,
         }:
             raise TaskConflictError("RECOVERY_CONTENT_NOT_CURRENT")
         if session.exec(select(AgentTask.id).where(
@@ -446,7 +457,7 @@ class BusinessRuntime:
         root = Path(content.content_dir).resolve()
         if not root.is_relative_to(self.settings.content_dir.resolve()):
             raise TaskConflictError("RECOVERY_CONTENT_STORAGE_CHANGED")
-        verify_acceptance(session, task, task.result_data)
+        verify_acceptance(session, task, task.result_data, _archived_revalidation=archived_receipt)
         script = session.get(AgentTask, task.input_data["upstream_task_ids"]["script"])
         plan = session.get(AgentTask, task.input_data["upstream_task_ids"]["visual_plan"])
         for parent in (script, plan):
@@ -532,6 +543,67 @@ class BusinessRuntime:
                 or recovery.input_data.get("lineage", {}).get("repair_target_task_id") != script.id):
             raise TaskConflictError("RECOVERY_QC_RECEIPT_CHANGED")
 
+    def _content_qc_rejection_metadata(self, recovery, source, script):
+        from glance_core.task_schemas import RecoveryPlan
+
+        plan = RecoveryPlan.model_validate(recovery.result_data)
+        if not _content_qc_target_changed(recovery.result_data):
+            raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
+        return {"code": QC_TARGET_REJECTION, "action": plan.action, "target_task_type": plan.target_task_type,
+                "recovery_input_hash": recovery.input_hash, "recovery_result_hash": stable_hash(recovery.result_data),
+                "source_task_id": source.id, "source_input_hash": source.input_hash,
+                "source_result_hash": stable_hash(source.result_data), "source_attempt": source.attempt,
+                "target_task_id": script.id, "target_input_hash": script.input_hash,
+                "target_result_hash": stable_hash(script.result_data)}
+
+    def _check_content_qc_rejection_receipt(self, session, recovery):
+        from glance_core.models import PublicationRecord
+
+        receipts = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == QC_PLAN_REJECTED,
+        )).all()
+        if (len(receipts) != 1 or receipts[0].actor_type != "system"
+                or receipts[0].actor_id != "mpt-content-qc"):
+            raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
+        self._require_accepted_native_task(session, recovery, consumed=True)
+        _require_current_revision(session, recovery)
+        source_id = recovery.input_data.get("failure", {}).get("source_task_id")
+        content = session.get(Content, recovery.content_id)
+        archived = content is not None and content.business_status == ContentStatus.ARCHIVED
+        if archived:
+            # Only its committed terminal receipt permits read-only acceptance revalidation after archival.
+            archives = session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "content", AuditEvent.entity_id == content.id,
+                AuditEvent.action == "handsfree_content_skipped",
+            )).all()
+            expected = {"candidate_id": content.candidate_id, "recovery_task_id": recovery.id,
+                        "result_hash": stable_hash(recovery.result_data), "policy": "consumed_terminal_recovery",
+                        "reason": QC_TARGET_REJECTION,
+                        "previous": {"business_status": "SCRIPT_REVIEW", "current_stage": "recovery_blocked",
+                                     "error_code": "RECOVERY_BLOCKED"}}
+            if (len(archives) != 1 or archives[0].actor_type != "system"
+                    or archives[0].actor_id != "handsfree-coordinator" or archives[0].metadata_json != expected
+                    or content.current_stage != "archived" or content.error_code != "RECOVERY_BLOCKED"
+                    or content.error_message != QC_TARGET_REJECTION):
+                raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
+            tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content.id)).all()
+            if (any(row.status in {TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED} for row in tasks)
+                    or session.exec(select(SchedulerOffer.request_id).where(
+                        SchedulerOffer.task_id.in_([row.id for row in tasks]), SchedulerOffer.expires_at > utc_now(),
+                    )).first()):
+                raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+            if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content.id)).first():
+                raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+            _require_reconciled_content(session, content.id)
+        try:
+            source, script = self._content_qc_source(session, source_id, recovery_id=recovery.id, archived_receipt=archived)
+        except (OSError, ValueError, KeyError, TypeError, NonRetryableMediaError) as exc:
+            raise TaskConflictError(str(exc)) from exc
+        self._check_content_qc_recovery_receipt(session, recovery, source, script)
+        if receipts[0].metadata_json != self._content_qc_rejection_metadata(recovery, source, script):
+            raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
+
     def schedule_content_qc_recovery(self, task_id, *, consuming=False):
         with Session(self.engine) as session:
             task = session.get(AgentTask, task_id)
@@ -581,19 +653,32 @@ class BusinessRuntime:
                     if marker is not None:
                         if marker.metadata_json.get("result_hash") != stable_hash(recovery.result_data):
                             raise TaskConflictError("RECOVERY_SOURCE_RESULT_CHANGED")
+                        if _content_qc_target_changed(recovery.result_data):
+                            self._check_content_qc_rejection_receipt(session, recovery)
                         return False
                     self._require_accepted_native_task(session, recovery, consumed=False)
+                    _require_current_revision(session, recovery)
                     source, script = self._content_qc_source(session, recovery.input_data.get("failure", {}).get("source_task_id"),
                                                              recovery_id=recovery.id)
                     self._check_content_qc_recovery_receipt(session, recovery, source, script)
                     result = recovery.result_data or {}
-                    if (result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
-                            and (result.get("target_task_type") or "short_script") != "short_script"):
-                        raise TaskConflictError("RECOVERY_QC_TARGET_CHANGED")
                     from app.business.pipeline import workflow
                     flow = workflow(session, effective_settings(session, self.settings))
                     flow.tasks = self.task_service(session)
-                    repair = flow.apply_recovery_plan(recovery)
+                    if (result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
+                            and (result.get("target_task_type") or "short_script") != "short_script"):
+                        metadata = self._content_qc_rejection_metadata(recovery, source, script)
+                        if session.exec(select(AuditEvent.id).where(
+                            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                            AuditEvent.action.in_([QC_PLAN_REJECTED, "recovery_blocked", "recovery_escalated"]),
+                        )).first():
+                            raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
+                        session.add(AuditEvent(actor_type="system", actor_id="mpt-content-qc", entity_type="agent_task",
+                                               entity_id=recovery.id, action=QC_PLAN_REJECTED, metadata_json=metadata))
+                        flow._mark_recovery_blocked(recovery, reason=QC_TARGET_REJECTION, action="mark_recovery_blocked")
+                        repair = None
+                    else:
+                        repair = flow.apply_recovery_plan(recovery)
                     if repair is not None:
                         session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
                                                entity_id=repair.id, action=OWNED,
@@ -698,6 +783,17 @@ class BusinessRuntime:
                     task.result_data
                 ):
                     raise ValueError("Consumed Agent result changed")
+                if kind == TaskType.RECOVERY:
+                    _require_owned_input(session, task)
+                if kind == TaskType.RECOVERY and (
+                    (_content_qc_target_changed(task.result_data)
+                     and (task.input_data or {}).get("failure", {}).get("source_task_type") == TaskType.CONTENT_QC.value)
+                    or session.exec(select(AuditEvent.id).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+                        AuditEvent.action == QC_PLAN_REJECTED,
+                    )).first()
+                ):
+                    self._check_content_qc_rejection_receipt(session, task)
                 return False
         if kind == TaskType.CONTENT_QC and task.schema_version == "2" and (task.result_data or {}).get("passed") is False:
             return self.schedule_content_qc_recovery(task_id, consuming=True)

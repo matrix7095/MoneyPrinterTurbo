@@ -851,15 +851,14 @@ def acceptance_subject(
     *,
     source_context_version: int | None = None,
     audio_evidence: dict | None = None,
+    _archived_revalidation: bool = False,
 ) -> dict[str, str]:
     from glance_core.task_service import stable_hash
 
     content = session.get(Content, content_id)
     acceptance_origin(session, content_id)
-    if content is None or content.business_status in {
-        ContentStatus.ARCHIVED,
-        ContentStatus.PUBLISHED,
-    }:
+    if (content is None or content.business_status == ContentStatus.PUBLISHED
+            or (content.business_status == ContentStatus.ARCHIVED and not _archived_revalidation)):
         raise ValueError("acceptance content missing or terminal")
     candidate = session.get(Candidate, content.candidate_id)
     if (
@@ -994,7 +993,7 @@ def acceptance_subject(
     return subject
 
 
-def verify_acceptance(session: Session, task: AgentTask, result: dict) -> None:
+def verify_acceptance(session: Session, task: AgentTask, result: dict, *, _archived_revalidation: bool = False) -> None:
     from glance_core.task_service import stable_hash
 
     if task.task_type != TaskType.CONTENT_QC or task.schema_version != "2":
@@ -1018,7 +1017,8 @@ def verify_acceptance(session: Session, task: AgentTask, result: dict) -> None:
     ):
         raise ValueError("AUDIO_EVIDENCE_VERSION_UNSUPPORTED")
     current = acceptance_subject(
-        session, task.content_id, refs, source_context_version=version, audio_evidence=audio
+        session, task.content_id, refs, source_context_version=version, audio_evidence=audio,
+        _archived_revalidation=_archived_revalidation,
     )
     if (
         audio is not None

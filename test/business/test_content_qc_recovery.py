@@ -10,13 +10,13 @@ import pytest
 from fastapi.testclient import TestClient
 from glance_core.content_acceptance import acceptance_subject, source_context
 from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent, Content, ContentStatus, RuntimeSetting, SchedulerOffer, TaskStatus, TaskType, utc_now
-from glance_core.task_schemas import CONTENT_ACCEPTANCE_CHECKS
+from glance_core.task_schemas import CONTENT_ACCEPTANCE_CHECKS, RecoveryPlan
 from glance_core.task_service import TaskConflictError, stable_hash
 from glance_core.workflow import WorkflowService
 from glance_media.executor import sha256_file
 from sqlmodel import Session, select
 
-from app.business.runtime import AGENT_CONSUMED, OWNED, QC_RECOVERY, _require_current_revision
+from app.business.runtime import AGENT_CONSUMED, OWNED, QC_RECOVERY, QC_PLAN_REJECTED, QC_TARGET_REJECTION, _require_current_revision
 from test.business.test_agent_failure_recovery import registered_client, record_intent, recovery_rows
 from test.business.test_deployment_http import app_for
 from test.business.test_discovery_http import ADMIN, make_runtime
@@ -35,13 +35,22 @@ REPAIR = {
 
 
 @pytest.fixture
-def failed_qc(image_contract, tmp_path):
+def failed_qc(image_contract, tmp_path, request):
     runtime, content_id, plan_id, _, asset_qc_id, _, _ = image_contract
     runtime.consume_agent(asset_qc_id)
     with TestClient(app_for(runtime, tmp_path)) as http:
         worker = registered_client(http, runtime, "script")
         with Session(runtime.engine) as session:
             content = session.get(Content, content_id)
+            origin = getattr(request, "param", "manual")
+            if origin == "handsfree":
+                for audit in session.exec(select(AuditEvent).where(
+                    AuditEvent.entity_id == content_id, AuditEvent.action == "manual_candidate_selected",
+                )).all():
+                    session.delete(audit)
+                session.add(AuditEvent(actor_type="system", actor_id="handsfree-coordinator", entity_type="content",
+                                       entity_id=content_id, action="handsfree_candidate_selected",
+                                       metadata_json={"candidate_id": content.candidate_id}))
             root = Path(content.content_dir)
             voice = root / "audio" / "narration.mp3"
             voice.parent.mkdir()
@@ -63,7 +72,7 @@ def failed_qc(image_contract, tmp_path):
                      "asr_status": "available", "segments": [{"text": "unclear name", "start_sec": 0, "end_sec": 3}],
                      "signal_status": "available", "signal": {"decoded_pcm_sha256": "fixture"}}
             bare = {"upstream_task_ids": refs, "video_artifact_id": artifact.id,
-                    "acceptance_contract_version": 2, "acceptance_origin": "manual", "source_context_version": 1,
+                    "acceptance_contract_version": 2, "acceptance_origin": origin, "source_context_version": 1,
                     "source_context": source_context(session, content_id, full_refs),
                     "acceptance_subject": acceptance_subject(session, content_id, full_refs, source_context_version=1)}
             receipt = root / "render" / "acceptance-input.json"
@@ -333,25 +342,134 @@ def test_qc_recovery_creates_one_owned_new_script_with_original_false_immutable(
 
 
 @pytest.mark.parametrize("damage", ["input", "result", "new_script", "new_qc", "parent_unconsumed", "unknown", "malformed",
-                                     "video", "voice", "audio", "receipt", "deployment", "leased", "offer", "qc_receipt", "target"])
+                                     "video", "voice", "audio", "receipt", "deployment", "leased", "offer", "qc_receipt"])
 def test_queued_recovery_rechecks_frozen_source_before_creating_script(failed_qc, damage):
     runtime, http, content_id, qc_id, plan_id, root = failed_qc
     runtime.consume_agent(qc_id)
     recovery = recovery_rows(runtime)[0]
     assistant = registered_client(http, runtime, "assistant")
     with Session(runtime.engine) as session:
-        result = {**REPAIR, "target_task_type": "visual_plan"} if damage == "target" else REPAIR
-        accept(session, runtime, session.get(AgentTask, recovery.id), result, assistant.settings.agent_id)
+        accept(session, runtime, session.get(AgentTask, recovery.id), REPAIR, assistant.settings.agent_id)
         if damage == "qc_receipt":
             session.delete(session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id, AuditEvent.action == QC_RECOVERY)).one())
             session.commit()
-        elif damage != "target":
+        else:
             damage_source(session, runtime, content_id, qc_id, plan_id, root, damage)
     with pytest.raises(TaskConflictError):
         runtime.consume_agent(recovery.id)
     with Session(runtime.engine) as session:
         assert session.exec(select(AgentTask.id).where(AgentTask.input_data["recovery_task_id"].as_string() == recovery.id)).first() is None
         assert session.exec(select(AuditEvent.id).where(AuditEvent.entity_id == recovery.id, AuditEvent.action == AGENT_CONSUMED)).first() is None
+
+
+@pytest.mark.parametrize("action", ["create_repair_task", "reroute_to_role", "repair_task_context"])
+@pytest.mark.parametrize("target", ["visual_plan", "content_qc"])
+def test_native_invalid_qc_target_is_consumed_as_server_rejection_without_new_work(failed_qc, action, target):
+    runtime, http, content_id, qc_id, _, root = failed_qc
+    assert runtime.consume_agent(qc_id)
+    recovery = recovery_rows(runtime)[0]
+    media = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    with Session(runtime.engine) as session:
+        old = {row.id: row.model_dump(mode="json") for row in session.exec(select(AgentTask)).all() if row.id != recovery.id}
+        settings = [row.model_dump(mode="json") for row in session.exec(select(RuntimeSetting)).all()]
+    assistant = registered_client(http, runtime, "assistant")
+    claim = assistant.claim()
+    assert claim["task_id"] == recovery.id
+    assistant.confirm_claim(recovery.id, claim["lease_token"], assistant.settings.agent_id)
+    result = {**REPAIR, "action": action, "target_task_type": target}
+    result = RecoveryPlan.model_validate(result).model_dump(mode="json")
+    assert assistant.complete(recovery.id, claim["lease_token"], assistant.settings.agent_id, result)["advanced"] == "CONSUMED"
+    assert runtime.consume_agent(recovery.id) is False
+    with Session(runtime.engine) as session:
+        rejected = session.get(AgentTask, recovery.id)
+        assert rejected.status == TaskStatus.COMPLETED
+        assert rejected.input_data == recovery.input_data and rejected.result_data == result
+        assert {row.id: row.model_dump(mode="json") for row in session.exec(select(AgentTask)).all() if row.id != recovery.id} == old
+        assert [row.model_dump(mode="json") for row in session.exec(select(RuntimeSetting)).all()
+                if row.key != "mpt_maintenance_last_run"] == settings
+        assert session.get(AgentTask, qc_id).result_data["passed"] is False
+        content = session.get(Content, content_id)
+        assert (content.current_stage, content.error_code, content.error_message) == ("recovery_blocked", "RECOVERY_BLOCKED", QC_TARGET_REJECTION)
+        receipt = session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id, AuditEvent.action == QC_PLAN_REJECTED)).one()
+        assert receipt.metadata_json["action"] == action and receipt.metadata_json["target_task_type"] == target
+        assert receipt.metadata_json["recovery_result_hash"] == stable_hash(result)
+        assert receipt.metadata_json["source_task_id"] == qc_id
+        assert session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id, AuditEvent.action == AGENT_CONSUMED)).one()
+        assert not session.exec(select(AuditEvent).where(AuditEvent.action.in_(["recovery_repair_task_created", "recovery_same_task_retried"]))).first()
+    runtime.recover_agent_results()
+    assert all(path.read_bytes() == data for path, data in media.items())
+
+
+@pytest.mark.parametrize("damage", ["result", "input", "new_script", "new_qc", "parent_unconsumed", "unknown", "malformed",
+                                     "video", "voice", "audio", "receipt", "deployment", "leased", "offer", "qc_receipt"])
+def test_invalid_qc_target_with_unproven_source_remains_conflict(failed_qc, damage):
+    runtime, http, content_id, qc_id, plan_id, root = failed_qc
+    assert runtime.consume_agent(qc_id)
+    recovery = recovery_rows(runtime)[0]
+    assistant = registered_client(http, runtime, "assistant")
+    with Session(runtime.engine) as session:
+        accept(session, runtime, session.get(AgentTask, recovery.id),
+               {**REPAIR, "action": "repair_task_context", "target_task_type": "content_qc"}, assistant.settings.agent_id)
+        if damage == "qc_receipt":
+            session.delete(session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id, AuditEvent.action == QC_RECOVERY)).one())
+            session.commit()
+        else:
+            damage_source(session, runtime, content_id, qc_id, plan_id, root, damage)
+    with pytest.raises(TaskConflictError):
+        runtime.consume_agent(recovery.id)
+    with Session(runtime.engine) as session:
+        assert session.get(Content, content_id).current_stage == "recovery"
+        assert not session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id,
+                                                        AuditEvent.action.in_([QC_PLAN_REJECTED, AGENT_CONSUMED, "recovery_blocked"]))).first()
+
+
+@pytest.mark.parametrize("failure_class", ["TASK_CONTRACT", "CONTEXT_MISSING", "TRANSIENT_EXECUTOR", "RIGHTS_OR_PUBLISHING", "UNKNOWN"])
+def test_wrong_failure_class_is_not_a_trusted_qc_target_rejection(failed_qc, failure_class):
+    runtime, http, content_id, qc_id, _, _ = failed_qc
+    assert runtime.consume_agent(qc_id)
+    recovery = recovery_rows(runtime)[0]
+    assistant = registered_client(http, runtime, "assistant")
+    with Session(runtime.engine) as session:
+        accept(session, runtime, session.get(AgentTask, recovery.id),
+               {**REPAIR, "failure_class": failure_class, "target_task_type": "content_qc"}, assistant.settings.agent_id)
+    with pytest.raises(TaskConflictError, match="RECOVERY_QC_REJECTION_RECEIPT_CHANGED"):
+        runtime.consume_agent(recovery.id)
+    with Session(runtime.engine) as session:
+        assert session.get(Content, content_id).current_stage == "recovery"
+        assert not session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id,
+                                                        AuditEvent.action.in_([QC_PLAN_REJECTED, AGENT_CONSUMED, "recovery_blocked"]))).first()
+
+
+@pytest.mark.parametrize("failure_point", ["blocked", "commit"])
+def test_qc_target_rejection_receipt_block_and_consumption_rollback_together(failed_qc, monkeypatch, failure_point):
+    runtime, http, content_id, qc_id, _, _ = failed_qc
+    assert runtime.consume_agent(qc_id)
+    recovery = recovery_rows(runtime)[0]
+    assistant = registered_client(http, runtime, "assistant")
+    with Session(runtime.engine) as session:
+        accept(session, runtime, session.get(AgentTask, recovery.id),
+               {**REPAIR, "target_task_type": "content_qc"}, assistant.settings.agent_id)
+    original = WorkflowService._mark_recovery_blocked
+
+    def fail_block(flow, *args, **kwargs):
+        original(flow, *args, **kwargs)
+        raise OSError("injected rejection failure")
+
+    def fail_commit(session):
+        raise OSError("injected rejection failure")
+
+    with monkeypatch.context() as patch:
+        if failure_point == "blocked":
+            patch.setattr(WorkflowService, "_mark_recovery_blocked", fail_block)
+        else:
+            patch.setattr(Session, "commit", fail_commit)
+        with pytest.raises(TaskConflictError, match="injected rejection failure"):
+            runtime.consume_agent(recovery.id)
+    with Session(runtime.engine) as session:
+        assert session.get(Content, content_id).current_stage == "recovery"
+        assert not session.exec(select(AuditEvent).where(AuditEvent.entity_id == recovery.id,
+                                                        AuditEvent.action.in_([QC_PLAN_REJECTED, AGENT_CONSUMED, "recovery_blocked"]))).first()
+    assert runtime.consume_agent(recovery.id)
 
 
 def test_core_budget_and_capacity_stay_visible_and_durable(failed_qc):
