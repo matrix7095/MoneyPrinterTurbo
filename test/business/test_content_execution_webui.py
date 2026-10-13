@@ -15,6 +15,8 @@ def page_for(http, content_id, monkeypatch):
 
     def transport(method, url, **options):
         calls.append((method, urlsplit(url).path))
+        if method == "POST" and urlsplit(url).path.endswith("/run/execute"):
+            calls.append(("PERMISSION", options["json"]))
         options.pop("timeout")
         options["follow_redirects"] = options.pop("allow_redirects")
         return http.request(method, urlsplit(url).path, **options)
@@ -32,12 +34,15 @@ def test_workbench_start_status_and_cooperative_stop(execution, monkeypatch):
     http, runtime, content_id, processes = execution
     page, calls = page_for(http, content_id, monkeypatch)
     assert not page.exception
+    assert page.checkbox[0].value is False
     page.button(key="business_execution_start").click().run()
     assert not page.exception
     assert ("POST", f"/api/v1/contents/{content_id}/run/execute") in calls
+    assert ("PERMISSION", {"allow_local_image_adaptation": False}) in calls
     assert len(processes) == 1
     assert any("正在启动" in item.value for item in page.info)
     assert page.button(key="business_execution_start").disabled
+    assert page.checkbox[0].disabled
     own_host(http, runtime, content_id)
     page.button(key="business_execution_refresh").click().run()
     assert not page.exception
@@ -48,6 +53,29 @@ def test_workbench_start_status_and_cooperative_stop(execution, monkeypatch):
     assert any("停止" in item.value for item in page.info)
     assert not processes[0].done.is_set()
     assert "test-admin" not in str(page.info)
+
+
+def test_workbench_permission_is_explicit_for_one_new_run(execution, monkeypatch):
+    http, _, content_id, processes = execution
+    page, calls = page_for(http, content_id, monkeypatch)
+    assert page.checkbox[0].value is False
+    page.checkbox[0].check().run()
+    page.button(key="business_execution_start").click().run()
+    assert not page.exception
+    assert ("PERMISSION", {"allow_local_image_adaptation": True}) in calls
+    assert page.checkbox[0].value is True and page.checkbox[0].disabled
+    page.button(key="business_execution_stop").click().run()
+    processes[0].code = 0
+    processes[0].done.set()
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        page.button(key="business_execution_refresh").click().run()
+        if not page.button(key="business_execution_start").disabled:
+            break
+        time.sleep(0.01)
+    assert not page.exception and page.checkbox[0].value is False
+    assert not page.checkbox[0].disabled
 
 
 def test_workbench_shows_failure_without_fake_running(execution, monkeypatch):

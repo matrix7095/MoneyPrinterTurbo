@@ -44,6 +44,7 @@ class LaunchRecord(BaseModel):
     exited_at: str | None = None
     exit_code: int | None = None
     error_code: str = ""
+    allow_local_image_adaptation: bool = False
 
 
 class LaunchBinding(BaseModel):
@@ -263,12 +264,14 @@ def _finished(runtime, content_id, launch_id, process):
         _handles.pop(launch_id, None)
 
 
-def execute_content(runtime, session, content_id):
+def execute_content(runtime, session, content_id, *, allow_local_image_adaptation=False):
     with content_operation_lock(runtime.settings, "execution:" + content_id):
         existing = _load(session, content_id)
         if existing and existing.state in ACTIVE:
+            if existing.allow_local_image_adaptation != allow_local_image_adaptation:
+                raise TaskConflictError("CONTENT_RUN_PERMISSION_FROZEN")
             return _view(runtime, session, existing)
-        run = start_run(session, content_id)
+        run = start_run(session, content_id, allow_local_image_adaptation=allow_local_image_adaptation)
         if existing and existing.run_id == run["run_id"]:
             return _view(runtime, session, existing)
         if run["host_epoch"] or run["state"] != "awaiting_host":
@@ -276,6 +279,7 @@ def execute_content(runtime, session, content_id):
         record = LaunchRecord(
             launch_id=secrets.token_hex(16), content_id=content_id, run_id=run["run_id"],
             generation=run["generation"], state="STARTING", created_at=utc_now().isoformat(),
+            allow_local_image_adaptation=run["allow_local_image_adaptation"],
         )
         # Commit intent before spawning: a crash in the gap is uncertain, never retryable.
         _save(session, record)

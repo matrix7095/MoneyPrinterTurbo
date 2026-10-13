@@ -107,6 +107,77 @@ def test_concurrent_start_is_one_launch_and_not_ready(execution):
     assert "test-admin" not in json.dumps(bodies)
 
 
+@pytest.mark.parametrize("permission", [False, True])
+def test_explicit_permission_is_frozen_and_admin_audited(execution, permission):
+    from glance_core.models import AuditEvent
+    from sqlmodel import select
+
+    http, runtime, content_id, processes = execution
+    body = {"allow_local_image_adaptation": permission}
+    first = http.post(path(content_id), headers=ADMIN, json=body).json()
+    assert first["allow_local_image_adaptation"] is permission
+    assert http.post(path(content_id), headers=ADMIN, json=body).json()["launch_id"] == first["launch_id"]
+    rejected = http.post(path(content_id), headers=ADMIN, json={"allow_local_image_adaptation": not permission})
+    assert rejected.status_code == 409 and rejected.json()["detail"] == "CONTENT_RUN_PERMISSION_FROZEN"
+    # The legacy permit endpoint has no permission input and preserves this run.
+    assert http.post(path(content_id, "run"), headers=ADMIN).json()["allow_local_image_adaptation"] is permission
+    assert len(processes) == 1
+    with Session(runtime.engine) as session:
+        assert load_run(session).allow_local_image_adaptation is permission
+        events = session.exec(select(AuditEvent).where(AuditEvent.action == "mpt_content_run_image_adaptation_permission_recorded")).all()
+        assert len(events) == 1 and events[0].actor_type == "admin"
+        assert events[0].metadata_json["allow_local_image_adaptation"] is permission
+        assert events[0].metadata_json["run_id"] == first["run_id"]
+
+
+@pytest.mark.parametrize("permission", ["true", 1, 0, None, [], {}])
+def test_permission_only_accepts_strict_bool_without_echo(execution, permission):
+    http, _, content_id, processes = execution
+    response = http.post(path(content_id), headers=ADMIN, json={"allow_local_image_adaptation": permission})
+    assert response.status_code == 422 and response.json()["detail"] == "CONTENT_EXECUTION_PERMISSION_INVALID"
+    assert processes == []
+
+
+def test_legacy_permit_cannot_be_upgraded_and_old_record_defaults_false(execution):
+    from app.business.content_run import RUN_KEY
+    from glance_core.models import RuntimeSetting
+
+    http, runtime, content_id, processes = execution
+    assert http.post(path(content_id, "run"), headers=ADMIN).json()["allow_local_image_adaptation"] is False
+    with Session(runtime.engine) as session:
+        row = session.get(RuntimeSetting, RUN_KEY)
+        data = json.loads(row.value)
+        data.pop("allow_local_image_adaptation")
+        row.value = json.dumps(data)
+        session.add(row)
+        session.commit()
+    assert http.get(path(content_id, "run"), headers=ADMIN).json()["allow_local_image_adaptation"] is False
+    response = http.post(path(content_id), headers=ADMIN, json={"allow_local_image_adaptation": True})
+    assert response.status_code == 409 and processes == []
+
+
+def test_new_generation_uses_new_explicit_permission_and_preserves_history(execution):
+    from glance_core.models import RuntimeSetting
+
+    http, runtime, content_id, processes = execution
+    first = http.post(path(content_id), headers=ADMIN, json={"allow_local_image_adaptation": True}).json()
+    http.post(path(content_id, "execution/stop"), headers=ADMIN)
+    processes[0].code = 0
+    processes[0].done.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if http.get(path(content_id, "execution"), headers=ADMIN).json()["state"] == "FINISHED":
+            break
+        time.sleep(0.01)
+    second = http.post(path(content_id), headers=ADMIN, json={"allow_local_image_adaptation": False}).json()
+    assert second["generation"] == first["generation"] + 1
+    assert second["allow_local_image_adaptation"] is False and len(processes) == 2
+    with Session(runtime.engine) as session:
+        assert load_run(session).allow_local_image_adaptation is False
+        old = session.get(RuntimeSetting, launch.PREFIX + first["run_id"])
+        assert json.loads(old.value)["allow_local_image_adaptation"] is True
+
+
 def own_host(http, runtime, content_id):
     run = http.get(path(content_id, "run"), headers=ADMIN).json()
     attach_fixture_host(http, run)

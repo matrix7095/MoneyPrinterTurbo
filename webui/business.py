@@ -154,9 +154,14 @@ def _execution(st, connection, content_id, content_status):
     else:
         st.info("当前内容尚未运行。")
     disabled = state in {"STARTING", "RUNNING", "DRAINING", "UNKNOWN"} or view.get("run_state") == "draining" or content_status in {"PUBLISHED", "ARCHIVED", "REJECTED"}
+    permission = st.checkbox(
+        "仅允许本次新 AI 概念图片按冻结最低尺寸在本机适配，保留原图和处理记录，并继续独立质检",
+        value=bool(view.get("allow_local_image_adaptation")) if disabled else False,
+        disabled=disabled, key=f"business_image_adaptation_{content_id}_{view.get('run_id', 'new')}_{state}",
+    )
     if st.button("运行一次", disabled=disabled, key="business_execution_start"):
         try:
-            connection.request("POST", content_path(content_id) + "/run/execute")
+            connection.request("POST", content_path(content_id) + "/run/execute", payload={"allow_local_image_adaptation": permission})
             st.rerun()
         except BusinessAPIError as exc:
             st.error(str(exc))

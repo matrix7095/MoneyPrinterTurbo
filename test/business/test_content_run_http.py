@@ -825,6 +825,91 @@ def test_default_core_claim_hook_retains_unscoped_behavior(system):
         assert claimed.status == TaskStatus.LEASED and claimed.attempt == 1 and token
 
 
+@pytest.mark.parametrize("permission", [False, True])
+@pytest.mark.parametrize("task_kind", [TaskType.ASSET_GENERATE_IMAGE, TaskType.RECOVERY])
+def test_image_permission_reaches_only_scoped_image_or_readonly_recovery_offer(system, monkeypatch, permission, task_kind):
+    import sys
+    from pathlib import Path
+
+    from glance_core.task_service import stable_hash
+    from glance_core.agent_roles import primary_role_for
+    from app.business import conductor_launch as launch
+    from app.business.content_run import FROZEN_FIELDS
+    from app.controllers.v1.content_execution import router
+    from test.business.test_content_execution_http import Process
+
+    runtime, http = system
+    http.app.include_router(router)
+    content_id, _ = selected(http, runtime, "image-permission")
+    deploy(http, stage(runtime, primary_role_for(task_kind).value))
+    task_input = {"requests": [{
+        "segment_index": 0, "prompt": "Conceptual AI illustration",
+        "min_width": 1080, "min_height": 1920, "aspect_ratio": "9:16",
+    }]} if task_kind == TaskType.ASSET_GENERATE_IMAGE else {
+        "failure": {"failure_class": "ENVIRONMENT", "error_code": "LOCAL_IMAGE_AUTHORIZATION_MISSING"},
+        "policy": {"allowed_actions": ["retry_same_task"]},
+    }
+    with Session(runtime.engine) as session:
+        task = runtime.task_service(session).create_task(
+            task_type=task_kind, content_id=content_id,
+            instructions="Frozen permission scope fixture", input_data=task_input,
+        )
+        task_id, input_before, hash_before = task.id, task.input_data, task.input_hash
+        session.add(AuditEvent(actor_type="system", actor_id="fixture", entity_type="agent_task", entity_id=task.id, action=OWNED, metadata_json={"input_hash": task.input_hash}))
+        session.commit()
+    process = Process()
+    monkeypatch.setattr(launch, "launch_command", lambda *args: [sys.executable])
+    monkeypatch.setattr(launch, "process_creation_time", lambda _: utc_now().isoformat())
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *args, **kwargs: process)
+    endpoint = f"/api/v1/contents/{content_id}/run/execute"
+    try:
+        response = http.post(endpoint, headers=ADMIN, json={"allow_local_image_adaptation": permission})
+        assert response.status_code == 200, response.text
+        run = response.json()
+        attach_fixture_host(http, http.get(f"/api/v1/contents/{content_id}/run", headers=ADMIN).json())
+        plan = scheduler(http).scheduler_plan("mpt-codex", 2, run_id=run["run_id"])
+        assert plan["status"] == "READY", plan
+        targets = [worker for worker in plan["worker_requests"] if worker["task_type"] == task_kind.value]
+        others = [worker for worker in plan["worker_requests"] if worker["task_type"] != task_kind.value]
+        assert len(targets) == 1 and others
+        worker = targets[0]
+        assert worker["task_id"] == task_id and worker["input_hash"] == hash_before
+        if task_kind == TaskType.ASSET_GENERATE_IMAGE:
+            assert ("allow_local_image_adaptation" in worker["prompt"]) is permission
+            if permission:
+                assert run["run_id"] in worker["prompt"]
+                assert '"allow_local_image_adaptation": true' in worker["prompt"]
+                assert "保留原始图片" in worker["prompt"] and "独立质量质检" in worker["prompt"]
+            else:
+                assert "未获本机图片尺寸适配授权" in worker["prompt"]
+                assert "LOCAL_IMAGE_AUTHORIZATION_MISSING" in worker["prompt"]
+        else:
+            assert run["run_id"] in worker["prompt"]
+            assert f'"allow_local_image_adaptation": {str(permission).lower()}' in worker["prompt"]
+            assert "只读" in worker["prompt"] and "不授予恢复角色本机处理权限" in worker["prompt"]
+            assert "冻结恢复预算" in worker["prompt"] and "不得自己改图" in worker["prompt"]
+        assert all("allow_local_image_adaptation" not in worker["prompt"] for worker in others)
+        frozen = {field: worker[field] for field in FROZEN_FIELDS}
+        assert stable_hash(frozen) == worker["offer_hash"]
+        altered = {**frozen, "prompt": worker["prompt"] + " forged permission"}
+        assert stable_hash(altered) != worker["offer_hash"]
+        assert http.post(endpoint, headers=ADMIN, json={"allow_local_image_adaptation": not permission}).status_code == 409
+        with Session(runtime.engine) as session:
+            saved = session.get(AgentTask, task_id)
+            assert saved.input_data == input_before and saved.input_hash == hash_before
+            receipt = session.exec(select(AuditEvent).where(AuditEvent.action == OFFER_ACTION, AuditEvent.entity_id == worker["request_id"])).one()
+            assert receipt.metadata_json["worker"] == frozen
+            assert receipt.metadata_json["worker_hash"] == worker["offer_hash"]
+            assert load_run(session).allow_local_image_adaptation is permission
+            assert Path(worker["launcher"]).is_file()
+    finally:
+        process.done.set()
+        deadline = time.monotonic() + 5
+        while any(handle is process for handle in launch._handles.values()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not any(handle is process for handle in launch._handles.values())
+
+
 def test_expired_run_with_live_lease_drains_without_extending_ttl(system):
     runtime, http = system
     target, task_id = selected(http, runtime, "expired-drain")

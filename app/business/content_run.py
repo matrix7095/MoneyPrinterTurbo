@@ -63,6 +63,7 @@ class ContentRun(BaseModel):
     expires_at: str
     stop_requested: bool = False
     stop_reason: str = ""
+    allow_local_image_adaptation: bool = False
     parent_thread_id: str | None = None
     process_identity: dict | None = None
     last_event_cursor: str | None = None
@@ -109,11 +110,11 @@ def save_run(session, run, action):
     row.value = run.model_dump_json()
     row.updated_at = utc_now()
     session.add(row)
-    human = action in {"mpt_content_run_started", "mpt_content_run_stop_requested"}
+    admin = action in {"mpt_content_run_started", "mpt_content_run_stop_requested"}
     session.add(
         AuditEvent(
-            actor_type="human" if human else "system",
-            actor_id="mpt-admin-api" if human else "mpt-content-run",
+            actor_type="admin" if admin else "system",
+            actor_id="mpt-admin-api" if admin else "mpt-content-run",
             entity_type="content_run",
             entity_id=run.run_id,
             action=action,
@@ -229,7 +230,9 @@ def run_view(session, run):
     }
 
 
-def start_run(session, content_id):
+def start_run(session, content_id, *, allow_local_image_adaptation=None):
+    if allow_local_image_adaptation is not None and type(allow_local_image_adaptation) is not bool:
+        raise TaskConflictError("CONTENT_RUN_PERMISSION_INVALID")
     begin_immediate(session)
     assert_allowed(session, content_id=content_id)
     content = session.get(Content, content_id)
@@ -247,6 +250,8 @@ def start_run(session, content_id):
         if existing.state in {"awaiting_host", "running", "draining"}:
             if existing.content_id != content_id:
                 raise TaskConflictError("CONTENT_RUN_ALREADY_ACTIVE")
+            if allow_local_image_adaptation is not None and existing.allow_local_image_adaptation != allow_local_image_adaptation:
+                raise TaskConflictError("CONTENT_RUN_PERMISSION_FROZEN")
             session.commit()
             return run_view(session, existing)
     now = utc_now()
@@ -257,8 +262,19 @@ def start_run(session, content_id):
         state="awaiting_host",
         created_at=now.isoformat(),
         expires_at=(now + TTL).isoformat(),
+        allow_local_image_adaptation=allow_local_image_adaptation is True,
     )
     save_run(session, run, "mpt_content_run_started")
+    if allow_local_image_adaptation is not None:
+        session.add(AuditEvent(
+            actor_type="admin", actor_id="mpt-admin-api", entity_type="content_run",
+            entity_id=run.run_id, action="mpt_content_run_image_adaptation_permission_recorded",
+            metadata_json={
+                "run_id": run.run_id, "generation": run.generation, "content_id": content_id,
+                "allow_local_image_adaptation": allow_local_image_adaptation,
+                "scope": "new_ai_concept_images_frozen_minimum_size_preserve_original_and_processing_record_independent_qc",
+            },
+        ))
     session.commit()
     return run_view(session, run)
 
