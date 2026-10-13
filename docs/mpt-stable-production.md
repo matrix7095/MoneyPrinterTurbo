@@ -6,6 +6,12 @@
 
 ## 当前验收清单
 
+2026-10-13最新接入进度：单内容生产改为按需启动、完成后推进，不依赖定时任务。Content run前置合同已提交`b68dc2a85465d90bcf290f513eb568083fd93579`并快进主目录源码；生产API尚未重启加载该接口。它保留单内容范围、全局容量、45分钟期限、冻结offer和停止后已领取任务排空。独立审查发现的残缺scope降级派发、授权拒绝后SQLite写锁未释放两项已修复；独立复审APPROVE、76项定向测试通过，Root最终完整业务回归1141 passed / 565.64秒 / exit 0，14文件前后冻结SHA一致，7081条既有依赖弃用警告。新宿主定位模块不在此次回归范围，另行验收。新接口诚实显示`contract_only/awaiting_host`，实际Conductor尚未接入，不能据此声称一键生产已可用。
+
+原生媒体工具已实际验证：新版桌面宿主的真实Sol/high子线程调用原生生图，生成红色哑光球的摄影概念PNG，Root独立解码并核对工具payload与本地原图哈希关联；原始尺寸仍为941×1672，不满足1080×1920最低要求，未在该能力探针中放大或上传。证据`native-app-role-canary-accept-result.json`与`native-image-canary/source-native.png`。这证明工具可调用，不能代替正式素材质检或未来图片处理授权。
+
+发布入口已重新核验：当前聊天打开Chrome抖音创作者中心，实际显示已登录的作品管理和7条历史作品，最新IKEA作品日期为2026-10-10 20:09、状态已发布；未上传或发布新视频。此前按需子线程完成`cua.getState()`，但未调用目标`getTab`，因此只有当前聊天的工作台可用性得到证明，独立发布Worker的目标页访问仍待接入验证。该标签保留用于后续发布流程。当前新视频最终审核与新真实发布仍未完成。
+
 按需原生宿主前置已实测：默认PATH的Codex CLI为0.144.6，不兼容桌面agents配置，专用配置下也拒绝当前模型；真正桌面进程使用0.162.0-alpha.17.2。新版App Server单次ephemeral诊断捕获真实服务端父子活动、子自身回复和完成事件。独立复核路由切片164条记录，其中唯一child thread/read响应返回executor/gpt-6-luna/max、ephemeral=true及正确父关联，父配置Sol/high；不是主模型自报。原始配置字段不代表每token遥测；该测试也未证明业务offer/lease/result、媒体生成或发布闭环。新诊断进程已清理，原Codex和生产服务未停止。证据 `native-app-rpc-routing-events.jsonl`、`native-app-rpc-routing-result.json`。
 
 真实MPT运动与时序盲测：四个两秒目标样本共228个实际解码帧，包含pan_right、ken_burns_in和short_fade。独立审核者查看全部连续帧，正常版允许1.033至1.2秒的实际淡入且无误拒；其他版准确发现开头0至0.4秒叠字缺失、红蓝镜头倒序，以及末尾截短0.4秒/缺12帧。Root在盲审结束后核对隔离答案与所有视频SHA，结果一致；倒序按实际颜色序列定位，不把构建窗口标注当成逐帧像素差异。仍是几何主体和纯音诊断，未验证真实语音、真实素材及生产内容，不能代替完整生产验收。证据 `mpt-motion-fault-probe/root-blind-review-proof.json`。
