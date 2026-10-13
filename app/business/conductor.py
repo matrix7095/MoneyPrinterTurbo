@@ -338,6 +338,7 @@ class NativeTransport:
             errors="replace",
             bufsize=1,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.queue = queue.Queue()
         self.eof = False

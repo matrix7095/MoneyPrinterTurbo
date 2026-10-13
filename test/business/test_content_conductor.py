@@ -612,6 +612,7 @@ def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch)
         "features.multi_agent=true",
     ]
     assert calls[0][1]["shell"] is False
+    assert calls[0][1]["creationflags"] == getattr(c.subprocess, "CREATE_NO_WINDOW", 0)
     assert not transport.process_alive()
 
 
