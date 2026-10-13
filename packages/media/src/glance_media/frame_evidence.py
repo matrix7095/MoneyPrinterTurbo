@@ -300,6 +300,8 @@ def generate_frame_evidence(
     video_path: Path,
     expected_sha256: str,
     output_dir: Path,
+    *,
+    timed: bool = False,
 ) -> Path:
     """Create a complete frame-by-frame evidence pack without making review judgments.
 
@@ -346,6 +348,25 @@ def generate_frame_evidence(
     frames = _frame_metadata(frame_paths, pts, destination)
     pages = _write_contact_pages(frame_paths, pts, destination, pages_dir)
 
+    video_end = None
+    if timed:
+        output = _run_tool(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=start_time,duration", "-of", "json", str(source)],
+            timeout_seconds=_FFPROBE_TIMEOUT_SECONDS, purpose="reading final video presentation end",
+        )
+        try:
+            stream = json.loads(output)["streams"][0]
+            video_end = float(stream.get("start_time", 0)) + float(stream["duration"])
+            times = [float(value) for value in pts] + [video_end]
+            if not math.isfinite(video_end) or any(right <= left for left, right in zip(times, times[1:])):
+                raise ValueError("nonmonotonic presentation sequence")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise FrameEvidenceError("Video presentation duration or PTS is unavailable/invalid") from exc
+        for frame, start, end in zip(frames, times, times[1:], strict=False):
+            frame["display_duration_sec"] = end - start
+            frame["display_end_sec"] = end
+
     after_digest = _digest_file(source, label="input video after processing")
     if after_digest != expected_digest:
         raise FrameEvidenceError(
@@ -389,6 +410,8 @@ def generate_frame_evidence(
             "audio review, or QC."
         ),
     }
+    if timed:
+        manifest.update(version=2, video_end_sec=video_end)
     manifest_path = destination / "manifest.json"
     try:
         with manifest_path.open("x", encoding="utf-8", newline="\n") as stream:

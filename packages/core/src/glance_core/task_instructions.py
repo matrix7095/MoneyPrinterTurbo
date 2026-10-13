@@ -802,6 +802,42 @@ _CONTENT_QC = """\
 - ❌ 因"问题不大"把 `error` 降级成 `warning`。
 """
 
+CONTENT_QC_VISUAL_JOINT = """
+## 受限 image_card 联合证据验收（schema v3，优先于仅可完整动态播放的旧方法描述）
+
+仅本新签发任务 visual_evidence_version=1 可采用 native_contact_pages_asr_pcm。
+这是一种显式受限方法，不能声称完整动态播放/原生听回。facts、rights、core_demonstration、
+visual_narration、subtitles、audio、pacing、identity_and_payoff、technical 九硬项仍全部需要
+真实证据与高置信通过；任何硬项不足或失败，passed=false，定位具体返工，不降级为 warning。
+
+必须用宿主原生图像能力实际查看 manifest.pages 的每一页，核对全部 frame_indices、SHA、PTS、
+每帧显示时长和末帧结束时刻；manifest.review.observed_by_reviewer=false 是生成记录，绝不是审核。
+context/ 中的页文件名为 pages[].path 的 basename；需要原尺寸细节可通过本任务已授权上下文
+或既有业务工作台核对同一冻结原帧，不另建服务、不绕过浏览器策略。页上细节不清则不得猜测。
+
+visual_review 按结果schema逐键填写：method、video_sha256、manifest_sha256，
+realtime_motion_observed=false，realtime_motion_required 如实判断；limitations 明确未获得实时
+运动感知与原生听感。若该片某硬项必须靠实时运动或实际听感才能判断，返回非通过；
+不能用帧序列推定速度观感、平滑感、杂音或音乐平衡已验证。
+pages[] 必须按顺序覆盖每页（page_index/sha256/frame_indices/observed=true/observation），
+每页 observation 写实际看见的具体内容与时码，不复制模板或声称只核对hash即观察过。
+segments[] 覆盖全部计划段：segment_index/frame_index/pts_sec/motion_continuous/observation，
+结合实际原生观察、逐帧位移和独立ASR，写画面身份、旁白对应、字幕显示与运动/重复缺陷。
+boundaries[] 覆盖所有相邻段切换，boundary_index 与左右实际frame_index，
+写具体PTS和跨段主体/字幕/衔接观察。停止移动、重复镜头、短暂错误画面或字幕必须拒绝。
+
+subtitle_alignment[] 覆盖 manifest.subtitles.events 全部烧录 Default 字幕事件：
+event_index/word_indices/observed_sync/observation；word_indices 为 audio_evidence.segments
+顺序展平 words 后的0基索引，逐条引用同final独立ASR词，全部词按时间顺序覆盖一次。
+核对内容、词时码、段内/跨段对齐及PCM信号，不能把TTS原文当独立识别，普通同音识别差异
+需按来源/实际证据消歧。ASR低置信、静音/削波或硬项判断不足不能通过。
+
+本方法仅覆盖服务端冻结并已离线验证的 pan_right/ken_burns_in 和受支持切换，
+不外推其他运动、模板或真实操作视频。应真实演示的卖点不能为适配本方法改为概念图；
+rights/来源/身份/前8秒价值兑现/真实或已明确概念路线仍按原硬标准判断。
+旧任务、旧prompt、旧failed结果不能采用本方法或获得新证据升级；服务端发布仍复验同一final。
+"""
+
 _ASSET_QC = """\
 ## 任务
 

@@ -853,7 +853,7 @@ class WorkflowService:
                 }
             elif content.business_status == ContentStatus.FINAL_REVIEW:
                 acceptance = self.completed_task_for(content.id, TaskType.CONTENT_QC)
-                if acceptance is not None and acceptance.schema_version == "2":
+                if acceptance is not None and acceptance.schema_version in {"2", "3"}:
                     continue  # This exact new task already owns the complete final-review contract.
                 task_type = TaskType.FINAL_REVIEW_ASSIST
                 artifact = self.session.exec(
@@ -1440,11 +1440,24 @@ class WorkflowService:
                             "visual_plan_task_id",
                             "source_context_sha256",
                             "audio_evidence_sha256",
+                            "visual_evidence_sha256",
                         )
                         if key in subject and isinstance(subject[key], str)
                     },
                     **evidence,
                 }
+                visual = task.input_data.get("visual_evidence")
+                if (task.schema_version == "3" and isinstance(visual, dict)
+                        and stable_hash(task.input_data) == task.input_hash
+                        and subject.get("visual_evidence_sha256") == stable_hash(visual)):
+                    manifest = visual.get("manifest", {})
+                    current["acceptance_evidence"]["visual_evidence_binding"] = {
+                        "manifest_sha256": visual.get("manifest_sha256"),
+                        "method": "native_contact_pages_asr_pcm",
+                        "frame_count": len(manifest.get("frames", [])),
+                        "page_count": len(manifest.get("pages", [])),
+                        "generated_only": True,
+                    }
 
         def references(owner: AgentTask | None) -> dict:
             refs = owner.input_data.get("upstream_task_ids") if owner else None

@@ -7,6 +7,7 @@ from contextlib import suppress
 from copy import deepcopy
 from math import ceil, isfinite
 from pathlib import Path
+from uuid import uuid4
 
 from glance_collector import CollectionService
 from glance_core.archive import ArchiveService
@@ -15,10 +16,12 @@ from glance_core.content_acceptance import (
     acceptance_origin,
     acceptance_subject,
     is_handsfree_content,
+    joint_visual_plan_supported,
     prepared_visual_plan,
     resolved_visual_plan,
     source_context,
     verify_acceptance,
+    verify_visual_joint_evidence,
 )
 from glance_core.database import begin_immediate
 from glance_core.models import (
@@ -38,7 +41,7 @@ from glance_core.models import (
 )
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import DEFAULT_COVER_STYLE_PRESET, Settings
-from glance_core.task_schemas import ContentAcceptanceResult, ManualAssistResult
+from glance_core.task_schemas import ManualAssistResult, result_model_for
 from glance_core.task_service import stable_hash
 from glance_core.workflow import (
     WorkflowService,
@@ -276,8 +279,8 @@ def verify_publish_ready(session: Session, settings: Settings, content_id: str, 
     _require_script_assist(session, settings, content_id, automatic=automatic, release=True)
     _require_current_qc(session, content_id, TaskType.VISUAL_PLAN_QC, {"visual_plan": plan, "script": script})
     qc = _require_current_qc(session, content_id, TaskType.CONTENT_QC, {"script": script, "visual_plan": plan})
-    if qc.schema_version != "2":
-        raise NonRetryableMediaError("Publication requires schema-v2 acceptance")
+    if qc.schema_version not in {"2", "3"}:
+        raise NonRetryableMediaError("Publication requires schema-v2 or schema-v3 acceptance")
     if qc.input_data.get("source_context_version") != 1 or qc.input_data.get("audio_evidence_version") != 1:
         raise NonRetryableMediaError("Publication requires source and independent final-audio evidence")
     verify_acceptance(session, qc, qc.result_data or {})
@@ -2113,7 +2116,7 @@ def _advance_after_agent(
                 flow.set_error(content_id, None, None)
                 flow.mark_status(content_id, ContentStatus.PRODUCING, "render_ready")
         elif task.task_type == TaskType.CONTENT_QC:
-            if task.schema_version == "2":
+            if task.schema_version in {"2", "3"}:
                 verify_acceptance(session, task, task.result_data or {})
                 if not (task.result_data or {}).get("passed"):
                     flow.set_error(content_id, "CONTENT_QC_FAILED", "成片验收未通过")
@@ -2370,13 +2373,38 @@ def repair_stalled_content_qc(
                 "manual_repair_round": int(source_input.get("manual_repair_round") or 0) + 1,
             }
         )
-        qc_task = flow.create_agent_task(
-            content_id,
-            TaskType.CONTENT_QC,
-            input_data,
-            priority=60,
-            allow_multiple=True,
-        )
+        if source.schema_version == "3":
+            full_refs = {**input_data["upstream_task_ids"], "video_artifact_id": final_artifact.id}
+            old_visual = source_input.get("visual_evidence", {})
+            current = acceptance_subject(session, content_id, full_refs, source_context_version=1,
+                                         audio_evidence=source_input.get("audio_evidence"), visual_evidence=old_visual)
+            if stable_hash(source_input) != source.input_hash or current != source_input.get("acceptance_subject"):
+                raise ValueError("ACCEPTANCE_MATERIALS_CHANGED")
+            verify_visual_joint_evidence(root, old_visual, None, source_input["audio_evidence"],
+                                         resolved_visual_plan(session, plan_task), passed=False)
+            pack_root = (root / old_visual["manifest_path"]).parent.resolve()
+            input_data["context_files"] = [path for path in context_files
+                                           if not (root / path).resolve().is_relative_to(pack_root)]
+            for field in ("visual_evidence", "visual_evidence_version", "audio_evidence", "audio_evidence_version"):
+                input_data.pop(field, None)
+            input_data["acceptance_subject"] = acceptance_subject(session, content_id, full_refs, source_context_version=1)
+            _write_acceptance_receipt(session, content, MediaExecutor(root), input_data)
+            _issue_acceptance(session, settings, content, input_data)
+            qc_task = session.exec(select(AgentTask).where(
+                AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+                AgentTask.schema_version == "3", AgentTask.status == TaskStatus.PENDING,
+            ).order_by(AgentTask.created_at.desc())).first()
+            if qc_task is None:
+                raise ValueError("VISUAL_JOINT_REISSUE_EVIDENCE_UNAVAILABLE")
+            context_files = qc_task.input_data["context_files"]
+        else:
+            qc_task = flow.create_agent_task(
+                content_id,
+                TaskType.CONTENT_QC,
+                input_data,
+                priority=60,
+                allow_multiple=True,
+            )
         content.business_status = ContentStatus.WAITING_AGENT
         content.current_stage = "content_qc"
         content.error_code = "CONTENT_QC_REPAIR_STARTED"
@@ -3075,6 +3103,15 @@ def _issue_acceptance(
             "成片独立音频证据未就绪；保留成片，自动补做媒体证据，不消耗内容修复预算",
         )
         return flow.mark_status(content.id, ContentStatus.WAITING_AGENT, "audio_evidence_waiting")
+    visual = None
+    plan = resolved_visual_plan(session, session.get(AgentTask, refs["visual_plan"]))
+    if joint_visual_plan_supported(plan):
+        try:
+            visual = _collect_visual_evidence(session, content, refs)
+        except (RuntimeError, OSError, ValueError):
+            flow.set_error(content.id, "VISUAL_EVIDENCE_UNAVAILABLE",
+                           "完整帧页/显示时码证据未就绪；保留成片，自动补做媒体证据")
+            return flow.mark_status(content.id, ContentStatus.WAITING_AGENT, "audio_evidence_waiting")
     begin_immediate(session)
     try:
         current = acceptance_subject(session, content.id, refs, source_context_version=1)
@@ -3090,20 +3127,72 @@ def _issue_acceptance(
         "audio_evidence_version": 1,
         "audio_evidence": audio,
         "acceptance_subject": acceptance_subject(
-            session, content.id, refs, source_context_version=1, audio_evidence=audio
+            session, content.id, refs, source_context_version=1, audio_evidence=audio,
+            visual_evidence=visual,
         ),
     }
+    if visual is not None:
+        complete_input.update(visual_evidence_version=1, visual_evidence=visual)
+        pack_root = (executor.root / visual["manifest_path"]).parent
+        complete_input["context_files"] = list(dict.fromkeys([
+            *complete_input.get("context_files", []), visual["manifest_path"],
+            *[(pack_root / item["path"]).relative_to(executor.root).as_posix()
+              for item in [*visual["manifest"]["pages"], *visual["manifest"]["frames"],
+                           visual["manifest"]["subtitles"]]],
+        ]))
+        _write_acceptance_receipt(session, content, executor, complete_input)
     flow.create_agent_task(
         content.id,
         TaskType.CONTENT_QC,
         complete_input,
         priority=60,
         allow_multiple=True,
-        schema_version="2",
+        schema_version="3" if visual is not None else "2",
         handsfree=is_handsfree_content(session, content.id),
     )
     flow.set_error(content.id, None, None)
     return flow.mark_status(content.id, ContentStatus.WAITING_AGENT, "content_qc")
+
+
+def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> dict:
+    """A new immutable pack for a new offer; never upgrade any prior task or result."""
+    import pysubs2
+    from glance_media.executor import _with_transition, layout_filter
+    from glance_media.frame_evidence import generate_frame_evidence
+
+    root = Path(content.content_dir).resolve()
+    artifact = session.get(Artifact, refs["video_artifact_id"])
+    plan = resolved_visual_plan(session, session.get(AgentTask, refs["visual_plan"]))
+    if not joint_visual_plan_supported(plan):
+        raise ValueError("VISUAL_EVIDENCE_METHOD_UNSUPPORTED")
+    subtitle = root / "transcript" / "narration.ass"
+    if not subtitle.is_file():
+        raise ValueError("VISUAL_EVIDENCE_SUBTITLES_MISSING")
+    subtitle_bytes = subtitle.read_bytes()
+    events = [{"index": index, "start_sec": event.start / 1000, "end_sec": event.end / 1000,
+               "text": event.plaintext} for index, event in enumerate(
+                   event for event in pysubs2.load(str(subtitle)) if event.style == "Default" and not event.is_comment)]
+    if not events:
+        raise ValueError("VISUAL_EVIDENCE_SUBTITLES_MISSING")
+    manifest_path = generate_frame_evidence(root / artifact.relative_path, artifact.sha256,
+                                          root / "render" / f"visual-evidence-{uuid4().hex}", timed=True)
+    copied = manifest_path.parent / "narration.ass"
+    copied.write_bytes(subtitle_bytes)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["input_video"].pop("path", None)
+    manifest.update(visual_plan=plan, subtitles={"path": copied.name, "sha256": sha256_file(copied), "events": events},
+                    render_templates=[_with_transition(layout_filter(
+                        "image_card", motion=segment.get("motion", "ken_burns_in"),
+                        focus_x=segment.get("focus_x", .5), focus_y=segment.get("focus_y", .5)),
+                        segment.get("transition", "hard_cut")) for segment in plan["segments"]])
+    # Keep the generator's original manifest immutable; enriched issuance has its own file.
+    issued_path = manifest_path.parent / "joint-manifest.json"
+    with issued_path.open("x", encoding="utf-8", newline="\n") as output:
+        json.dump(manifest, output, ensure_ascii=False, allow_nan=False)
+    if subtitle.read_bytes() != subtitle_bytes:
+        raise ValueError("VISUAL_EVIDENCE_SUBTITLES_CHANGED")
+    return {"manifest_path": issued_path.relative_to(root).as_posix(),
+            "manifest_sha256": sha256_file(issued_path), "manifest": manifest}
 
 
 def transition_pending_acceptance_evidence(session: Session, settings: Settings) -> None:
@@ -3317,9 +3406,9 @@ def approve_final(engine: Engine, settings: Settings, content_id: str, *, automa
             _require_script_assist(session, settings, content_id, automatic=True, allow_manual_approval=True)
         final_path = verify_publish_ready(session, settings, content_id, automatic=automatic)
         acceptance = flow.completed_task_for(content_id, TaskType.CONTENT_QC)
-        if acceptance is not None and acceptance.schema_version == "2":
+        if acceptance is not None and acceptance.schema_version in {"2", "3"}:
             verify_acceptance(session, acceptance, acceptance.result_data or {})
-            decision = ContentAcceptanceResult.model_validate(acceptance.result_data)
+            decision = result_model_for(TaskType.CONTENT_QC, acceptance.schema_version).model_validate(acceptance.result_data)
             if not decision.passed:
                 raise NonRetryableMediaError("成片验收未通过，禁止打包")
         script = flow.result_for(content_id, TaskType.SHORT_SCRIPT)

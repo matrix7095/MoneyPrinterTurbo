@@ -411,7 +411,7 @@ VISUAL_PLAN 在选材前核对实际使用依据：OFFICIAL_REFERENCE 空 note �
 不得冒充实物操作、性能测试或成品效果；不得用字幕代替必须兑现的真实演示。
 VISUAL_PLAN_QC 对无法兑现的核心展示返回 error 且 passed=false，不把问题留到成片审核。
 """
-    if task_type == TaskType.CONTENT_QC and schema_version == "2":
+    if task_type == TaskType.CONTENT_QC and schema_version in {"2", "3"}:
         from glance_core.task_instructions import TASK_INSTRUCTIONS
 
         # The v2 task owns BOTH complete-video contracts, including custom old templates.
@@ -438,6 +438,10 @@ audio 必须 false 并定位缺口，不把普通同音转写差异直接当成�
 只有高置信且所有硬项均通过才 passed=true；否则 issues 明确定位返工，交由现有预算修复。
 不得请求人工、不触发发布、不篡改旧QC。相同材料的失败直接修订，不重复签发自己重审。
 """
+    if task_type == TaskType.CONTENT_QC and schema_version == "3":
+        from glance_core.task_instructions import CONTENT_QC_VISUAL_JOINT
+
+        template += CONTENT_QC_VISUAL_JOINT
     if task_type in (
         TaskType.SHORT_SCRIPT,
         TaskType.SCRIPT_QC,

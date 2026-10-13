@@ -723,6 +723,55 @@ class ContentAcceptanceResult(GenericQCResult):
         return self
 
 
+class VisualPageObservation(StrictModel):
+    page_index: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    frame_indices: list[int]
+    observed: bool
+    observation: str = Field(min_length=1, max_length=2000)
+
+
+class VisualSegmentObservation(StrictModel):
+    segment_index: int = Field(ge=0)
+    frame_index: int = Field(ge=0)
+    pts_sec: float = Field(ge=0)
+    motion_continuous: bool
+    observation: str = Field(min_length=1, max_length=2000)
+
+
+class VisualBoundaryObservation(StrictModel):
+    boundary_index: int = Field(ge=0)
+    left_frame_index: int = Field(ge=0)
+    right_frame_index: int = Field(ge=0)
+    observation: str = Field(min_length=1, max_length=2000)
+
+
+class SubtitleAlignmentObservation(StrictModel):
+    event_index: int = Field(ge=0)
+    word_indices: list[int]
+    observed_sync: bool
+    observation: str = Field(min_length=1, max_length=2000)
+
+
+class VisualJointReview(StrictModel):
+    method: Literal["native_contact_pages_asr_pcm"]
+    video_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    realtime_motion_observed: Literal[False]
+    realtime_motion_required: bool
+    limitations: str = Field(min_length=1, max_length=2000)
+    pages: list[VisualPageObservation]
+    segments: list[VisualSegmentObservation]
+    boundaries: list[VisualBoundaryObservation]
+    subtitle_alignment: list[SubtitleAlignmentObservation]
+
+
+class ContentVisualAcceptanceResult(ContentAcceptanceResult):
+    """An independently versioned method; v2 records and normalization stay intact."""
+
+    visual_review: VisualJointReview
+
+
 class GeneratedImageResult(StrictModel):
     artifact_id: str = Field(pattern=r"^asset_[a-f0-9]{32}$")
     tool_name: str
@@ -836,6 +885,8 @@ RESULT_MODELS: dict[TaskType, type[StrictModel]] = {
 
 
 def result_model_for(task_type: TaskType, schema_version: str = "1") -> type[StrictModel]:
+    if task_type == TaskType.CONTENT_QC and schema_version == "3":
+        return ContentVisualAcceptanceResult
     if task_type == TaskType.CONTENT_QC and schema_version == "2":
         return ContentAcceptanceResult
     return RESULT_MODELS[task_type]
@@ -1027,6 +1078,8 @@ INPUT_FIELDS: dict[TaskType, frozenset[str]] = {
             "video_artifact_id",
             "context_files",
             "verified_claims",
+            "visual_evidence_version",
+            "visual_evidence",
         }
     ),
     TaskType.ASSET_GENERATE_IMAGE: frozenset(

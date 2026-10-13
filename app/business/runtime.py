@@ -439,21 +439,21 @@ class BusinessRuntime:
     def _content_qc_source(self, session, task_id, *, consumed=True, recovery_id=None, archived_receipt=False):
         from glance_core.content_acceptance import verify_acceptance
         from glance_core.models import PublicationRecord
-        from glance_core.task_schemas import ContentAcceptanceResult
+        from glance_core.task_schemas import result_model_for
         from app.business.pipeline import _render_voice_path
         from app.business.bundles import sha256_file
 
         task = session.get(AgentTask, task_id)
         if task is None:
             raise KeyError(task_id)
-        if (task.task_type != TaskType.CONTENT_QC or task.schema_version != "2"
+        if (task.task_type != TaskType.CONTENT_QC or task.schema_version not in {"2", "3"}
                 or not isinstance(task.input_data, dict)
                 or task.status != TaskStatus.COMPLETED or not isinstance(task.result_data, dict)
                 or task.result_data.get("passed") is not False
                 or task.input_data.get("source_context_version") != 1
                 or task.input_data.get("audio_evidence_version") != 1):
             raise TaskConflictError("RECOVERY_REQUIRES_FAILED_V2_CONTENT_QC")
-        ContentAcceptanceResult.model_validate(task.result_data)
+        result_model_for(TaskType.CONTENT_QC, task.schema_version).model_validate(task.result_data)
         self._require_accepted_native_task(session, task, consumed=consumed)
         _require_current_revision(session, task)
         _require_reconciled_content(session, task.content_id)
@@ -813,7 +813,7 @@ class BusinessRuntime:
                 ):
                     self._check_content_qc_rejection_receipt(session, task)
                 return False
-        if kind == TaskType.CONTENT_QC and task.schema_version == "2" and (task.result_data or {}).get("passed") is False:
+        if kind == TaskType.CONTENT_QC and task.schema_version in {"2", "3"} and (task.result_data or {}).get("passed") is False:
             return self.schedule_content_qc_recovery(task_id, consuming=True)
         if kind == TaskType.RECOVERY:
             with Session(self.engine) as session:
@@ -982,7 +982,7 @@ class BusinessRuntime:
                     assert_allowed(session, task_id=offer.id)
                     if (offer.status != TaskStatus.PENDING or offer.attempt != 0 or offer.assigned_agent_id
                             or offer.lease_token_hash or offer.started_at or offer.result_data
-                            or offer.schema_version != "2" or stable_hash(offer.input_data) != offer.input_hash
+                            or offer.schema_version not in {"2", "3"} or stable_hash(offer.input_data) != offer.input_hash
                             or offer.input_data.get("acceptance_contract_version") != 2
                             or offer.input_data.get("source_context_version") != 1
                             or offer.input_data.get("audio_evidence_version") != 1):
@@ -1001,17 +1001,21 @@ class BusinessRuntime:
                     receipt_path = root / "render" / "acceptance-input.json"
                     receipts = session.exec(select(Artifact).where(
                         Artifact.content_id == content_id, Artifact.artifact_type == "acceptance_input",
-                        Artifact.relative_path == "render/acceptance-input.json",
+                        Artifact.id == frozen.get("acceptance_receipt_artifact_id") if offer.schema_version == "3"
+                        else Artifact.relative_path == "render/acceptance-input.json",
                     )).all()
+                    if offer.schema_version == "3" and len(receipts) == 1:
+                        receipt_path = root / receipts[0].relative_path
                     if (not receipt_path.resolve().is_relative_to(root) or not receipt_path.is_file()
                             or sum(artifact.sha256 == sha256_file(receipt_path)
                                    and artifact.size_bytes == receipt_path.stat().st_size for artifact in receipts) != 1):
                         raise ValueError("Visual restoration original render receipt changed")
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                     without_audio = deepcopy(frozen)
-                    without_audio.pop("audio_evidence")
-                    without_audio.pop("audio_evidence_version")
-                    without_audio["acceptance_subject"].pop("audio_evidence_sha256")
+                    if "audio_evidence" not in receipt:
+                        without_audio.pop("audio_evidence")
+                        without_audio.pop("audio_evidence_version")
+                        without_audio["acceptance_subject"].pop("audio_evidence_sha256")
                     if receipt != without_audio:
                         raise ValueError("Visual restoration QC/render receipt mismatch")
                     audio = frozen["audio_evidence"]
@@ -1024,8 +1028,16 @@ class BusinessRuntime:
                         raise ValueError("Visual restoration QC plan lineage changed")
                     plan.result_data = original
                     session.add(plan)
-                    current = acceptance_subject(session, content_id, refs, source_context_version=1, audio_evidence=audio)
+                    visual = None
+                    if offer.schema_version == "3":
+                        from app.business.pipeline import _collect_visual_evidence
+
+                        visual = _collect_visual_evidence(session, content, refs)
+                    current = acceptance_subject(session, content_id, refs, source_context_version=1,
+                                                 audio_evidence=audio, visual_evidence=visual)
                     expected = {**frozen["acceptance_subject"], "visual_plan_sha256": submission.result_hash}
+                    if visual is not None:
+                        expected["visual_evidence_sha256"] = stable_hash(visual)
                     context = source_context(session, content_id, refs)
                     if current != expected or context != frozen["source_context"] or context.get("evidence_gaps"):
                         raise ValueError("Visual restoration current acceptance materials changed")
@@ -1034,6 +1046,17 @@ class BusinessRuntime:
                                         producer_stage="visual_plan_restoration")
                     new_input = {**frozen, "acceptance_subject": current, "previous_acceptance_task_id": offer.id,
                                  "acceptance_receipt_artifact_id": artifact.id}
+                    if visual is not None:
+                        old_root = (root / frozen["visual_evidence"]["manifest_path"]).parent
+                        new_root = (root / visual["manifest_path"]).parent
+                        new_input["visual_evidence"] = visual
+                        new_input["context_files"] = [
+                            path for path in frozen.get("context_files", [])
+                            if not (root / path).resolve().is_relative_to(old_root.resolve())
+                        ] + [visual["manifest_path"], *[
+                            (new_root / item["path"]).relative_to(root).as_posix()
+                            for item in [*visual["manifest"]["pages"], *visual["manifest"]["frames"],
+                                         visual["manifest"]["subtitles"]]]]
                     relative = f"render/acceptance-input-restored-{stable_hash(new_input)}.json"
                     new_path = root / relative
                     encoded = json.dumps(new_input, ensure_ascii=False).encode("utf-8")
@@ -1048,7 +1071,7 @@ class BusinessRuntime:
                     session.add(artifact)
                     flow.tasks.cancel(offer.id, actor_id="admin-api", actor_type="human")
                     replacement = flow.create_agent_task(content_id, TaskType.CONTENT_QC, new_input, priority=60,
-                                                         allow_multiple=True, schema_version="2")
+                                                         allow_multiple=True, schema_version=offer.schema_version)
                     session.add(AuditEvent(actor_type="human", actor_id="admin-api", entity_type="content",
                                            entity_id=content_id, action="mpt_visual_plan_restored",
                                            metadata_json={"visual_plan_task_id": plan.id, "original_result_hash": submission.result_hash,

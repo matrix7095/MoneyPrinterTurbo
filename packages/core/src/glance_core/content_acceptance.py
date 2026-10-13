@@ -1,8 +1,9 @@
 """Deterministic binding of a v2 Agent acceptance to its exact current materials."""
 
 import hashlib
+import json
 from copy import deepcopy
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
@@ -851,6 +852,7 @@ def acceptance_subject(
     *,
     source_context_version: int | None = None,
     audio_evidence: dict | None = None,
+    visual_evidence: dict | None = None,
     _archived_revalidation: bool = False,
 ) -> dict[str, str]:
     from glance_core.task_service import stable_hash
@@ -990,13 +992,200 @@ def acceptance_subject(
         if audio_evidence.get("video_sha256") != artifact.sha256:
             raise ValueError("AUDIO_EVIDENCE_VIDEO_MISMATCH")
         subject["audio_evidence_sha256"] = stable_hash(audio_evidence)
+    if visual_evidence is not None:
+        if visual_evidence.get("manifest", {}).get("input_video", {}).get("expected_sha256") != artifact.sha256:
+            raise ValueError("VISUAL_EVIDENCE_VIDEO_MISMATCH")
+        subject["visual_evidence_sha256"] = stable_hash(visual_evidence)
     return subject
+
+
+JOINT_VISUAL_MOTIONS = frozenset({"pan_right", "ken_burns_in"})
+# hard_cut: independently observed 32-frame positive and one-frame boundary fault clips.
+JOINT_VISUAL_TRANSITIONS = frozenset({"short_fade", "hard_cut"})
+
+
+def joint_visual_plan_supported(plan: dict) -> bool:
+    segments = plan.get("segments", [])
+    return bool(segments) and all(
+        isinstance(segment, dict) and segment.get("layout") == "image_card"
+        and segment.get("motion", "ken_burns_in") in JOINT_VISUAL_MOTIONS
+        and segment.get("transition", "hard_cut") in JOINT_VISUAL_TRANSITIONS
+        and not segment.get("scene_id") for segment in segments
+    )
+
+
+def verify_visual_joint_evidence(root: Path, evidence: dict, review: dict | None,
+                                 audio: dict, plan: dict, *, passed: bool) -> None:
+    """Bind native observations to every frozen page, frame and independent audio word.
+
+    Generated coverage never implies observation. These checks detect only exact
+    repeated decoded frames; semantic/subjective defects remain reviewer hard gates.
+    """
+    root = root.resolve()
+
+    def checked_path(base, relative, sha):
+        if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise ValueError("VISUAL_EVIDENCE_PATH_INVALID")
+        path = (base / relative).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or _file_sha256(path) != sha:
+            raise ValueError("VISUAL_EVIDENCE_FILE_CHANGED")
+        return path
+
+    def seconds(value):
+        if isinstance(value, bool):
+            raise ValueError("VISUAL_EVIDENCE_TIME_INVALID")
+        number = float(value)
+        if not isfinite(number) or number < 0:
+            raise ValueError("VISUAL_EVIDENCE_TIME_INVALID")
+        return number
+
+    manifest_path = checked_path(root, evidence["manifest_path"], evidence["manifest_sha256"])
+    manifest = evidence["manifest"]
+    if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+        raise ValueError("VISUAL_EVIDENCE_MANIFEST_CHANGED")
+    if (manifest.get("version") != 2 or manifest.get("method") != "full_decoded_frame_sequence"
+            or manifest.get("review") != {"observed_by_reviewer": False, "audio_review_performed": False}
+            or manifest.get("visual_plan") != plan or not joint_visual_plan_supported(plan)):
+        raise ValueError("VISUAL_EVIDENCE_METHOD_UNSUPPORTED")
+    video_sha = manifest["input_video"]["expected_sha256"]
+    if any(manifest["input_video"].get(key) != video_sha for key in
+           ("sha256_before_processing", "sha256_after_processing")) or audio.get("video_sha256") != video_sha:
+        raise ValueError("VISUAL_EVIDENCE_VIDEO_MISMATCH")
+    frames, pages = manifest["frames"], manifest["pages"]
+    if not frames or not pages or [f["index"] for f in frames] != list(range(len(frames))):
+        raise ValueError("VISUAL_EVIDENCE_FRAME_COVERAGE")
+    times = [seconds(frame["pts_seconds"]) for frame in frames]
+    end = seconds(manifest["video_end_sec"])
+    if abs(times[0]) > .001 or any(right <= left for left, right in zip(times, times[1:] + [end])):
+        raise ValueError("VISUAL_EVIDENCE_PTS_INVALID")
+    paths = set()
+    for frame, start, stop in zip(frames, times, times[1:] + [end], strict=True):
+        if (abs(seconds(frame["display_end_sec"]) - stop) > 1e-6
+                or abs(seconds(frame["display_duration_sec"]) - (stop - start)) > 1e-6):
+            raise ValueError("VISUAL_EVIDENCE_END_INVALID")
+        path = checked_path(manifest_path.parent, frame["path"], frame["sha256"])
+        if path in paths:
+            raise ValueError("VISUAL_EVIDENCE_DUPLICATE_FILE")
+        paths.add(path)
+    if [p["page_index"] for p in pages] != list(range(len(pages))):
+        raise ValueError("VISUAL_EVIDENCE_PAGE_COVERAGE")
+    mapped = []
+    for page in pages:
+        if not page["frame_indices"] or len(page["frame_indices"]) > 4:
+            raise ValueError("VISUAL_EVIDENCE_PAGE_COVERAGE")
+        mapped.extend(page["frame_indices"])
+        path = checked_path(manifest_path.parent, page["path"], page["sha256"])
+        if path in paths:
+            raise ValueError("VISUAL_EVIDENCE_DUPLICATE_FILE")
+        paths.add(path)
+    if mapped != list(range(len(frames))) or any(
+        manifest["coverage"].get(key) != expected for key, expected in
+        (("frame_count", len(frames)), ("mapped_frame_count", len(frames)), ("mapping_complete", True))
+    ):
+        raise ValueError("VISUAL_EVIDENCE_PAGE_COVERAGE")
+    segments = plan["segments"]
+    previous_end = 0.0
+    for segment in segments:
+        start, stop = seconds(segment["narration_start_sec"]), seconds(segment["narration_end_sec"])
+        if abs(start - previous_end) > .001 or stop <= start:
+            raise ValueError("VISUAL_EVIDENCE_PLAN_TIMELINE")
+        previous_end = stop
+    if abs(previous_end - end) > max(seconds(frames[-1]["display_duration_sec"]), .05):
+        raise ValueError("VISUAL_EVIDENCE_PLAN_END")
+    subtitles = manifest["subtitles"]
+    checked_path(manifest_path.parent, subtitles["path"], subtitles["sha256"])
+    events = subtitles["events"]
+    if not events or [event["index"] for event in events] != list(range(len(events))):
+        raise ValueError("VISUAL_EVIDENCE_SUBTITLES_INCOMPLETE")
+    for event in events:
+        if not event["text"].strip() or not (0 <= seconds(event["start_sec"]) < seconds(event["end_sec"]) <= end + .05):
+            raise ValueError("VISUAL_EVIDENCE_SUBTITLE_TIME")
+    if not passed:
+        return  # A truthful failure may describe an incomplete observation, never approve it.
+    if (not isinstance(review, dict) or review.get("method") != "native_contact_pages_asr_pcm"
+            or review.get("video_sha256") != video_sha or review.get("manifest_sha256") != evidence["manifest_sha256"]
+            or review.get("realtime_motion_observed") is not False
+            or review.get("realtime_motion_required") is not False or not review.get("limitations", "").strip()):
+        raise ValueError("VISUAL_REVIEW_INCOMPLETE_OR_REALTIME_REQUIRED")
+
+    def complete_observations(name, key, count):
+        rows = review.get(name, [])
+        if len(rows) != count or [row.get(key) for row in rows] != list(range(count)):
+            raise ValueError(f"VISUAL_REVIEW_{name.upper()}_COVERAGE")
+        if any(not row.get("observation", "").strip() for row in rows):
+            raise ValueError("VISUAL_REVIEW_OBSERVATION_MISSING")
+        return rows
+
+    for expected, observed in zip(pages, complete_observations("pages", "page_index", len(pages)), strict=True):
+        if (observed.get("observed") is not True or observed.get("sha256") != expected["sha256"]
+                or observed.get("frame_indices") != expected["frame_indices"]):
+            raise ValueError("VISUAL_REVIEW_PAGE_NOT_OBSERVED")
+    for segment, observed in zip(segments, complete_observations("segments", "segment_index", len(segments)), strict=True):
+        index = observed.get("frame_index")
+        if (type(index) is not int or not 0 <= index < len(frames)
+                or abs(seconds(observed["pts_sec"]) - times[index]) > 1e-6
+                or not segment["narration_start_sec"] <= times[index] < segment["narration_end_sec"]
+                or observed.get("motion_continuous") is not True):
+            raise ValueError("VISUAL_REVIEW_SEGMENT_MISMATCH")
+        run_start = None
+        previous_sha = None
+        for frame in frames:
+            time = seconds(frame["pts_seconds"])
+            if not segment["narration_start_sec"] + .2 <= time < segment["narration_end_sec"]:
+                continue
+            if frame["sha256"] != previous_sha:
+                run_start, previous_sha = time, frame["sha256"]
+            if seconds(frame["display_end_sec"]) - run_start >= .5:
+                raise ValueError("VISUAL_EVIDENCE_REPEATED_MOVING_FRAMES")
+    for boundary, observed in enumerate(complete_observations("boundaries", "boundary_index", len(segments) - 1)):
+        right = next((i for i, time in enumerate(times) if time >= segments[boundary + 1]["narration_start_sec"]), None)
+        if right is None or right == 0 or observed.get("left_frame_index") != right - 1 or observed.get("right_frame_index") != right:
+            raise ValueError("VISUAL_REVIEW_BOUNDARY_MISMATCH")
+    if (audio.get("method") != "local_asr_and_pcm" or audio.get("asr_status") != "available"
+            or audio.get("signal_status") != "available"
+            or abs(seconds(audio.get("signal", {}).get("duration_sec")) - end) > .1):
+        raise ValueError("VISUAL_REVIEW_AUDIO_INCOMPLETE")
+    signal = audio["signal"]
+    levels = signal.get("rms_dbfs", [])
+    if (signal.get("sample_rate_hz") != 16000 or signal.get("channels") != 1
+            or not isinstance(signal.get("decoded_pcm_sha256"), str)
+            or len(signal["decoded_pcm_sha256"]) != 64 or signal.get("window_sec") != .1
+            or len(levels) != ceil(seconds(signal["duration_sec"]) / .1)
+            or any(not isfinite(float(level)) for level in levels)
+            or not 0 < seconds(signal.get("peak_amplitude")) <= 1.01
+            or seconds(signal.get("full_scale_sample_fraction")) > .001):
+        raise ValueError("VISUAL_REVIEW_PCM_INCOMPLETE_OR_CLIPPED")
+    words = [word for segment in audio.get("segments", []) for word in segment.get("words", [])]
+    if not words:
+        raise ValueError("VISUAL_REVIEW_ASR_WORDS_MISSING")
+    for word in words:
+        if not 0 <= seconds(word["start_sec"]) < seconds(word["end_sec"]) <= end + .1:
+            raise ValueError("VISUAL_REVIEW_ASR_TIME_INVALID")
+        begin, finish = int(seconds(word["start_sec"]) / .1), int(seconds(word["end_sec"]) / .1)
+        if not any(float(level) > -55 for level in levels[begin:max(begin + 1, finish)]):
+            raise ValueError("VISUAL_REVIEW_ASR_IN_SILENCE")
+    covered = []
+    for event, alignment in zip(events, complete_observations("subtitle_alignment", "event_index", len(events)), strict=True):
+        indices = alignment.get("word_indices", [])
+        if (alignment.get("observed_sync") is not True or not indices
+                or any(type(i) is not int or not 0 <= i < len(words) for i in indices)
+                or indices != sorted(set(indices))):
+            raise ValueError("VISUAL_REVIEW_SUBTITLE_ALIGNMENT")
+        first, last = words[indices[0]], words[indices[-1]]
+        if (abs(seconds(first["start_sec"]) - seconds(event["start_sec"])) > .4
+                or abs(seconds(last["end_sec"]) - seconds(event["end_sec"])) > .4
+                or any(not isfinite(float(words[i].get("probability", 0)))
+                       or float(words[i].get("probability", 0)) < .7 for i in indices)):
+            raise ValueError("VISUAL_REVIEW_SUBTITLE_ASR_MISMATCH")
+        covered.extend(indices)
+    if covered != list(range(len(words))):
+        raise ValueError("VISUAL_REVIEW_ASR_COVERAGE")
 
 
 def verify_acceptance(session: Session, task: AgentTask, result: dict, *, _archived_revalidation: bool = False) -> None:
     from glance_core.task_service import stable_hash
 
-    if task.task_type != TaskType.CONTENT_QC or task.schema_version != "2":
+    if task.task_type != TaskType.CONTENT_QC or task.schema_version not in {"2", "3"}:
         raise ValueError("legacy QC is not a v2 acceptance")
     if (
         task.input_data.get("acceptance_contract_version") != 2
@@ -1012,12 +1201,21 @@ def verify_acceptance(session: Session, task: AgentTask, result: dict, *, _archi
     version = task.input_data.get("source_context_version")
     audio_version = task.input_data.get("audio_evidence_version")
     audio = task.input_data.get("audio_evidence") if audio_version is not None else None
+    visual = task.input_data.get("visual_evidence")
+    if task.schema_version == "3":
+        if type(task.input_data.get("visual_evidence_version")) is not int or task.input_data["visual_evidence_version"] != 1 or not isinstance(visual, dict):
+            raise ValueError("VISUAL_EVIDENCE_VERSION_UNSUPPORTED")
+        if type(version) is not int or version != 1 or type(audio_version) is not int or audio_version != 1 or not isinstance(audio, dict):
+            raise ValueError("VISUAL_JOINT_REQUIRES_SOURCE_AND_AUDIO_EVIDENCE")
+    elif visual is not None or task.input_data.get("visual_evidence_version") is not None or result.get("visual_review") is not None:
+        raise ValueError("LEGACY_QC_CANNOT_USE_JOINT_VISUAL_EVIDENCE")
     if audio_version is not None and (
         type(audio_version) is not int or audio_version != 1 or not isinstance(audio, dict)
     ):
         raise ValueError("AUDIO_EVIDENCE_VERSION_UNSUPPORTED")
     current = acceptance_subject(
         session, task.content_id, refs, source_context_version=version, audio_evidence=audio,
+        visual_evidence=visual,
         _archived_revalidation=_archived_revalidation,
     )
     if (
@@ -1039,3 +1237,11 @@ def verify_acceptance(session: Session, task: AgentTask, result: dict, *, _archi
             raise ValueError("SOURCE_CONTEXT_INCOMPLETE")
     if task.input_data.get("acceptance_subject") != current or result.get("subject") != current:
         raise ValueError("acceptance subject changed/mismatched")
+    if task.schema_version == "3":
+        from glance_core.task_schemas import result_model_for
+
+        decision = result_model_for(TaskType.CONTENT_QC, "3").model_validate(result)
+        content = session.get(Content, task.content_id)
+        plan = resolved_visual_plan(session, session.get(AgentTask, refs["visual_plan"]))
+        verify_visual_joint_evidence(Path(content.content_dir), visual,
+                                     decision.visual_review.model_dump(mode="json"), audio, plan, passed=decision.passed)

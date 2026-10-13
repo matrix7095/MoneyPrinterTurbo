@@ -13,6 +13,8 @@ from glance_core.content_acceptance import (
     _visual_parent_chain,
     generated_image_material,
     source_context,
+    resolved_visual_plan,
+    verify_visual_joint_evidence,
 )
 from glance_core.models import (
     AgentTask,
@@ -171,6 +173,22 @@ def _bundle_contract_errors(
     """Validate the final materialized bundle before an Agent spends a turn on it."""
     errors: list[dict[str, Any]] = []
     content = session.get(Content, task.content_id) if task.content_id else None
+    if task.task_type == TaskType.CONTENT_QC and task.schema_version == "3":
+        try:
+            evidence = task.input_data["visual_evidence"]
+            root = Path(content.content_dir).resolve()
+            plan = session.get(AgentTask, task.input_data["upstream_task_ids"]["visual_plan"])
+            verify_visual_joint_evidence(root, evidence, None, task.input_data["audio_evidence"],
+                                         resolved_visual_plan(session, plan), passed=False)
+            pack_root = (root / evidence["manifest_path"]).parent
+            required = {evidence["manifest_path"], *[
+                (pack_root / item["path"]).relative_to(root).as_posix()
+                for item in [*evidence["manifest"]["pages"], *evidence["manifest"]["frames"],
+                             evidence["manifest"]["subtitles"]]]}
+            if not required.issubset(set(context_files)):
+                raise ValueError("VISUAL_EVIDENCE_CONTEXT_INCOMPLETE")
+        except (ValueError, OSError, TypeError, KeyError, AttributeError) as exc:
+            errors.append({"path": ["visual_evidence"], "message": str(exc)})
     declared_upstream = task.input_data.get("upstream_task_ids") or {}
     # Some pre-contract tasks were intentionally minimal bundle-materialization records.
     # Enforce the full script contract when its dependency/mode fields are declared, while

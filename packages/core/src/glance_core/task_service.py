@@ -1195,7 +1195,7 @@ class AgentTaskService:
                                 "message": "必须返回最终内容页，不能返回搜索结果页或跳转链接",
                             }
                         )
-        if not errors and task.task_type == TaskType.CONTENT_QC and task.schema_version == "2":
+        if not errors and task.task_type == TaskType.CONTENT_QC and task.schema_version in {"2", "3"}:
             from glance_core.content_acceptance import verify_acceptance
 
             try:

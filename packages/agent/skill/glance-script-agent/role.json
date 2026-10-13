@@ -1,7 +1,7 @@
 {
   "role_id": "script",
   "skill_name": "glance-script-agent",
-  "skill_version": "1.1.0",
+  "skill_version": "1.2.0",
   "protocol_version": "1",
   "task_types": ["short_script", "script_qc", "content_qc", "publish_prepare"]
 }
