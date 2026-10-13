@@ -6,6 +6,10 @@
 
 ## 当前验收清单
 
+真实MPT静态图片渲染故障盲测：四个两秒、1080×1920/30fps视频共240帧，使用真实MptMediaExecutor输出构建正常版和三个故障版。两名独立审核者实际查看全部40页连续帧，并用异常前后原图复核；Root在审核结束后读取隔离答案，逐项核对视频SHA、帧数和故障索引：正常版无误拒，单帧紫屏第30帧、字幕遮挡第38至40帧、主体遮挡第48至50帧均准确定位。此结论仅限静态几何、纯音诊断素材；尚未验证字幕时序偏移、运动裁切/转场、重复倒序、末尾截断及真实语音/生产成片，不改变CONTENT_QC门槛。证据 `mpt-visual-fault-probe/root-blind-review-proof.json`。
+
+一次启动接入核查：business选题请求立即准备上下文，Agent完成接口立即consume并推进下游，阶段推进已有事件式路径；现有CLI角色launcher仅领取任务包并输出prompt，不运行模型，缺口是外部角色执行接入。本机Codex App Server经stdio的initialize和account/read实测成功，现有ChatGPT账户可读，未创建thread/turn、未刷新凭据；这不证明原生子Agent或所需媒体工具可用。服务端“native”检查验证MPT部署、输入、租约和accepted submission，而非Codex parent/subagent身份；现有scheduler Skill明确要求真正native spawn，不可把新app-server聊天当作等价Worker。后续按需入口需保留这条交接边界。证据 `codex-host-readonly-probe.json`。
+
 六秒合成图像序列盲测结果：独立审核者实际观察六张顺序帧页（每页30帧，最终视频共180帧），未读取保留答案，报告3.000秒红转蓝、白色方块水平向右匀速移动，缩放后估计37.5像素/秒；Root对照保留规格75像素/秒与0.5缩放，结果一致。此测试没有植入单帧故障，也未验证生产渲染、字幕可读性或音频，不能作为CONTENT_QC通过依据。证据 `codex-frame-probe-review.json`。
 
 2026-10-13复核：生产自动化 `glance-codex-scheduler` 为 PAUSED，后台 scheduler/config 的 enabled=false，UI健康返回200，MPT Runtime Watchdog仍启用；暂停新派发不取消已有Worker。原生MPT的单次请求通过create_task调用task.start执行流水线，不依赖十分钟定时扫描；当前改造版另要求生成素材与发布使用AgentTask，因此暂停定时任务不会自动补齐这些接入。Gemini不是稳定生产的必选依赖，后续优先验证Codex与本机工具的审核路径；尚未证明该路径满足完整动态审核，不以解码或抽帧成功代替审核通过。前文所列Gemini授权是此前候选方案的待办，不代表必须采用该方案。
