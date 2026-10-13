@@ -31,6 +31,16 @@ def validate_worker(worker: dict, scheduler_id: str, root: Path, roles: dict) ->
         raise ValueError("unsupported effort")
     if not re.fullmatch(r"agt_[0-9a-f]{32}", str(worker.get("task_id", ""))):
         raise ValueError("invalid task identity")
+    scope = ("run_id", "run_generation", "content_id", "input_hash")
+    if any(field in worker for field in scope):
+        if (
+            not all(field in worker for field in scope)
+            or not re.fullmatch(r"run_[0-9a-f]{32}", str(worker["run_id"]))
+            or type(worker["run_generation"]) is not int or worker["run_generation"] < 1
+            or not re.fullmatch(r"content_[0-9a-f]{32}", str(worker["content_id"]))
+            or not isinstance(worker["input_hash"], str) or not worker["input_hash"]
+        ):
+            raise ValueError("invalid content run offer")
     if not re.fullmatch(
         re.escape(f"{scheduler_id}-{role}-") + r"[0-9a-f]{12}",
         str(worker.get("agent_id", "")),
@@ -74,6 +84,8 @@ def materialize_offer(worker: dict, scheduler_id: str, launcher: Path, deadline:
         deadline=deadline,
         launcher_hash=hashlib.sha256(launcher.read_bytes()).hexdigest(),
     )
+    if "run_id" in worker:
+        frozen.update({key: worker[key] for key in ("run_id", "run_generation", "content_id", "input_hash")})
     payload = json.dumps(frozen, sort_keys=True).encode()
     digest = hashlib.sha256(payload).hexdigest()
     envelope = path.with_suffix(".json")

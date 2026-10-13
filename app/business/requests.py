@@ -18,6 +18,9 @@ class DispatchRequest(StrictRequest):
     workspace_dir: str = Field(default="", max_length=1000)
     launcher: str = Field(default="", max_length=1000)
     task_id: str | None = Field(default=None, max_length=80)
+    run_id: str | None = Field(default=None, pattern=r"^run_[0-9a-f]{32}$")
+    run_generation: int | None = Field(default=None, ge=1, strict=True)
+    request_id: str | None = Field(default=None, max_length=120)
 
 
 class DeploymentSkill(StrictRequest):

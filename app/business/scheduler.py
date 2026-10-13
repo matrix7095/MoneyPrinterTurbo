@@ -34,6 +34,8 @@ from sqlalchemy.orm import with_loader_criteria
 from sqlmodel import select
 
 from app.business.consumption import content_operation_lock
+from app.business.content_run import FROZEN_FIELDS, OFFER_ACTION, require_run
+from glance_core.task_service import stable_hash
 from app.business.quarantine import (
     assert_allowed,
     eligible_task_clause,
@@ -262,7 +264,7 @@ def worker_prompt(request_id, skill_name, launcher):
     )
 
 
-def active_local_media(runtime, session):
+def active_local_media(runtime, session, content_id=None):
     rows = session.exec(
         select(StageRun)
         .join(Content)
@@ -270,6 +272,7 @@ def active_local_media(runtime, session):
             StageRun.status == StageStatus.RUNNING,
             StageRun.started_at.is_not(None),
             Content.business_status == ContentStatus.PRODUCING,
+            *([Content.id == content_id] if content_id is not None else []),
         )
     ).all()
     for row in rows:
@@ -287,8 +290,9 @@ def active_local_media(runtime, session):
     return False
 
 
-def scheduler_plan(runtime, session, scheduler_id):
+def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
     begin_immediate(session)
+    run = require_run(session, run_id) if run_id is not None else None
     config = load_scheduler_config(session)
     if config["scheduler_id"] != scheduler_id:
         raise KeyError("Scheduler not configured")
@@ -305,7 +309,9 @@ def scheduler_plan(runtime, session, scheduler_id):
         "worker_requests": [],
         "blocked": [],
     }
-    if enabled:
+    if run is not None:
+        result.update(run_id=run.run_id, run_generation=run.generation, content_id=run.content_id, run_state=run.state, execution_mode="contract_only")
+    if enabled or run is not None:
         eligible = eligible_task_clause() & AgentTask.task_type.in_(
             runtime.supported_task_types
         )
@@ -325,7 +331,7 @@ def scheduler_plan(runtime, session, scheduler_id):
 
         event.listen(session, "do_orm_execute", restrict)
         try:
-            planned = build_scheduler_plan(session, config)
+            planned = build_scheduler_plan(session, config, pending_content_id=run.content_id if run else None)
         finally:
             event.remove(session, "do_orm_execute", restrict)
         live = session.exec(
@@ -449,8 +455,7 @@ def scheduler_plan(runtime, session, scheduler_id):
             )
             capacity[role.value] = capacity.get(role.value, 0) + 1
             host_capacity[host] = host_capacity.get(host, 0) + 1
-            result["worker_requests"].append(
-                {
+            worker_request = {
                     **item,
                     "request_id": request_id,
                     "title": f"mpt_worker_{kind.value}_{item['task_id']}_{request_id.rsplit(':', 1)[-1]}",
@@ -462,7 +467,16 @@ def scheduler_plan(runtime, session, scheduler_id):
                         request_id, role_spec(role).skill_name, worker.launcher_path
                     ),
                 }
-            )
+            if run is not None:
+                task = session.get(AgentTask, item["task_id"])
+                worker_request.update(run_id=run.run_id, run_generation=run.generation, content_id=run.content_id, input_hash=task.input_hash, scheduler_id=scheduler_id)
+                frozen = {field: worker_request[field] for field in FROZEN_FIELDS}
+                session.add(AuditEvent(
+                    actor_type="scheduler", actor_id=scheduler_id, entity_type="scheduler_offer",
+                    entity_id=request_id, action=OFFER_ACTION,
+                    metadata_json={"worker": frozen, "worker_hash": stable_hash(frozen)},
+                ))
+            result["worker_requests"].append(worker_request)
         result["status"] = (
             "READY"
             if result["worker_requests"]
@@ -472,7 +486,7 @@ def scheduler_plan(runtime, session, scheduler_id):
         )
         if result["status"] == "NO_TASK":
             try:
-                if active_local_media(runtime, session):
+                if active_local_media(runtime, session, run.content_id if run else None):
                     result.update(status="WAITING_UPSTREAM", retry_after_sec=30)
             except OSError as exc:
                 result.update(

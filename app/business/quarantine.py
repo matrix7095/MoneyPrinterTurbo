@@ -157,11 +157,21 @@ def filter_task_reads(session, clause):
 
 
 class IsolatedTaskService(AgentTaskService):
+    def _authorize_claim(self, *, agent_id, task_id, role_id, runtime_info, authorization_context):
+        from app.business.content_run import authorize_claim
+
+        authorize_claim(
+            self.session, agent_id=agent_id, task_id=task_id, role_id=role_id,
+            runtime_info=runtime_info, scope=authorization_context,
+        )
+
     def create_task(self, **kwargs):
         assert_allowed(self.session, content_id=kwargs.get("content_id"))
         return super().create_task(**kwargs)
 
     def claim(self, **kwargs):
+        from app.business.content_run import scoped_offer_clause
+
         kwargs["runtime_info"] = checked_runtime_host(
             self.session, kwargs["agent_id"], kwargs.get("runtime_info")
         )
@@ -192,7 +202,10 @@ class IsolatedTaskService(AgentTaskService):
             # A cached identity-map object makes Session.get bypass loader SQL
             # criteria. Validate the persisted row with an explicit scalar query.
             return None
-        with filter_task_reads(self.session, eligible_task_clause() & recoverable):
+        selectable = eligible_task_clause() & recoverable
+        if not kwargs.get("authorization_context"):
+            selectable &= (AgentTask.status != TaskStatus.PENDING) | ~scoped_offer_clause()
+        with filter_task_reads(self.session, selectable):
             return super().claim(**kwargs)
 
     def heartbeat(self, task_id, lease_token, runtime_info=None):

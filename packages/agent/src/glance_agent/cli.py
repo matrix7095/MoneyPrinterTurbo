@@ -1046,19 +1046,30 @@ def bootstrap_scheduler(
 def scheduler_plan(
     scheduler_id: Annotated[str, typer.Option("--scheduler-id")],
     contract_version: Annotated[int, typer.Option("--contract-version", min=1, max=2)] = 1,
+    run_id: Annotated[str, typer.Option("--run-id")] = "",
 ) -> None:
     """Read one server-owned plan without claiming or changing any business task."""
     with _api_errors():
+        if run_id and contract_version != 2:
+            raise ValueError("Content runs require scheduler contract 2")
         config = settings()
         deadline = time.time() + 540  # Earlier than the server's ten-minute offer expiry.
         client = AgentClient(config)
         plan = (
-            client.scheduler_plan(scheduler_id, contract_version=2)
+            client.scheduler_plan(scheduler_id, contract_version=2, **({"run_id": run_id} if run_id else {}))
             if contract_version == 2
             else client.scheduler_plan(scheduler_id)
         )
         if not isinstance(plan, dict):
             output({"status": "HANDOFF_ERROR", "message": "invalid plan shape"})
+            raise typer.Exit(DISPATCH_EXIT_ENV_FAILURE)
+        if run_id and (
+            plan.get("run_id") != run_id
+            or type(plan.get("run_generation")) is not int
+            or plan["run_generation"] < 1
+            or not isinstance(plan.get("content_id"), str)
+        ):
+            output({"status": "HANDOFF_ERROR", "message": "invalid content run plan", "worker_requests": []})
             raise typer.Exit(DISPATCH_EXIT_ENV_FAILURE)
         if contract_version == 2 and (
             type(plan.get("contract_version")) is not int
@@ -1086,6 +1097,13 @@ def scheduler_plan(
                 workers = plan["worker_requests"]
                 if not isinstance(workers, list) or not 1 <= len(workers) <= 16:
                     raise ValueError("invalid worker requests")
+                if run_id and any(
+                    worker.get("run_id") != run_id
+                    or worker.get("run_generation") != plan["run_generation"]
+                    or worker.get("content_id") != plan["content_id"]
+                    for worker in workers
+                ):
+                    raise ValueError("worker outside content run")
                 launchers = [
                     validate_worker(worker, scheduler_id, root, roles) for worker in workers
                 ]
@@ -1127,6 +1145,9 @@ def dispatch_offer(
                 agent_id=worker["agent_id"],
                 model_name=worker["model"],
                 reasoning_effort=worker["reasoning_effort"],
+                run_id=worker.get("run_id", ""),
+                run_generation=worker.get("run_generation"),
+                request_id=worker["request_id"] if worker.get("run_id") else "",
             )
     except typer.Exit as exc:
         if exc.exit_code == DISPATCH_EXIT_NO_TASK:
@@ -1222,12 +1243,20 @@ def dispatch(
     model_name: Annotated[str, typer.Option("--model-name")] = "",
     reasoning_effort: Annotated[str, typer.Option("--reasoning-effort")] = "",
     task_id: Annotated[str, typer.Option("--task-id")] = "",
+    run_id: Annotated[str, typer.Option("--run-id")] = "",
+    run_generation: Annotated[int | None, typer.Option("--run-generation", min=1)] = None,
+    request_id: Annotated[str, typer.Option("--request-id")] = "",
 ) -> None:
     """调度入口：stdout 直接输出给 Agent 的指令文本，退出码 0/10/11/20。
 
     --wait 缺省时由服务端按 agent_claim_wait_cap 决定长轮询（直接唤起式）；
     调度式（计时器跑，按退出码决定是否唤起）应传 --wait 0 秒级返回。
     """
+    if (run_id or run_generation is not None or request_id) and not (
+        run_id and run_generation is not None and request_id
+    ):
+        typer.echo("HANDOFF_ERROR: a complete frozen run offer is required")
+        raise typer.Exit(DISPATCH_EXIT_ENV_FAILURE)
     try:
         config = settings()
     except ValidationError:
@@ -1251,7 +1280,8 @@ def dispatch(
         response: dict[str, object] = {}
         try:
             response = client.dispatch(
-                wait=wait, launcher=launcher, task_type=task_type, task_id=task_id
+                wait=wait, launcher=launcher, task_type=task_type, task_id=task_id,
+                **({"run_id": run_id, "run_generation": run_generation, "request_id": request_id} if run_id else {}),
             )
             gaps: list[str] = []
             if response.get("should_run"):

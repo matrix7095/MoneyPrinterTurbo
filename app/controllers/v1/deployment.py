@@ -5,6 +5,7 @@ from glance_core.agent_roles import AgentRole
 from glance_core.runtime_config import RuntimeSettingsError, effective_settings
 from glance_core.scheduler_profiles import load_scheduler_config, save_scheduler_config
 from glance_core.security import verify_scheduler_token
+from glance_core.task_service import TaskConflictError
 from sqlmodel import Session
 
 from app.business.auth import bearer_token, require_admin, require_agent
@@ -47,6 +48,7 @@ def plan(
     request: Request,
     scheduler_id: str,
     contract_version: int = Query(...),
+    run_id: str | None = Query(default=None, pattern=r"^run_[0-9a-f]{32}$"),
     authorized: Annotated[None, Depends(require_scheduler)],
     session: Annotated[Session, Depends(get_session)],
 ):
@@ -55,15 +57,18 @@ def plan(
     runtime = get_runtime(request)
     try:
         effective_settings(session, runtime.settings)
-        runtime.maintain_dispatch()
-        return scheduler_plan(runtime, session, scheduler_id)
+        if run_id is None:
+            runtime.maintain_dispatch()
+        else:
+            runtime.maintain_content_dispatch(run_id)
+        return scheduler_plan(runtime, session, scheduler_id, run_id=run_id)
     except RuntimeSettingsError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     except KeyError:
         raise HTTPException(
             status_code=404, detail="Scheduler not configured"
         ) from None
-    except ValueError as exc:
+    except (ValueError, TaskConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 

@@ -31,6 +31,42 @@ router = APIRouter(
 )
 
 
+@router.post("/contents/{content_id}/run")
+def start_content_run(*, content_id: str, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_run import start_run
+
+    try:
+        return start_run(session, content_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content not found") from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.get("/contents/{content_id}/run")
+def content_run(*, content_id: str, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_run import get_run
+
+    try:
+        return get_run(session, content_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content run not found") from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/run/stop")
+def stop_content_run(*, content_id: str, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_run import get_run
+
+    try:
+        return get_run(session, content_id, stop=True)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content run not found") from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 @router.get("/contents")
 def list_contents(*, session: Annotated[Session, Depends(get_session)]):
     return [

@@ -767,6 +767,9 @@ class AgentTaskService:
         self.session.refresh(task)
         return task
 
+    def _authorize_claim(self, *, agent_id, task_id, role_id, runtime_info, authorization_context):
+        """Runtime-specific permits are checked inside the lease transaction."""
+
     def claim(
         self,
         *,
@@ -776,12 +779,21 @@ class AgentTaskService:
         runtime_info: dict[str, Any] | None = None,
         reserve_seconds: int | None = None,
         task_id: str | None = None,
+        authorization_context: tuple | None = None,
     ) -> tuple[AgentTask, str] | None:
         # Validate before BEGIN IMMEDIATE: an old publish worker must receive a
         # capability error and must never enter the lease/dispatch transaction.
         require_runtime_capability(role_id, runtime_info)
         now = utc_now()
         begin_immediate(self.session)
+        try:
+            self._authorize_claim(
+                agent_id=agent_id, task_id=task_id, role_id=role_id,
+                runtime_info=runtime_info, authorization_context=authorization_context,
+            )
+        except Exception:
+            self.session.rollback()
+            raise
         active_leases = len(
             self.session.exec(
                 select(AgentTask).where(

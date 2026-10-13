@@ -301,6 +301,7 @@ def build_scheduler_plan(
     payload: SchedulerConfig | Mapping[str, Any],
     *,
     handsfree: bool = False,
+    pending_content_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build a read-only plan for pending tasks under the configured capacity.
 
@@ -310,7 +311,7 @@ def build_scheduler_plan(
     session state is changed.
     """
     config = _config_model(payload)
-    if not config.enabled:
+    if not config.enabled and pending_content_id is None:
         return []
 
     session = tasks if isinstance(tasks, Session) else None
@@ -347,7 +348,9 @@ def build_scheduler_plan(
             leased_by_type[task_type] = leased_by_type.get(task_type, 0) + 1
         elif task.id in offered_ids:
             continue
-        elif task.not_before is None or as_utc(task.not_before) <= now:
+        elif (pending_content_id is None or task.content_id == pending_content_id) and (
+            task.not_before is None or as_utc(task.not_before) <= now
+        ):
             pending.append((task, task_type))
 
     global_remaining = max(0, config.max_parallel - leased_total)

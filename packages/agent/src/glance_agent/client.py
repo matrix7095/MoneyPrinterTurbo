@@ -70,7 +70,14 @@ class AgentClient:
         launcher: str = "",
         task_type: str = "",
         task_id: str = "",
+        run_id: str = "",
+        run_generation: int | None = None,
+        request_id: str = "",
     ) -> dict[str, Any]:
+        if (run_id or run_generation is not None or request_id) and not (
+            run_id and run_generation is not None and request_id
+        ):
+            raise ValueError("A complete frozen run offer is required")
         with self._client() as client:
             params: dict[str, Any] = {}
             if wait is not None:
@@ -84,6 +91,7 @@ class AgentClient:
                     "role_id": self.settings.role_id,
                     "task_type": task_type or None,
                     "task_id": task_id or None,
+                    **({"run_id": run_id, "run_generation": run_generation, "request_id": request_id} if run_id else {}),
                     "runtime": self.settings.runtime_report(),
                     "workspace_dir": str(self.settings.workspace_dir.expanduser().resolve()),
                     "launcher": launcher,
@@ -96,13 +104,16 @@ class AgentClient:
             response.raise_for_status()
             return response.json()
 
-    def scheduler_plan(self, scheduler_id: str, contract_version: int = 1) -> dict[str, Any]:
+    def scheduler_plan(self, scheduler_id: str, contract_version: int = 1, *, run_id: str = "") -> dict[str, Any]:
+        if run_id and contract_version != 2:
+            raise ValueError("Content runs require scheduler contract 2")
         with self._client() as client:
             response = client.get(
                 "/api/v1/agent/scheduler/plan",
                 params={
                     "scheduler_id": scheduler_id,
                     **({"contract_version": 2} if contract_version == 2 else {}),
+                    **({"run_id": run_id} if run_id else {}),
                 },
                 headers=self._headers(),
             )

@@ -144,9 +144,15 @@ def claim(
     runtime = get_runtime(request)
     try:
         current = effective_settings(service.session, runtime.settings)
+        from app.business.content_run import authorize_claim
+
+        authorize_claim(service.session, agent_id=payload.agent_id, task_id=None,
+                        role_id=selected, runtime_info=None, scope=None)
         runtime.maintain_dispatch()
     except RuntimeSettingsError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     deadline = time.monotonic() + max(0, min(wait, current.agent_claim_wait_cap))
     try:
         while True:
@@ -235,11 +241,24 @@ def dispatch(
             status_code=422, detail="必须指定具体业务角色；平台不支持全能 Agent"
         )
     runtime = get_runtime(request)
+    scope_fields = (payload.run_id, payload.run_generation, payload.request_id)
+    if any(value is not None for value in scope_fields) and not all(value is not None for value in scope_fields):
+        raise HTTPException(status_code=422, detail="A complete frozen run offer is required")
     try:
         current = effective_settings(service.session, runtime.settings)
-        runtime.maintain_dispatch()
+        from app.business.content_run import authorize_claim
+
+        authorize_claim(service.session, agent_id=payload.agent_id, task_id=payload.task_id,
+                        role_id=selected, runtime_info=payload.runtime.model_dump() if payload.runtime else None,
+                        scope=scope_fields if payload.run_id else None)
+        if payload.run_id is None:
+            runtime.maintain_dispatch()
+        else:
+            runtime.maintain_content_dispatch(payload.run_id)
     except RuntimeSettingsError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     capabilities = set(role_spec(selected).task_types) & runtime.supported_task_types
     if payload.task_type is not None:
         if payload.task_type not in capabilities:
@@ -261,6 +280,7 @@ def dispatch(
                 runtime_info=payload.runtime.model_dump() if payload.runtime else None,
                 reserve_seconds=current.agent_reserve_seconds,
                 task_id=payload.task_id,
+                authorization_context=scope_fields if payload.run_id else None,
             )
             if claimed is not None or time.monotonic() >= deadline:
                 break

@@ -225,6 +225,24 @@ class BusinessRuntime:
             finally:
                 session.rollback()
 
+    def maintain_content_dispatch(self, run_id):
+        from app.business.content_run import require_run
+
+        with Session(self.engine) as session:
+            target_id = require_run(session, run_id).content_id
+        self.recover_agent_results(lock_timeout_seconds=0, content_id=target_id)
+        owned = select(AuditEvent.entity_id).where(
+            AuditEvent.action == OWNED,
+            AuditEvent.metadata_json["input_hash"].as_string() == AgentTask.input_hash,
+        )
+        with Session(self.engine) as session:
+            begin_immediate(session)
+            require_run(session, run_id)
+            with filter_task_reads(session, eligible_task_clause() & AgentTask.id.in_(owned) & (AgentTask.content_id == target_id)):
+                count = self.task_service(session).reap_expired_leases()
+            session.commit()
+            return count
+
     def _require_native_deployment(self, session, task):
         from glance_core.agent_roles import primary_role_for
         from app.business.requests import DeploymentReportRequest
@@ -862,11 +880,12 @@ class BusinessRuntime:
                 session.commit()
             return True
 
-    def recover_agent_results(self, *, lock_timeout_seconds: float = 30):
+    def recover_agent_results(self, *, lock_timeout_seconds: float = 30, content_id: str | None = None):
         with Session(self.engine) as session:
             tasks = session.exec(
                 select(AgentTask.id).where(
                     AgentTask.status == TaskStatus.COMPLETED,
+                    *([AgentTask.content_id == content_id] if content_id is not None else []),
                     eligible_task_clause(),
                     AgentTask.task_type != TaskType.SOURCE_DISCOVERY,
                     AgentTask.task_type.in_(self.supported_task_types),
