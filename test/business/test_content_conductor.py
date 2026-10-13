@@ -1,0 +1,1048 @@
+"""Protocol fault injection: no desktop, business service or media side effects."""
+
+import copy
+import json
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from glance_core.task_service import stable_hash
+
+from app.business import conductor as c
+from app.business.content_run import FROZEN_FIELDS
+
+RUN = "run_" + "a" * 32
+CONTENT = "content_" + "b" * 32
+
+
+def worker(index=0):
+    data = dict.fromkeys(FROZEN_FIELDS, "fixture")
+    data.update(
+        request_id=f"mpt-codex:{index}:abcdef{index}",
+        task_id=f"task_{index}",
+        run_id=RUN,
+        content_id=CONTENT,
+        run_generation=1,
+        host_epoch=1,
+        title=f"mpt_task_{index}",
+        prompt="PRIVATE WORKER PROMPT 原样",
+        native_agent_type="default",
+        fork_turns="none",
+        model="gpt-6-luna",
+        reasoning_effort="max",
+        round_id="round_fixture",
+    )
+    data["offer_hash"] = stable_hash({key: data[key] for key in FROZEN_FIELDS})
+    data["_offer_deadline"] = 10**12
+    return data
+
+
+class FakeBackend:
+    def __init__(self):
+        self.events = []
+        self.state = dict(
+            run_id=RUN,
+            generation=1,
+            host_epoch=0,
+            state="awaiting_host",
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat(),
+            content_status="WAITING_AGENT",
+            intents={},
+            ready_rounds=0,
+            active_task_ids=[],
+        )
+
+    def view(self, content_id):
+        assert content_id == CONTENT
+        return copy.deepcopy(self.state)
+
+    def attach(self, run_id, body):
+        assert run_id == RUN and body["expected_host_epoch"] == 0
+        self.events.append(("attach", body))
+        self.state.update(
+            host_epoch=1,
+            state="running",
+            parent_thread_id=body["parent_thread_id"],
+            process_identity=copy.deepcopy(body["process_identity"]),
+        )
+        return dict(
+            run_id=RUN,
+            generation=1,
+            parent_thread_id=body["parent_thread_id"],
+            host_epoch=1,
+        )
+
+    def intent(self, run_id, request_id, body):
+        self.events.append(("intent", request_id, body))
+        self.state["intents"][request_id] = dict(state="SPAWN_INTENT")
+        return dict(
+            request_id=request_id,
+            state="SPAWN_INTENT",
+            offer_hash=body["offer_hash"],
+            host_epoch=1,
+        )
+
+    def observe(self, run_id, request_id, body):
+        assert body["generation"] == body["host_epoch"] == 1
+        self.events.append((body["outcome"], request_id, copy.deepcopy(body)))
+        return {}
+
+    def stop(self, content_id, expected_binding):
+        assert all(
+            self.state.get(key) == value for key, value in expected_binding.items()
+        )
+        self.events.append(("stop", content_id, copy.deepcopy(expected_binding)))
+        self.state.update(state="draining", stop_requested=True)
+        return {}
+
+
+class FakeNative:
+    def __init__(self, backend, fault=None):
+        self.backend, self.fault = backend, fault
+        self.workspace = Path.cwd()
+        self.identity = dict(
+            pid=123,
+            started_at="2026-10-13T00:00:00+00:00",
+            instance_id="fixture",
+            binary_path="fixture.exe",
+            binary_sha256="a" * 64,
+            version="0.162",
+        )
+        self.queue = deque()
+        self.sent = []
+        self.eof = self.closed = False
+        self.counter = self.turn_count = 0
+        self.after_empty = None
+
+    def request(self, method, params):
+        self.counter += 1
+        rpc = f"rpc_{self.counter}"
+        self.sent.append((method, params))
+        if method == "initialize":
+            self.queue.append(dict(id=rpc, result={}))
+        elif method == "thread/start":
+            assert params["ephemeral"] is True
+            self.queue.append(
+                dict(id=rpc, result=dict(thread=dict(id="parent", ephemeral=True)))
+            )
+        elif method == "turn/start":
+            self.turn_count += 1
+            values = json.loads(params["input"][0]["text"].split("\n", 1)[1])
+            request_id = list(self.backend.state["intents"])[-1]
+            assert any(
+                e[0] == "intent" and e[1] == request_id for e in self.backend.events
+            )
+            turn_id = f"turn_{self.turn_count}"
+            child_id = f"child_{self.turn_count}"
+            self.queue.extend(
+                [
+                    dict(id=rpc, result=dict(turn=dict(id=turn_id))),
+                    dict(
+                        method="turn/started",
+                        params=dict(threadId="parent", turn=dict(id=turn_id)),
+                    ),
+                ]
+            )
+            if self.fault == "missing_child":
+                self.queue.append(
+                    dict(method="turn/completed", params=dict(threadId="parent"))
+                )
+            elif self.fault == "eof":
+                self.queue.append("EOF")
+            elif self.fault == "callback":
+                self.queue.append(
+                    dict(
+                        method="item/commandExecution/requestApproval",
+                        id="approve",
+                        params={},
+                    )
+                )
+                self.queue.append(
+                    dict(method="turn/completed", params=dict(threadId="parent"))
+                )
+            else:
+                path = "/root/" + (
+                    "wrong" if self.fault == "path" else values["task_name"]
+                )
+                self.queue.append(
+                    dict(
+                        method="item/started",
+                        params=dict(
+                            threadId="parent",
+                            turnId=turn_id,
+                            item=dict(
+                                id="call_" + child_id,
+                                type="subAgentActivity",
+                                kind="started",
+                                agentPath=path,
+                                agentThreadId=child_id,
+                            ),
+                        ),
+                    )
+                )
+                self.values = values
+        elif method == "thread/read":
+            child_id = params["threadId"]
+            self.queue.append(
+                dict(
+                    id=rpc,
+                    result=dict(
+                        thread=dict(
+                            id=child_id,
+                            parentThreadId="parent",
+                            agentRole="default",
+                            model="wrong"
+                            if self.fault == "model"
+                            else self.values["model"],
+                            reasoningEffort=self.values["reasoning_effort"],
+                            ephemeral=True,
+                        )
+                    ),
+                )
+            )
+            self.queue.extend(
+                [
+                    dict(method="turn/completed", params=dict(threadId=child_id)),
+                    dict(method="turn/completed", params=dict(threadId="parent")),
+                ]
+            )
+        return rpc
+
+    def send(self, message):
+        self.sent.append(("send", message))
+
+    def receive(self, timeout):
+        assert 0 < timeout <= 30
+        if self.queue:
+            value = self.queue.popleft()
+            if value == "EOF":
+                self.eof = True
+                raise c.ConductorError("CONDUCTOR_NATIVE_OBSERVATION_LOST")
+            return value
+        if self.after_empty:
+            self.after_empty()
+        return None
+
+    def alive(self):
+        return not self.eof
+
+    def process_alive(self):
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def setup(tmp_path):
+    backend = FakeBackend()
+    native = FakeNative(backend)
+    journal = c.Journal(tmp_path / "state", RUN, CONTENT)
+    tick = [0]
+
+    def monotonic():
+        tick[0] += 0.1
+        return tick[0]
+
+    plans = []
+
+    def planner(run_id):
+        assert run_id == RUN
+        plans.append(run_id)
+        return dict(
+            contract_version=2,
+            status="READY",
+            run_id=RUN,
+            run_generation=1,
+            content_id=CONTENT,
+            worker_requests=[worker()],
+        )
+
+    runner = c.Conductor(
+        backend, planner, native, journal, RUN, CONTENT, monotonic=monotonic
+    )
+    yield runner, backend, native, journal, plans
+    journal.close()
+
+
+def finish(backend, runner):
+    if (
+        runner.current
+        and runner.current.get("child")
+        and runner.children[runner.current["child"]["child_id"]]["terminal"]
+    ):
+        w = runner.current["worker"]
+        backend.state["intents"][w["request_id"]]["claimbinding_summary"] = dict(
+            claim_id="claim",
+            task_id=w["task_id"],
+            task_status="COMPLETED",
+            accepted=True,
+            consumed=True,
+            accepted_result_hash="a" * 64,
+            consumed_result_hash="a" * 64,
+        )
+        backend.state["content_status"] = "PUBLISHED"
+
+
+def test_real_event_binding_precedes_verified_and_exact_dispatch(setup):
+    runner, backend, native, journal, plans = setup
+    native.after_empty = lambda: finish(backend, runner)
+    result = runner.run()
+    assert result["status"] == "CONDUCTOR_CONTENT_TERMINAL"
+    assert native.closed and native.turn_count == 1
+    verified = next(e for e in backend.events if e[0] == "VERIFIED")
+    child = verified[2]["child"]
+    assert child["started"]["agent_path"] == "/root/mpt_task_0"
+    assert child["metadata_rpc_id"].startswith("rpc_")
+    assert child["model"] == "gpt-6-luna" and child["reasoning_effort"] == "max"
+    assert child["issued_prompt_sha256"] == c.prompt_sha256(worker()["prompt"])
+    assert native.values == dict(
+        task_name="mpt_task_0",
+        agent_type="default",
+        model="gpt-6-luna",
+        reasoning_effort="max",
+        fork_turns="none",
+        message=worker()["prompt"],
+    )
+    assert [e[0] for e in backend.events].index("intent") < [
+        e[0] for e in backend.events
+    ].index("VERIFIED")
+    assert len(plans) == 1
+    assert (
+        "PRIVATE WORKER PROMPT"
+        not in journal.path.read_text() + journal.log_path.read_text()
+    )
+    assert "VERIFIED" in journal.log_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "fault,code",
+    [
+        ("model", "CONDUCTOR_CHILD_METADATA_MISMATCH"),
+        ("missing_child", "CONDUCTOR_SPAWN_NOT_OBSERVED"),
+        ("callback", "HOST_APPROVAL_REQUIRED"),
+    ],
+)
+def test_rejection_closes_new_admissions_and_does_not_respawn(setup, fault, code):
+    runner, backend, native, _, _ = setup
+    native.fault = fault
+    result = runner.run()
+    assert result["status"] == code and native.turn_count == 1
+    assert not any(e[0] == "VERIFIED" for e in backend.events)
+    if fault == "callback":
+        reply = next(
+            p for method, p in native.sent if method == "send" and "error" in p
+        )
+        assert "result" not in reply and reply["id"] == "approve"
+
+
+def test_eof_keeps_unknown_live_own_process_unterminated(setup):
+    runner, backend, native, journal, _ = setup
+    native.fault = "eof"
+    with pytest.raises(c.ConductorError, match="OBSERVATION_LOST"):
+        runner.run()
+    assert native.turn_count == 1 and not native.closed
+    assert any(e[0] == "OBSERVATION_LOST" for e in backend.events)
+    assert journal.state["unresolved"] is True
+    log = journal.log_path.read_text()
+    assert '"actively_terminated": false' in log
+
+
+def bind_fixture(runner, journal):
+    w = worker()
+    runner.generation = runner.epoch = 1
+    runner.parent, runner.parent_turn = "parent", "turn_1"
+    runner.backend.state.update(
+        host_epoch=1,
+        state="running",
+        parent_thread_id="parent",
+        process_identity=copy.deepcopy(runner.native.identity),
+    )
+    runner.current = dict(worker=w)
+    journal.state["intents"][w["request_id"]] = {}
+    return w
+
+
+def test_stop_before_metadata_does_not_forge_terminal(setup):
+    runner, backend, native, journal, _ = setup
+    w = bind_fixture(runner, journal)
+    runner.stop_reason = "CONDUCTOR_STOP_REQUESTED"
+    started = dict(
+        parent_thread_id="parent",
+        parent_turn_id="turn_1",
+        item_id="call",
+        agent_path="/root/" + w["title"],
+        child_id="child",
+    )
+    runner.children["child"] = dict(terminal=False)
+    response = dict(
+        result=dict(
+            thread=dict(
+                id="child",
+                parentThreadId="parent",
+                agentRole="default",
+                model=w["model"],
+                reasoningEffort=w["reasoning_effort"],
+                ephemeral=True,
+            )
+        )
+    )
+    runner._verify_child("rpc_read", started, response)
+    assert [e[0] for e in backend.events] == ["REJECTED"]
+    assert not runner.children["child"]["terminal"]
+
+
+def test_parent_turn_mismatch_and_extra_child_are_rejected(setup):
+    runner, backend, _, journal, _ = setup
+    w = bind_fixture(runner, journal)
+    runner._child_started(
+        dict(threadId="parent", turnId="wrong"),
+        dict(id="call", agentThreadId="child", agentPath="/root/" + w["title"]),
+    )
+    assert runner.stop_reason == "CONDUCTOR_UNEXPECTED_CHILD"
+    assert not runner.metadata and not any(e[0] == "VERIFIED" for e in backend.events)
+
+
+def test_wait_timeout_does_not_mark_child_terminal_or_respawn(setup):
+    runner, _, native, journal, _ = setup
+    bind_fixture(runner, journal)
+    runner.children["child"] = dict(terminal=False)
+    for _ in range(20):
+        runner._pump(0.01)
+    assert runner.children["child"] == dict(terminal=False)
+    assert native.turn_count == 0
+
+
+def test_accepted_is_not_consumed_and_task_binding_must_match(setup):
+    runner, _, _, journal, _ = setup
+    w = bind_fixture(runner, journal)
+    runner.current["child"] = dict(child_id="child")
+    runner.children["child"] = dict(terminal=True)
+    summary = dict(
+        claim_id="claim",
+        task_id=w["task_id"],
+        accepted=True,
+        consumed=False,
+        accepted_result_hash="hash",
+        consumed_result_hash="hash",
+    )
+    view = dict(intents={w["request_id"]: dict(claimbinding_summary=summary)})
+    assert not runner._business_resolved(view)
+    summary["consumed"] = True
+    assert runner._business_resolved(view)
+    summary.update(consumed=False, task_status="PENDING")
+    assert not runner._business_resolved(view)
+    summary.update(consumed=True, task_status="COMPLETED")
+    summary["task_id"] = "other"
+    assert not runner._business_resolved(view)
+    summary.update(task_id=w["task_id"], consumed_result_hash="different")
+    assert not runner._business_resolved(view)
+
+
+def test_round_batch_retained_no_replan_or_duplicate_intent(setup):
+    runner, backend, _, journal, _ = setup
+    runner.generation = runner.epoch = 1
+    runner.planner = lambda run_id: dict(
+        contract_version=2,
+        status="READY",
+        run_id=RUN,
+        run_generation=1,
+        content_id=CONTENT,
+        worker_requests=[worker(0), worker(1)],
+    )
+    runner._plan(dict(generation=1, host_epoch=1))
+    assert [w["title"] for w in runner.inbox] == ["mpt_task_0", "mpt_task_1"]
+    with pytest.raises(c.ConductorError, match="DUPLICATE_OFFER"):
+        runner._plan(dict(generation=1, host_epoch=1))
+    assert len(runner.inbox) == 2
+    assert backend.events == [] and journal.state["intents"] == {}
+
+
+def test_journal_restart_refuses_replay_and_redacts_raw_payload(tmp_path):
+    path = tmp_path / "private"
+    journal = c.Journal(path, RUN, CONTENT)
+    message = dict(
+        method="item/completed",
+        params=dict(
+            threadId="safe",
+            item=dict(
+                type="mcpToolCall",
+                output="PRIVATE DOM phone 12345",
+                arguments=dict(token="SECRET"),
+            ),
+        ),
+    )
+    journal.record("native", c.event_summary(message))
+    journal.close()
+    assert (
+        "PRIVATE DOM" not in journal.log_path.read_text()
+        and "SECRET" not in journal.log_path.read_text()
+    )
+    with pytest.raises(c.ConductorError, match="RECOVERY_REQUIRED"):
+        c.Journal(path, RUN, CONTENT)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prompt", "changed"),
+        ("host_epoch", True),
+        ("fork_turns", "all"),
+        ("model", "gemini"),
+        ("content_id", "other"),
+    ],
+)
+def test_offer_tampering_fails_before_spawn(field, value):
+    w = worker()
+    w[field] = value
+    with pytest.raises(c.ConductorError):
+        c.validate_worker(w, dict(generation=1, host_epoch=1), RUN, CONTENT)
+
+
+def test_http_exact_protocol_and_token_only_in_memory(tmp_path):
+    private = tmp_path / "storage" / "private" / "runtime.json"
+    private.parent.mkdir(parents=True)
+    private.write_text(json.dumps(dict(admin_token="secret-token")))
+    backend = c.HttpBackend("http://127.0.0.1:8000", private, tmp_path)
+    calls = []
+
+    def respond(request):
+        assert request.headers["Authorization"] == "Bearer secret-token"
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={})
+
+    backend.client.close()
+    backend.client = httpx.Client(
+        base_url="http://127.0.0.1:8000",
+        headers={"Authorization": "Bearer secret-token"},
+        transport=httpx.MockTransport(respond),
+    )
+    backend.view(CONTENT)
+    backend.attach(RUN, {})
+    backend.intent(RUN, "request", {})
+    backend.observe(RUN, "request", {})
+    backend.stop(CONTENT, dict(run_id=RUN))
+    assert calls == [
+        ("GET", f"/api/v1/contents/{CONTENT}/run"),
+        ("POST", f"/api/v1/content-runs/{RUN}/host/attach"),
+        ("PUT", f"/api/v1/content-runs/{RUN}/intents/request"),
+        ("POST", f"/api/v1/content-runs/{RUN}/intents/request/observation"),
+        ("POST", f"/api/v1/contents/{CONTENT}/run/stop"),
+    ]
+    backend.close()
+    assert list(private.parent.iterdir()) == [private]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://evil:8000",
+        "https://127.0.0.1:8000",
+        "http://127.0.0.1:8000/",
+        "http://127.0.0.1:65536",
+    ],
+)
+def test_non_loopback_or_noncanonical_api_rejected_before_credentials(tmp_path, url):
+    with pytest.raises(c.ConductorError, match="API_URL_INVALID"):
+        c.HttpBackend(url, tmp_path / "absent", tmp_path)
+
+
+def test_scheduler_uses_ps7_argument_array_not_service_command_text(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "storage" / "agent-launcher-staging"
+    root.mkdir(parents=True)
+    launcher = root / "mpt-codex.ps1"
+    launcher.write_text("fixture")
+    launcher.with_suffix(".json").write_text(
+        json.dumps(
+            dict(
+                workspace=str(tmp_path),
+                scheduler_id="mpt-codex",
+                agent_id="mpt-codex",
+                role_id="scheduler",
+            )
+        )
+    )
+    plan = dict(worker_requests=[], command="evil command")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout=json.dumps(plan))
+
+    monkeypatch.setattr(c.subprocess, "run", run)
+    assert c.SchedulerPlanner(tmp_path, launcher, "mpt-codex")(RUN) == plan
+    argv, kwargs = calls[0]
+    assert argv[0] == str(c.POWERSHELL_EXECUTABLE) and argv[-2:] == ["--run-id", RUN]
+    assert (
+        "evil command" not in argv
+        and kwargs["shell"] is False
+        and kwargs["timeout"] == 30
+    )
+
+
+def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch):
+    import io
+
+    calls = []
+    process = SimpleNamespace(
+        pid=111,
+        stdin=io.StringIO(),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+        poll=lambda: 0,
+    )
+
+    def popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return process
+
+    monkeypatch.setattr(c.subprocess, "Popen", popen)
+    transport = c.NativeTransport(
+        c.NativeDesktopBinary(tmp_path / "codex.exe", "a" * 64, "0.162"), tmp_path
+    )
+    assert calls[0][0][1:] == [
+        "app-server",
+        "--stdio",
+        "-c",
+        "features.multi_agent=true",
+    ]
+    assert calls[0][1]["shell"] is False
+    assert not transport.process_alive()
+
+
+def test_parent_response_lost_persists_uncertain_without_retry(setup):
+    runner, backend, native, journal, _ = setup
+    original = native.request
+
+    def request(method, params):
+        rpc = original(method, params)
+        if method == "turn/start":
+            native.queue.clear()
+        return rpc
+
+    native.request = request
+    with pytest.raises(c.ConductorError, match="RESPONSE_UNCERTAIN"):
+        runner.run()
+    assert native.turn_count == 1 and not native.closed
+    assert (
+        journal.state["intents"][worker()["request_id"]]["state"] == "SPAWN_SEND_INTENT"
+    )
+    assert any(e[0] == "UNKNOWN" for e in backend.events)
+    assert any(e[0] == "stop" for e in backend.events)
+
+
+def test_intent_commit_failure_never_sends_native_turn(setup):
+    runner, backend, native, _, _ = setup
+
+    def intent(*args):
+        raise c.ConductorError("CONDUCTOR_BACKEND_HTTP_409")
+
+    backend.intent = intent
+    with pytest.raises(c.ConductorError, match="HTTP_409"):
+        runner.run()
+    assert native.turn_count == 0
+    assert any(e[0] == "stop" for e in backend.events)
+
+
+def test_stop_drains_same_child_before_closing_process(setup):
+    runner, backend, native, _, plans = setup
+    original = native.request
+
+    def request(method, params):
+        rpc = original(method, params)
+        if method == "thread/read":
+            terminal_child = native.queue.pop()
+            terminal_parent = native.queue.pop()
+            backend.state.update(stop_requested=True, state="draining")
+
+            def later():
+                assert not native.closed
+                assert runner.stop_reason == "CONDUCTOR_STOP_REQUESTED"
+                assert not runner.children[params["threadId"]]["terminal"]
+                native.queue.extend([terminal_parent, terminal_child])
+                native.after_empty = None
+
+            native.after_empty = later
+        return rpc
+
+    native.request = request
+    result = runner.run()
+    assert result["status"] == "CONDUCTOR_STOP_REQUESTED"
+    assert native.closed and native.turn_count == 1 and len(plans) == 1
+    assert not any(e[0] == "VERIFIED" for e in backend.events)
+    assert any(e[0] == "TERMINAL" for e in backend.events)
+
+
+def test_serial_runner_preserves_two_offers_in_one_ready_batch(setup):
+    runner, backend, native, _, plans = setup
+
+    def planner(run_id):
+        plans.append(run_id)
+        return dict(
+            contract_version=2,
+            status="READY",
+            run_id=RUN,
+            run_generation=1,
+            content_id=CONTENT,
+            worker_requests=[worker(0), worker(1)],
+        )
+
+    runner.planner = planner
+
+    def consume():
+        if not runner.current or not runner.current.get("child"):
+            return
+        finish(backend, runner)
+        if native.turn_count < 2:
+            backend.state["content_status"] = "WAITING_AGENT"
+
+    native.after_empty = consume
+    runner.run()
+    assert native.turn_count == 2 and len(plans) == 1
+    assert [e[1] for e in backend.events if e[0] == "intent"] == [
+        worker(0)["request_id"],
+        worker(1)["request_id"],
+    ]
+
+
+def test_sixteen_server_rounds_stops_new_offers(setup):
+    runner, backend, native, _, plans = setup
+    original = backend.attach
+
+    def attach(*args):
+        result = original(*args)
+        backend.state["ready_rounds"] = 16
+        return result
+
+    backend.attach = attach
+    result = runner.run()
+    assert result["status"] == "CONDUCTOR_ROUND_LIMIT"
+    assert native.turn_count == 0 and plans == [] and native.closed
+
+
+def test_expired_run_stops_without_new_worker(setup):
+    runner, backend, native, _, plans = setup
+    backend.state["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    result = runner.run()
+    assert (
+        result["status"] == "CONDUCTOR_RUN_EXPIRED"
+        and native.turn_count == 0
+        and plans == []
+    )
+
+
+@pytest.mark.parametrize("status", ["PUBLISHED", "ARCHIVED", "REJECTED", "FAILED"])
+def test_business_terminal_stops_permit_before_planning(setup, status):
+    runner, backend, native, _, plans = setup
+    backend.state["content_status"] = status
+    assert runner.run()["status"] == "CONDUCTOR_CONTENT_TERMINAL"
+    assert plans == [] and native.closed and any(e[0] == "stop" for e in backend.events)
+
+
+def test_http_error_never_exposes_response_credentials(tmp_path):
+    private = tmp_path / "storage" / "private" / "runtime.json"
+    private.parent.mkdir(parents=True)
+    private.write_text(json.dumps(dict(admin_token="secret")))
+    backend = c.HttpBackend("http://127.0.0.1:8000", private, tmp_path)
+    backend.client.close()
+    backend.client = httpx.Client(
+        base_url="http://127.0.0.1:8000",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(409, json=dict(detail="SECRET PRIVATE PAYLOAD"))
+        ),
+    )
+    with pytest.raises(c.ConductorError) as raised:
+        backend.view(CONTENT)
+    assert str(raised.value) == "CONDUCTOR_BACKEND_HTTP_409"
+    backend.close()
+
+
+def test_finished_child_heartbeat_uses_host_idle_not_terminal_intent(setup):
+    runner, backend, _, journal, _ = setup
+    bind_fixture(runner, journal)
+    runner.current.update(child=dict(child_id="child"), admitted=True)
+    runner.children["child"] = dict(terminal=True)
+    runner.last_heartbeat = -100
+    runner._heartbeat()
+    assert backend.events[-1][0:2] == ("HEARTBEAT", "host")
+    assert backend.events[-1][2]["child"] is None
+
+
+def test_actual_child_terminal_without_claim_stops_incomplete_handoff(setup):
+    runner, backend, native, _, _ = setup
+    original = backend.observe
+
+    def observe(run_id, request_id, body):
+        response = original(run_id, request_id, body)
+        if body["outcome"] == "TERMINAL":
+            backend.state["intents"][request_id].update(
+                state="TERMINAL", claimbinding_summary=dict(claim_id=None)
+            )
+        return response
+
+    backend.observe = observe
+    assert runner.run()["status"] == "CONDUCTOR_HANDOFF_NOT_CLAIMED"
+    assert native.turn_count == 1 and native.closed
+
+
+def test_attach_response_lost_reconciles_and_stops_without_spawn(setup):
+    runner, backend, native, _, _ = setup
+    original = backend.attach
+
+    def attach(*args):
+        original(*args)
+        raise c.ConductorError("CONDUCTOR_BACKEND_UNREACHABLE")
+
+    backend.attach = attach
+    with pytest.raises(c.ConductorError, match="BACKEND_UNREACHABLE"):
+        runner.run()
+    assert native.turn_count == 0 and native.closed
+    assert any(e[0] == "stop" for e in backend.events)
+
+
+def test_verified_observation_body_matches_actual_strict_backend_schema(setup):
+    from app.business.requests import (
+        HostAttachRequest,
+        HostObservationRequest,
+        SpawnIntentRequest,
+    )
+
+    runner, backend, native, _, _ = setup
+    native.after_empty = lambda: finish(backend, runner)
+    runner.run()
+    for event in backend.events:
+        if event[0] == "attach":
+            HostAttachRequest.model_validate(event[1])
+        elif event[0] == "intent":
+            SpawnIntentRequest.model_validate(event[2])
+        elif event[0] in {"VERIFIED", "TERMINAL", "HEARTBEAT"}:
+            HostObservationRequest.model_validate(event[2])
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        dict(
+            type="commandExecution",
+            command="worker --lease-token opaque_lease_0123",
+            aggregatedOutput="opaque_lease_0123",
+        ),
+        dict(
+            type="agentMessage",
+            text="opaque_lease_0123",
+            message="private business prompt",
+        ),
+        dict(
+            type="mcpToolCall",
+            arguments=dict(lease="opaque_lease_0123"),
+            result=dict(token="opaque_lease_0123"),
+        ),
+    ],
+)
+def test_opaque_lease_tokens_never_persist_even_without_secret_prefix(tmp_path, item):
+    journal = c.Journal(tmp_path / "private", RUN, CONTENT)
+    message = dict(
+        method="item/completed",
+        params=dict(threadId="parent", turnId="turn", item=dict(id="call", **item)),
+    )
+    summary = c.event_summary(message)
+    journal.record("native", summary)
+    journal.close()
+    assert summary["payload_bytes"] > 0 and len(summary["payload_sha256"]) == 64
+    assert (
+        "opaque_lease_0123"
+        not in journal.log_path.read_text() + journal.path.read_text()
+    )
+    assert "private business prompt" not in journal.log_path.read_text()
+
+
+def test_no_task_is_final_only_without_pending_or_inflight_handles(setup):
+    runner, backend, native, _, plans = setup
+
+    def planner(run_id):
+        plans.append(run_id)
+        return dict(
+            contract_version=2,
+            status="NO_TASK",
+            run_id=RUN,
+            run_generation=1,
+            content_id=CONTENT,
+            worker_requests=[],
+        )
+
+    runner.planner = planner
+    assert runner.run()["status"] == "CONDUCTOR_NO_TASK"
+    assert native.closed and native.turn_count == 0 and len(plans) == 1
+
+
+def test_accepted_pending_consumption_drives_controlled_plan_maintenance(setup):
+    runner, backend, native, _, plans = setup
+    first_planner = runner.planner
+
+    def planner(run_id):
+        if not backend.state["intents"]:
+            return first_planner(run_id)
+        plans.append(run_id)
+        finish(backend, runner)
+        return dict(
+            contract_version=2,
+            status="NO_TASK",
+            run_id=RUN,
+            run_generation=1,
+            content_id=CONTENT,
+            worker_requests=[],
+        )
+
+    runner.planner = planner
+
+    def accepted():
+        if runner.current and runner.current.get("child"):
+            w = runner.current["worker"]
+            backend.state["intents"][w["request_id"]]["claimbinding_summary"] = dict(
+                claim_id="claim",
+                task_id=w["task_id"],
+                task_status="COMPLETED",
+                accepted=True,
+                consumed=False,
+                accepted_result_hash="a" * 64,
+                consumed_result_hash=None,
+            )
+            native.after_empty = None
+
+    native.after_empty = accepted
+    assert runner.run()["status"] == "CONDUCTOR_CONTENT_TERMINAL"
+    assert len(plans) == 2 and native.turn_count == 1
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        dict(host_epoch=2),
+        dict(parent_thread_id="foreign"),
+        dict(process_identity={"pid": 999}),
+    ],
+)
+def test_existing_host_without_intents_rejected_before_initialize(setup, foreign):
+    runner, backend, native, _, _ = setup
+    backend.state.update(foreign)
+    with pytest.raises(c.ConductorError, match="RUN_NOT_FRESH"):
+        runner.run()
+    assert native.sent == []
+    assert backend.events == []
+
+
+def test_main_rejects_healthy_host_before_constructing_new_process(
+    tmp_path, monkeypatch
+):
+    backend = FakeBackend()
+    backend.state.update(
+        host_epoch=1,
+        parent_thread_id="healthy",
+        process_identity=dict(pid=999),
+        state="running",
+    )
+    backend.close = lambda: None
+    monkeypatch.setattr(c, "HttpBackend", lambda *args: backend)
+
+    def forbidden(*args):
+        pytest.fail("Existing host must be rejected before native discovery/Popen")
+
+    monkeypatch.setattr(c, "resolve_native_desktop_binary", forbidden)
+    monkeypatch.setattr(c, "NativeTransport", forbidden)
+    assert (
+        c.main(
+            [
+                "--workspace",
+                str(tmp_path),
+                "--api-url",
+                "http://127.0.0.1:8000",
+                "--runtime-private",
+                str(tmp_path / "storage" / "private" / "runtime.json"),
+                "--scheduler-launcher",
+                str(tmp_path / "unused.ps1"),
+                "--run-id",
+                RUN,
+                "--content-id",
+                CONTENT,
+            ]
+        )
+        == 20
+    )
+    assert backend.events == []
+
+
+def test_foreign_epoch_on_reconcile_never_requests_stop(setup):
+    runner, backend, native, _, _ = setup
+    original = backend.attach
+
+    def attach(*args):
+        result = original(*args)
+        backend.state.update(host_epoch=2)
+        return result
+
+    backend.attach = attach
+    with pytest.raises(c.ConductorError, match="GENERATION_CHANGED"):
+        runner.run()
+    assert native.turn_count == 0
+    assert not any(event[0] == "stop" for event in backend.events)
+
+
+def test_lost_attach_foreign_process_not_stopped(setup):
+    runner, backend, native, _, _ = setup
+    original = backend.attach
+
+    def attach(*args):
+        original(*args)
+        backend.state["process_identity"]["instance_id"] = "foreign"
+        raise c.ConductorError("CONDUCTOR_BACKEND_UNREACHABLE")
+
+    backend.attach = attach
+    with pytest.raises(c.ConductorError, match="BACKEND_UNREACHABLE"):
+        runner.run()
+    assert native.turn_count == 0
+    assert not any(event[0] == "stop" for event in backend.events)
+
+
+def test_machine_stop_cas_rejects_takeover_after_view(setup):
+    runner, backend, native, _, _ = setup
+    backend.state["content_status"] = "PUBLISHED"
+    attempts = []
+
+    def stop(content_id, expected_binding):
+        attempts.append(copy.deepcopy(expected_binding))
+        backend.state.update(host_epoch=2, parent_thread_id="replacement")
+        raise c.ConductorError("CONDUCTOR_BACKEND_HTTP_409")
+
+    backend.stop = stop
+    with pytest.raises(c.ConductorError, match="HTTP_409"):
+        runner.run()
+    assert len(attempts) == 1
+    assert (
+        attempts[0]["host_epoch"] == 1 and attempts[0]["parent_thread_id"] == "parent"
+    )
+    assert attempts[0]["process_identity"] == native.identity
+    assert backend.state["state"] == "running" and not backend.state.get(
+        "stop_requested"
+    )
+
+
+def test_all_machine_stops_have_exact_own_binding(setup):
+    runner, backend, native, _, _ = setup
+    backend.state["content_status"] = "PUBLISHED"
+    runner.run()
+    stops = [event for event in backend.events if event[0] == "stop"]
+    assert len(stops) == 1
+    assert stops[0][2] == dict(
+        run_id=RUN,
+        generation=1,
+        host_epoch=1,
+        parent_thread_id="parent",
+        process_identity=native.identity,
+    )

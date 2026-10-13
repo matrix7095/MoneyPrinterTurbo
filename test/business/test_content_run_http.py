@@ -60,13 +60,107 @@ def selected(http, runtime, name):
         return content_id, task.id
 
 
-def start(http, content_id):
-    response = http.post(f"/api/v1/contents/{content_id}/run", headers=ADMIN)
+def attach_fixture_host(http, run):
+    import os
+    import sys
+    from pathlib import Path
+
+    response = http.post(
+        f"/api/v1/content-runs/{run['run_id']}/host/attach",
+        headers=ADMIN,
+        json={
+            "generation": run["generation"],
+            "expected_host_epoch": run.get("host_epoch", 0),
+            "parent_thread_id": "fixture-parent",
+            "process_identity": {
+                "pid": os.getpid(),
+                "started_at": "2026-10-01T00:00:00+00:00",
+                "instance_id": "fixture-instance",
+                "binary_path": sys.executable,
+                "binary_sha256": hashlib.sha256(
+                    Path(sys.executable).read_bytes()
+                ).hexdigest(),
+                "version": "test-host",
+            },
+        },
+    )
     assert response.status_code == 200, response.text
     return response.json()
 
 
+def fixture_child(worker):
+    child_id = "fixture-child-" + worker["request_id"].rsplit(":", 1)[-1]
+    return {
+        "child_id": child_id,
+        "parent_thread_id": "fixture-parent",
+        "native_agent_type": worker["native_agent_type"],
+        "model": worker["model"],
+        "reasoning_effort": worker["reasoning_effort"],
+        "ephemeral": True,
+        "started": {
+            "parent_thread_id": "fixture-parent",
+            "parent_turn_id": "fixture-turn",
+            "item_id": "fixture-item",
+            "agent_path": "/root/" + worker["title"],
+            "child_id": child_id,
+        },
+        "metadata_rpc_id": 1,
+        "issued_prompt_sha256": hashlib.sha256(worker["prompt"].encode()).hexdigest(),
+    }
+
+
+def verify_fixture_worker(http, worker):
+    path = f"/api/v1/content-runs/{worker['run_id']}/intents/{worker['request_id']}"
+    http.put(
+        path,
+        headers=ADMIN,
+        json={
+            "generation": worker["run_generation"],
+            "host_epoch": worker["host_epoch"],
+            "event_id": "spawn-" + worker["request_id"],
+            "offer_hash": worker["offer_hash"],
+        },
+    )
+    return http.post(
+        path + "/observation",
+        headers=ADMIN,
+        json={
+            "generation": worker["run_generation"],
+            "host_epoch": worker["host_epoch"],
+            "event_id": "verified-" + worker["request_id"],
+            "outcome": "VERIFIED",
+            "child": fixture_child(worker),
+        },
+    )
+
+
+def terminal_fixture_worker(http, worker):
+    response = http.post(
+        f"/api/v1/content-runs/{worker['run_id']}/intents/{worker['request_id']}/observation",
+        headers=ADMIN,
+        json={
+            "generation": worker["run_generation"],
+            "host_epoch": worker["host_epoch"],
+            "event_id": "terminal-" + worker["request_id"],
+            "outcome": "TERMINAL",
+            "child": fixture_child(worker),
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def start(http, content_id, *, attach=True):
+    response = http.post(f"/api/v1/contents/{content_id}/run", headers=ADMIN)
+    assert response.status_code == 200, response.text
+    run = response.json()
+    if attach and run["state"] in {"awaiting_host", "running"}:
+        attach_fixture_host(http, run)
+        run = http.get(f"/api/v1/contents/{content_id}/run", headers=ADMIN).json()
+    return run
+
+
 def scoped_dispatch(http, worker, **overrides):
+    verify_fixture_worker(http, worker)
     agent = client_for(http, worker["role_id"])
     body = {
         "agent_id": worker["agent_id"],
@@ -112,7 +206,9 @@ def test_admin_unique_idempotent_run_and_unchanged_private_config(system):
         == 401
     )
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda _: start(http, content_id), range(4)))
+        results = list(
+            pool.map(lambda _: start(http, content_id, attach=False), range(4))
+        )
     assert len({item["run_id"] for item in results}) == 1
     assert all(
         item["state"] == "awaiting_host" and item["execution_mode"] == "contract_only"
@@ -262,10 +358,12 @@ def test_invalid_scope_cannot_claim_or_charge_attempt(system, invalid):
     worker = scheduler(http).scheduler_plan("mpt-codex", 2, run_id=run["run_id"])[
         "worker_requests"
     ][0]
+    assert verify_fixture_worker(http, worker).status_code == 200
     overrides = {}
     if invalid == "stop":
         stopped = http.post(f"/api/v1/contents/{target}/run/stop", headers=ADMIN).json()
-        assert stopped["state"] == "stopped"
+        assert stopped["state"] == "draining"
+        terminal_fixture_worker(http, worker)
         new = start(http, target)
         assert new["generation"] == 2 and new["run_id"] != run["run_id"]
         replacement = scheduler(http).scheduler_plan(
@@ -358,6 +456,7 @@ def test_scoped_offer_is_frozen_one_use_and_old_worker_can_drain(system):
         ]
         == "CONSUMED"
     )
+    terminal_fixture_worker(http, worker)
     assert (
         http.get(f"/api/v1/contents/{target}/run", headers=ADMIN).json()["state"]
         == "stopped"
@@ -656,6 +755,7 @@ def test_real_cli_v2_run_option_materializes_and_dispatches_frozen_scope(
     agent_config.agent_id = "mpt-codex-research"
     agent_config.workspace_dir = scheduler_config.workspace_dir
     monkeypatch.setattr(cli, "settings", lambda: agent_config)
+    assert verify_fixture_worker(http, worker).status_code == 200
     digest = hashlib.sha256(envelope.read_bytes()).hexdigest()
     dispatched = CliRunner().invoke(
         cli.app, ["dispatch-offer", "--offer", str(envelope), "--digest", digest]
@@ -754,6 +854,7 @@ def test_expired_run_with_live_lease_drains_without_extending_ttl(system):
         ]
         == "CONSUMED"
     )
+    terminal_fixture_worker(http, worker)
     assert (
         http.get(f"/api/v1/contents/{target}/run", headers=ADMIN).json()["state"]
         == "expired"

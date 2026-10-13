@@ -157,6 +157,11 @@ def filter_task_reads(session, clause):
 
 
 class IsolatedTaskService(AgentTaskService):
+    def _after_claim(self, *, task, authorization_context):
+        from app.business.content_host import record_claim
+
+        record_claim(self.session, task, authorization_context)
+
     def _authorize_claim(self, *, agent_id, task_id, role_id, runtime_info, authorization_context):
         from app.business.content_run import authorize_claim
 
@@ -204,7 +209,11 @@ class IsolatedTaskService(AgentTaskService):
             return None
         selectable = eligible_task_clause() & recoverable
         if not kwargs.get("authorization_context"):
-            selectable &= (AgentTask.status != TaskStatus.PENDING) | ~scoped_offer_clause()
+            selectable &= (
+                AgentTask.status.notin_([TaskStatus.PENDING, TaskStatus.LEASED])
+                | ((AgentTask.status == TaskStatus.LEASED) & (AgentTask.lease_expires_at >= utc_now()))
+                | ~scoped_offer_clause(self.session)
+            )
         with filter_task_reads(self.session, selectable):
             return super().claim(**kwargs)
 
@@ -228,7 +237,12 @@ class IsolatedTaskService(AgentTaskService):
         return super().require_lease(task_id, *args, **kwargs)
 
     def complete(self, *, task_id, **kwargs):
+        from app.business.content_host import accepted_binding
+
         assert_allowed(self.session, task_id=task_id)
+        task = self.session.get(AgentTask, task_id)
+        if task is not None:
+            accepted_binding(self.session, task, kwargs["agent_id"])
         return super().complete(task_id=task_id, **kwargs)
 
     def fail(self, *, task_id, **kwargs):
@@ -243,14 +257,17 @@ class IsolatedTaskService(AgentTaskService):
     def _latest_publish_intent(self, intent_key):
         existing = super()._latest_publish_intent(intent_key)
         context = getattr(self, "_mpt_publish_policy_context", None)
-        if existing is None and context is not None:
+        if context is not None:
             from app.business.publish_policy import enforce_auto_intent
+            from app.business.content_host import authorize_publish
 
             task_id, settings = context
             task = self.session.get(AgentTask, task_id)
+            authorize_publish(self.session, task)
             # Core calls this after BEGIN IMMEDIATE and before writing AUTHORIZED.
             # Its rollback/finally retains the original lease and retry semantics.
-            enforce_auto_intent(self.session, task, settings)
+            if existing is None:
+                enforce_auto_intent(self.session, task, settings)
         return existing
 
     def register_publish_intent(self, *, task_id, settings=None, **kwargs):

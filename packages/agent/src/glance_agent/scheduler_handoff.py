@@ -6,6 +6,15 @@ import re
 import shlex
 import time
 from pathlib import Path
+from glance_core.task_service import stable_hash
+
+HOST_FIELDS = ("host_epoch", "round_id", "offer_hash", "native_agent_type", "fork_turns", "title", "prompt")
+SCOPE_FROZEN_FIELDS = (
+    "request_id", "task_id", "task_type", "role_id", "skill_name", "model",
+    "reasoning_effort", "agent_id", "launcher", "scheduler_id", "run_id",
+    "run_generation", "content_id", "input_hash", "host_epoch", "round_id",
+    "title", "prompt", "native_agent_type", "fork_turns",
+)
 
 
 def offer_path(launcher: Path, request_id: str) -> Path:
@@ -34,11 +43,17 @@ def validate_worker(worker: dict, scheduler_id: str, root: Path, roles: dict) ->
     scope = ("run_id", "run_generation", "content_id", "input_hash")
     if any(field in worker for field in scope):
         if (
-            not all(field in worker for field in scope)
+            not all(field in worker for field in (*scope, *HOST_FIELDS, "scheduler_id"))
             or not re.fullmatch(r"run_[0-9a-f]{32}", str(worker["run_id"]))
             or type(worker["run_generation"]) is not int or worker["run_generation"] < 1
             or not re.fullmatch(r"content_[0-9a-f]{32}", str(worker["content_id"]))
             or not isinstance(worker["input_hash"], str) or not worker["input_hash"]
+            or type(worker["host_epoch"]) is not int or worker["host_epoch"] < 1
+            or worker["scheduler_id"] != scheduler_id
+            or worker["native_agent_type"] != "default" or worker["fork_turns"] != "none"
+            or not re.fullmatch(r"[a-z0-9_]+", str(worker["title"]))
+            or not isinstance(worker["prompt"], str) or not worker["prompt"]
+            or worker["offer_hash"] != stable_hash({key: worker[key] for key in SCOPE_FROZEN_FIELDS})
         ):
             raise ValueError("invalid content run offer")
     if not re.fullmatch(
@@ -85,7 +100,7 @@ def materialize_offer(worker: dict, scheduler_id: str, launcher: Path, deadline:
         launcher_hash=hashlib.sha256(launcher.read_bytes()).hexdigest(),
     )
     if "run_id" in worker:
-        frozen.update({key: worker[key] for key in ("run_id", "run_generation", "content_id", "input_hash")})
+        frozen.update({key: worker[key] for key in ("run_id", "run_generation", "content_id", "input_hash", *HOST_FIELDS)})
     payload = json.dumps(frozen, sort_keys=True).encode()
     digest = hashlib.sha256(payload).hexdigest()
     envelope = path.with_suffix(".json")
@@ -132,7 +147,7 @@ def materialize_offer(worker: dict, scheduler_id: str, launcher: Path, deadline:
     path.chmod(0o700)
 
 
-def consume_offer(path: Path, digest: str, config, roles: dict) -> dict:
+def read_offer(path: Path, digest: str, config, roles: dict) -> dict:
     if path != path.resolve() or path.suffix != ".json" or path.parent.name != "scheduler-offers":
         raise ValueError("invalid offer path")
     payload = path.read_bytes()
@@ -151,6 +166,11 @@ def consume_offer(path: Path, digest: str, config, roles: dict) -> dict:
     deadline = worker["deadline"]
     if not isinstance(deadline, (float, int)) or not time.time() < deadline <= time.time() + 600:
         raise ValueError("expired/invalid offer")
+    return worker
+
+
+def consume_offer(path: Path, digest: str, config, roles: dict) -> dict:
+    worker = read_offer(path, digest, config, roles)
     with path.with_suffix(".consumed").open("x"):
         pass
     return worker

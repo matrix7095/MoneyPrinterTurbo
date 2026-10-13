@@ -59,6 +59,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["Agent"])
 
 
+@router.get("/agent/content-run-offers/{request_id}/admission")
+def content_offer_admission(*, request_id: str, agent_id: str, run_id: str, generation: int,
+                            authorized_role: Annotated[AgentRole | None, Depends(require_agent)],
+                            session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_host import admission
+
+    if authorized_role is None:
+        raise HTTPException(status_code=403, detail="Admission requires the exact role token")
+    try:
+        return admission(session, request_id, role_id=authorized_role, agent_id=agent_id, run_id=run_id, generation=generation)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 @router.post("/agent/whoami")
 def whoami(
     *,

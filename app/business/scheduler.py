@@ -292,7 +292,14 @@ def active_local_media(runtime, session, content_id=None):
 
 def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
     begin_immediate(session)
+    from app.business.content_host import reserved_tasks
+
+    native_reserved = reserved_tasks(session)
     run = require_run(session, run_id) if run_id is not None else None
+    if run is not None:
+        from app.business.content_host import require_host
+
+        require_host(session, run.run_id, run.generation)
     config = load_scheduler_config(session)
     if config["scheduler_id"] != scheduler_id:
         raise KeyError("Scheduler not configured")
@@ -331,9 +338,14 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
 
         event.listen(session, "do_orm_execute", restrict)
         try:
-            planned = build_scheduler_plan(session, config, pending_content_id=run.content_id if run else None)
+            planned = build_scheduler_plan(session, config, pending_content_id=run.content_id if run else None,
+                                           reserved_tasks={key: item["task_type"] for key, item in native_reserved.items()})
         finally:
             event.remove(session, "do_orm_execute", restrict)
+        if run is not None and run.ready_rounds >= 16 and planned:
+            planned = []
+            result["blocked"].append({"reason": "CONTENT_RUN_ROUND_LIMIT"})
+        round_id = "round_" + secrets.token_hex(12)
         live = session.exec(
             select(SchedulerOffer).where(SchedulerOffer.expires_at > utc_now())
         ).all()
@@ -358,7 +370,7 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
         capacity = {}
         host_capacity = {}
         counted_tasks = set()
-        for item in [*live, *leased]:
+        for item in [*live, *leased, *native_reserved.values()]:
             if isinstance(item, SchedulerOffer):
                 task = session.get(AgentTask, item.task_id)
                 if task is None or task.task_type not in runtime.supported_task_types:
@@ -367,17 +379,22 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
                     assert_allowed(session, task_id=task.id)
                 except TaskConflictError:
                     continue
+            elif isinstance(item, dict):
+                task = None
             else:
                 task = item
-            role = primary_role_for(task.task_type).value
-            if task.id in counted_tasks:
+            task_id = item["task_id"] if isinstance(item, dict) else task.id
+            role = primary_role_for(TaskType(item["task_type"]) if isinstance(item, dict) else task.task_type).value
+            if task_id in counted_tasks:
                 continue
-            counted_tasks.add(task.id)
+            counted_tasks.add(task_id)
             capacity[role] = capacity.get(role, 0) + 1
             if isinstance(item, SchedulerOffer):
                 assigned_proof = deployment_proof(
                     session, f"{item.scheduler_id}-{role}"
                 )
+            elif isinstance(item, dict):
+                assigned_proof = deployment_proof(session, item["agent_id"])
             else:
                 assigned_proof = deployment_proof(session, task.assigned_agent_id or "")
                 if assigned_proof is None:
@@ -469,14 +486,23 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
                 }
             if run is not None:
                 task = session.get(AgentTask, item["task_id"])
-                worker_request.update(run_id=run.run_id, run_generation=run.generation, content_id=run.content_id, input_hash=task.input_hash, scheduler_id=scheduler_id)
+                worker_request.update(run_id=run.run_id, run_generation=run.generation, content_id=run.content_id, input_hash=task.input_hash, scheduler_id=scheduler_id,
+                                      host_epoch=run.host_epoch, round_id=round_id, native_agent_type="default", fork_turns="none")
                 frozen = {field: worker_request[field] for field in FROZEN_FIELDS}
+                worker_request["offer_hash"] = stable_hash(frozen)
                 session.add(AuditEvent(
                     actor_type="scheduler", actor_id=scheduler_id, entity_type="scheduler_offer",
                     entity_id=request_id, action=OFFER_ACTION,
                     metadata_json={"worker": frozen, "worker_hash": stable_hash(frozen)},
                 ))
             result["worker_requests"].append(worker_request)
+        if run is not None and result["worker_requests"]:
+            from app.business.content_run import save_run
+
+            run.ready_rounds += 1
+            save_run(session, run, "mpt_content_run_ready_round")
+            result["round_id"] = round_id
+            result["ready_rounds"] = run.ready_rounds
         result["status"] = (
             "READY"
             if result["worker_requests"]

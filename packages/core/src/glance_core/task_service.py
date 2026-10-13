@@ -770,6 +770,9 @@ class AgentTaskService:
     def _authorize_claim(self, *, agent_id, task_id, role_id, runtime_info, authorization_context):
         """Runtime-specific permits are checked inside the lease transaction."""
 
+    def _after_claim(self, *, task, authorization_context):
+        """Record runtime-specific claim associations before the lease commits."""
+
     def claim(
         self,
         *,
@@ -929,6 +932,11 @@ class AgentTaskService:
             runtime_info=runtime_info,
             claim_status="CLAIMED",
         )
+        try:
+            self._after_claim(task=task, authorization_context=authorization_context)
+        except Exception:
+            self.session.rollback()
+            raise
         self.session.commit()
         self.session.refresh(task)
         return task, lease_token

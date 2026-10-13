@@ -120,6 +120,16 @@ class AgentClient:
             response.raise_for_status()
             return response.json()
 
+    def offer_admission(self, worker: dict) -> dict[str, Any]:
+        with self._client() as client:
+            response = client.get(
+                f"/api/v1/agent/content-run-offers/{worker['request_id']}/admission",
+                params={"agent_id": worker["agent_id"], "run_id": worker["run_id"], "generation": worker["run_generation"]},
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return response.json()
+
     def confirm_claim(self, task_id: str, lease_token: str, agent_id: str) -> dict[str, Any]:
         with self._client() as client:
             response = client.post(

@@ -20,7 +20,7 @@ from glance_media.executor import NonRetryableMediaError
 from sqlmodel import Session, select
 
 from app.business.auth import require_admin
-from app.business.requests import RejectScriptRequest
+from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest
 from app.business.runtime import get_runtime, get_session
 from app.business.bundles import sha256_file
 from app.business.quarantine import quarantine_records, task_projection
@@ -29,6 +29,36 @@ from app.controllers.v1.agent import content_root
 router = APIRouter(
     prefix="/api/v1", tags=["Content"], dependencies=[Depends(require_admin)]
 )
+
+
+@router.post("/content-runs/{run_id}/host/attach")
+def attach_content_host(*, run_id: str, payload: HostAttachRequest, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_host import attach_host
+
+    try:
+        return attach_host(session, run_id, payload)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.put("/content-runs/{run_id}/intents/{request_id}")
+def content_spawn_intent(*, run_id: str, request_id: str, payload: SpawnIntentRequest, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_host import spawn_intent
+
+    try:
+        return spawn_intent(session, run_id, request_id, payload)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/content-runs/{run_id}/intents/{request_id}/observation")
+def content_host_observation(*, run_id: str, request_id: str, payload: HostObservationRequest, session: Annotated[Session, Depends(get_session)]):
+    from app.business.content_host import observe_host
+
+    try:
+        return observe_host(session, run_id, request_id, payload)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
 @router.post("/contents/{content_id}/run")
@@ -56,11 +86,11 @@ def content_run(*, content_id: str, session: Annotated[Session, Depends(get_sess
 
 
 @router.post("/contents/{content_id}/run/stop")
-def stop_content_run(*, content_id: str, session: Annotated[Session, Depends(get_session)]):
+def stop_content_run(*, content_id: str, session: Annotated[Session, Depends(get_session)], payload: StopRunRequest | None = None):
     from app.business.content_run import get_run
 
     try:
-        return get_run(session, content_id, stop=True)
+        return get_run(session, content_id, stop=True, expected_binding=payload.expected_binding if payload else None)
     except KeyError:
         raise HTTPException(status_code=404, detail="Content run not found") from None
     except TaskConflictError as exc:

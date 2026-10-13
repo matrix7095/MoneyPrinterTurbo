@@ -26,7 +26,7 @@ from pydantic import ValidationError
 
 from glance_agent.client import AgentClient
 from glance_agent.doctor import diagnostic_snapshot
-from glance_agent.scheduler_handoff import consume_offer, materialize_offer, validate_worker
+from glance_agent.scheduler_handoff import consume_offer, materialize_offer, validate_worker, read_offer
 from glance_agent.settings import PUBLISH_REQUIRED_CAPABILITIES, AgentSettings
 from glance_agent.validator import validate_result
 from glance_agent.workspace import (
@@ -1130,8 +1130,21 @@ def dispatch_offer(
 ) -> None:
     """Consume one frozen local scheduler offer, without model-transcribed identifiers."""
     try:
-        worker = consume_offer(offer, digest, settings(), _handoff_roles())
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+        config = settings()
+        roles = _handoff_roles()
+        worker = read_offer(offer, digest, config, roles)
+        if worker.get("run_id"):
+            client = AgentClient(config)
+            deadline = time.monotonic() + min(60, max(0, worker["deadline"] - time.time()))
+            while True:
+                admitted = client.offer_admission(worker)
+                if admitted.get("status") == "READY" and admitted.get("offer_hash") == worker.get("offer_hash"):
+                    break
+                if admitted.get("status") != "WAITING" or time.monotonic() >= deadline:
+                    raise ValueError("content host admission unavailable; offer was not consumed")
+                time.sleep(1)
+        worker = consume_offer(offer, digest, config, roles)
+    except (OSError, ValueError, TypeError, KeyError, httpx.HTTPError) as exc:
         typer.echo(f"HANDOFF_ERROR: {exc}")
         raise typer.Exit(DISPATCH_EXIT_ENV_FAILURE) from None
     captured = io.StringIO()

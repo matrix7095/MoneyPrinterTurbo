@@ -302,6 +302,7 @@ def build_scheduler_plan(
     *,
     handsfree: bool = False,
     pending_content_id: str | None = None,
+    reserved_tasks: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a read-only plan for pending tasks under the configured capacity.
 
@@ -326,12 +327,15 @@ def build_scheduler_plan(
     leased_by_type: dict[str, int] = {}
     pending: list[tuple[AgentTask, str]] = []
     offered_ids: set[str] = set()
+    reserved = dict(reserved_tasks or {})
+    counted_ids: set[str] = set()
     if session is not None:
         live_offers = session.exec(
             select(SchedulerOffer).where(SchedulerOffer.expires_at > now)
         ).all()
         for offer in live_offers:
             offered_ids.add(offer.task_id)
+            counted_ids.add(offer.task_id)
             leased_total += 1
             if offer.task_type:
                 leased_by_type[offer.task_type] = leased_by_type.get(offer.task_type, 0) + 1
@@ -344,14 +348,23 @@ def build_scheduler_plan(
         if task_type is None:
             continue
         if status == TaskStatus.LEASED.value:
+            counted_ids.add(task.id)
             leased_total += 1
             leased_by_type[task_type] = leased_by_type.get(task_type, 0) + 1
-        elif task.id in offered_ids:
+        elif task.id in offered_ids or task.id in reserved:
             continue
         elif (pending_content_id is None or task.content_id == pending_content_id) and (
             task.not_before is None or as_utc(task.not_before) <= now
         ):
             pending.append((task, task_type))
+
+    for task_id, task_type in reserved.items():
+        if task_id in counted_ids:
+            continue
+        if task_type not in SCHEDULABLE_TASK_TYPE_VALUES:
+            raise ValueError("Unknown reserved task type")
+        leased_total += 1
+        leased_by_type[task_type] = leased_by_type.get(task_type, 0) + 1
 
     global_remaining = max(0, config.max_parallel - leased_total)
     per_type_remaining = {

@@ -42,6 +42,12 @@ FROZEN_FIELDS = (
     "run_generation",
     "content_id",
     "input_hash",
+    "host_epoch",
+    "round_id",
+    "title",
+    "prompt",
+    "native_agent_type",
+    "fork_turns",
 )
 
 
@@ -52,7 +58,7 @@ class ContentRun(BaseModel):
     run_id: str = Field(pattern=r"^run_[0-9a-f]{32}$")
     content_id: str
     generation: int = Field(ge=1)
-    state: Literal["awaiting_host", "draining", "stopped", "expired"]
+    state: Literal["awaiting_host", "running", "draining", "stopped", "expired"]
     created_at: str
     expires_at: str
     stop_requested: bool = False
@@ -61,6 +67,10 @@ class ContentRun(BaseModel):
     process_identity: dict | None = None
     last_event_cursor: str | None = None
     offer_children: dict[str, str] = Field(default_factory=dict)
+    host_epoch: int = Field(default=0, ge=0)
+    host_observed_at: str | None = None
+    ready_rounds: int = Field(default=0, ge=0, le=16)
+    intents: dict[str, dict] = Field(default_factory=dict)
 
 
 def load_run(session):
@@ -69,6 +79,17 @@ def load_run(session):
         return None
     try:
         run = ContentRun.model_validate(json.loads(row.value))
+        from app.business.requests import HostIntentRecord, HostProcess
+
+        for intent in run.intents.values():
+            HostIntentRecord.model_validate(intent)
+        if run.process_identity is not None:
+            HostProcess.model_validate(run.process_identity)
+        if (
+            run.host_observed_at is not None
+            and datetime.fromisoformat(run.host_observed_at).tzinfo is None
+        ):
+            raise ValueError("Invalid host observation timestamp")
         dates = [
             datetime.fromisoformat(run.created_at),
             datetime.fromisoformat(run.expires_at),
@@ -136,14 +157,24 @@ def live_tasks(session, content_id):
 
 
 def refresh_run(session, run):
+    from app.business.content_host import child_work_unresolved
+
     expired = as_utc(datetime.fromisoformat(run.expires_at)) <= utc_now()
-    if run.state == "awaiting_host" and expired:
+    if run.state in {"awaiting_host", "running"} and expired:
         invalidate_offers(session, run)
         run.stop_requested = True
         run.stop_reason = "expired"
-        run.state = "draining" if live_tasks(session, run.content_id) else "expired"
+        run.state = (
+            "draining"
+            if live_tasks(session, run.content_id) or child_work_unresolved(run)
+            else "expired"
+        )
         save_run(session, run, "mpt_content_run_expired")
-    elif run.state == "draining" and not live_tasks(session, run.content_id):
+    elif (
+        run.state == "draining"
+        and not live_tasks(session, run.content_id)
+        and not child_work_unresolved(run)
+    ):
         run.state = "expired" if run.stop_reason == "expired" else "stopped"
         save_run(session, run, "mpt_content_run_drained")
     return run
@@ -155,7 +186,7 @@ def require_run(session, run_id, generation=None):
         run is None
         or run.run_id != run_id
         or (generation is not None and run.generation != generation)
-        or run.state != "awaiting_host"
+        or run.state not in {"awaiting_host", "running"}
         or run.stop_requested
         or as_utc(datetime.fromisoformat(run.expires_at)) <= utc_now()
     ):
@@ -172,16 +203,29 @@ def require_run(session, run_id, generation=None):
 
 
 def run_view(session, run):
+    from app.business.content_host import claim_summary, host_live
+
     content = session.get(Content, run.content_id)
     return {
         **run.model_dump(),
-        "execution_mode": "contract_only",
+        "execution_mode": "native_host" if run.host_epoch else "contract_only",
         "current_stage": content.current_stage if content else None,
         "content_status": content.business_status.value if content else None,
         "blocking_reason": run.stop_reason
         or (content.error_code if content else "CONTENT_MISSING")
-        or "HOST_NOT_ATTACHED",
+        or (
+            "HOST_NOT_ATTACHED"
+            if not run.host_epoch
+            else "HOST_OBSERVATION_EXPIRED"
+            if not host_live(run)
+            else ""
+        ),
         "active_task_ids": live_tasks(session, run.content_id),
+        "host_live": host_live(run),
+        "intents": {
+            key: {**intent, "claimbinding_summary": claim_summary(session, intent)}
+            for key, intent in run.intents.items()
+        },
     }
 
 
@@ -200,7 +244,7 @@ def start_run(session, content_id):
     existing = load_run(session)
     if existing:
         refresh_run(session, existing)
-        if existing.state in {"awaiting_host", "draining"}:
+        if existing.state in {"awaiting_host", "running", "draining"}:
             if existing.content_id != content_id:
                 raise TaskConflictError("CONTENT_RUN_ALREADY_ACTIVE")
             session.commit()
@@ -219,36 +263,52 @@ def start_run(session, content_id):
     return run_view(session, run)
 
 
-def get_run(session, content_id, *, stop=False):
+def get_run(session, content_id, *, stop=False, expected_binding=None):
+    from app.business.content_host import child_work_unresolved
+
     begin_immediate(session)
     if session.get(Content, content_id) is None:
         raise KeyError(content_id)
     run = load_run(session)
     if run is None or run.content_id != content_id:
         raise KeyError("Content run not found")
+    if expected_binding is not None:
+        expected = expected_binding.model_dump()
+        if {key: getattr(run, key) for key in expected} != expected:
+            session.rollback()
+            raise TaskConflictError("CONTENT_RUN_STOP_BINDING_CHANGED")
     refresh_run(session, run)
-    if stop and run.state == "awaiting_host":
+    if stop and run.state in {"awaiting_host", "running"}:
         invalidate_offers(session, run)
         run.stop_requested = True
         run.stop_reason = "operator_stop"
-        run.state = "draining" if live_tasks(session, content_id) else "stopped"
-        save_run(session, run, "mpt_content_run_stop_requested")
+        run.state = (
+            "draining"
+            if live_tasks(session, content_id) or child_work_unresolved(run)
+            else "stopped"
+        )
+        save_run(session, run, "mpt_content_run_machine_stop_requested" if expected_binding is not None else "mpt_content_run_stop_requested")
     session.commit()
     return run_view(session, run)
 
 
-def scoped_offer_clause():
+def scoped_offer_clause(session=None):
     # Only pending selection is isolated. Other content's leases still count.
     scoped = select(AuditEvent.entity_id).where(
         AuditEvent.entity_type == "scheduler_offer",
         AuditEvent.action == OFFER_ACTION,
     )
-    return AgentTask.id.in_(
+    offered = AgentTask.id.in_(
         select(SchedulerOffer.task_id).where(
             SchedulerOffer.request_id.in_(scoped),
             SchedulerOffer.expires_at > utc_now(),
         )
     )
+    if session is None:
+        return offered
+    from app.business.content_host import reserved_tasks
+
+    return offered | AgentTask.id.in_(list(reserved_tasks(session)))
 
 
 def authorize_claim(session, *, agent_id, task_id, role_id, runtime_info, scope):
@@ -261,19 +321,25 @@ def authorize_claim(session, *, agent_id, task_id, role_id, runtime_info, scope)
         )
     ).all()
     if not scope:
+        from app.business.content_host import reserved_tasks
+
         scoped = select(AuditEvent.entity_id).where(
             AuditEvent.entity_type == "scheduler_offer",
             AuditEvent.action == OFFER_ACTION,
         )
-        if receipts or (
-            task_id
-            and session.exec(
-                select(SchedulerOffer.request_id).where(
-                    SchedulerOffer.task_id == task_id,
-                    SchedulerOffer.request_id.in_(scoped),
-                    SchedulerOffer.expires_at > utc_now(),
-                )
-            ).first()
+        if (
+            receipts
+            or task_id in reserved_tasks(session)
+            or (
+                task_id
+                and session.exec(
+                    select(SchedulerOffer.request_id).where(
+                        SchedulerOffer.task_id == task_id,
+                        SchedulerOffer.request_id.in_(scoped),
+                        SchedulerOffer.expires_at > utc_now(),
+                    )
+                ).first()
+            )
         ):
             raise TaskConflictError("CONTENT_RUN_OFFER_REQUIRED")
         return
@@ -312,3 +378,6 @@ def authorize_claim(session, *, agent_id, task_id, role_id, runtime_info, scope)
         or not re.fullmatch(r"[0-9a-f]{12}", agent_id.rsplit("-", 1)[-1])
     ):
         raise TaskConflictError("CONTENT_RUN_OFFER_INVALID")
+    from app.business.content_host import require_admission
+
+    require_admission(session, worker, receipt.metadata_json["worker_hash"])
