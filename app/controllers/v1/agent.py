@@ -260,8 +260,34 @@ def dispatch(
         raise HTTPException(status_code=422, detail="A complete frozen run offer is required")
     try:
         current = effective_settings(service.session, runtime.settings)
+        from app.business.requests import DeploymentReportRequest
+        from app.business.scheduler import deployment_files
         from app.business.content_run import authorize_claim
 
+        proof = deployment_proof(service.session, payload.agent_id)
+        deployed_worker = service.session.get(AgentWorker, proof.entity_id if proof else payload.agent_id)
+        skill_path = skill_version = None
+        if proof is not None or payload.run_id is not None or (
+            deployed_worker and (deployed_worker.deployment_verified_at or deployed_worker.launcher_path)
+        ):
+            if proof is None or deployed_worker is None or not deployed_worker.deployment_verified_at:
+                raise TaskConflictError("DISPATCH_DEPLOYMENT_UNVERIFIED")
+            try:
+                launcher, _, skill = deployment_files(runtime, DeploymentReportRequest(
+                    agent_id=deployed_worker.agent_id, role_id=selected,
+                    launcher_path=deployed_worker.launcher_path,
+                    skill={"name": deployed_worker.skill_name, "path": proof.metadata_json["skill_path"],
+                           "content_hash": deployed_worker.skill_content_hash},
+                    protocol_version=deployed_worker.protocol_version,
+                ))
+                if (deployed_worker.role_id != selected.value
+                        or deployed_worker.skill_version != role_spec(selected).skill_version
+                        or hashlib.sha256(launcher.read_bytes()).hexdigest() != proof.metadata_json["launcher_sha256"]
+                        or hashlib.sha256(launcher.with_suffix(".json").read_bytes()).hexdigest() != proof.metadata_json["manifest_sha256"]):
+                    raise ValueError("Deployment changed")
+                skill_path, skill_version = str(skill), deployed_worker.skill_version
+            except (OSError, ValueError, KeyError, TypeError):
+                raise TaskConflictError("DISPATCH_DEPLOYMENT_CHANGED") from None
         authorize_claim(service.session, agent_id=payload.agent_id, task_id=payload.task_id,
                         role_id=selected, runtime_info=payload.runtime.model_dump() if payload.runtime else None,
                         scope=scope_fields if payload.run_id else None)
@@ -337,6 +363,8 @@ def dispatch(
             skill_name=role_spec(selected).skill_name,
             workspace_dir=workspace_dir,
             launcher=payload.launcher or "<启动器>",
+            skill_path=skill_path,
+            skill_version=skill_version,
         ),
         "task_id": task.id,
         "task_type": task.task_type,

@@ -248,7 +248,7 @@ def register_deployment(runtime, session, payload):
     }
 
 
-def worker_prompt(request_id, skill_name, launcher):
+def worker_prompt(request_id, skill_name, launcher, *, skill_path, skill_version):
     offer = (
         Path(launcher).parent
         / "scheduler-offers"
@@ -257,12 +257,16 @@ def worker_prompt(request_id, skill_name, launcher):
     return (
         BUSINESS_WORKER_LEAF_RULE
         + "你是本轮新建的一次性 MPT Worker，不复用或续接旧会话。"
-        f"使用 Skill `{skill_name}`；在读取业务工作区或任务内容前，只执行一次交接文件 "
+        "交接完成前不加载任何 Skill；在读取业务工作区或任务内容前，只执行一次交接文件 "
         f"`{offer}`，不传任何参数。文件已冻结服务端授权的任务、角色、模型与思考强度；"
         "禁止重写文件、手输 dispatch/claim 参数或在文件缺失时绕过交接。"
         "文件不存在或无法执行时报告 HANDOFF_ERROR 并结束。"
         "严格按启动器 stdout 行事：有明确任务 prompt 才继续；NO_TASK、AT_CAPACITY、"
         "HANDOFF_ERROR 或未知输出都立即结束，不重复 dispatch、claim 或 inspect。"
+        "交接返回明确任务 prompt 后，只使用本次已验证部署的 "
+        f"Skill `{skill_name}`，版本 `{skill_version}`：亲自读取绝对路径 "
+        f"`{Path(skill_path) / 'SKILL.md'}` 及同包 `references/` 中引用的文件。"
+        "不得以全局 Skill catalog 中同名或旧版本 Skill 代替，不猜测其他 Skill 路径。"
     )
 
 
@@ -426,13 +430,23 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
             reason = "WORKER_NOT_BOOTSTRAPPED"
             if worker and proof and worker.deployment_verified_at:
                 try:
+                    from app.business.requests import DeploymentReportRequest
+
                     launcher = Path(worker.launcher_path)
                     data = proof.metadata_json
+                    deployment_files(runtime, DeploymentReportRequest(
+                        agent_id=worker.agent_id, role_id=role,
+                        launcher_path=worker.launcher_path,
+                        skill={"name": worker.skill_name, "path": data["skill_path"],
+                               "content_hash": worker.skill_content_hash},
+                        protocol_version=worker.protocol_version,
+                    ))
                     host = data["device_label"]
                     if not host:
                         raise ValueError("Deployment host is unpinned")
                     if (
-                        hashlib.sha256(launcher.read_bytes()).hexdigest()
+                        worker.skill_version != role_spec(role).skill_version
+                        or hashlib.sha256(launcher.read_bytes()).hexdigest()
                         != data["launcher_sha256"]
                         or hashlib.sha256(
                             launcher.with_suffix(".json").read_bytes()
@@ -483,7 +497,8 @@ def scheduler_plan(runtime, session, scheduler_id, *, run_id=None):
                     "agent_id": fresh_id,
                     "launcher": worker.launcher_path,
                     "prompt": worker_prompt(
-                        request_id, role_spec(role).skill_name, worker.launcher_path
+                        request_id, role_spec(role).skill_name, worker.launcher_path,
+                        skill_path=data["skill_path"], skill_version=worker.skill_version,
                     ),
                 }
             if run is not None:

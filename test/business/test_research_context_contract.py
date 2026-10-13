@@ -10,16 +10,17 @@ from fastapi.testclient import TestClient
 from glance_agent import cli
 from glance_agent.scheduler_handoff import materialize_offer, offer_path, read_offer
 from glance_core.agent_roles import role_spec
-from glance_core.models import AgentTask, AuditEvent, TaskStatus, TaskType, RightsStatus
+from glance_core.models import AgentTask, AgentWorker, AuditEvent, TaskStatus, TaskType, RightsStatus
 from glance_core.task_instructions import BUSINESS_WORKER_LEAF_RULE, render_dispatch_task_prompt
 from glance_core.task_service import stable_hash
 from sqlmodel import Session, select
 
 from app.business.content_run import FROZEN_FIELDS, OFFER_ACTION
+from app.business.quarantine import deployment_proof
 from test.business.test_agent_failure_recovery import registered_client
 from test.business.test_agent_launcher_staging import staged as staged
 from test.business.test_content_http import client_for
-from test.business.test_content_run_http import start, system as system
+from test.business.test_content_run_http import scoped_dispatch, start, system as system
 from test.business.test_deployment_http import app_for, scheduler
 from test.business.test_discovery_http import ADMIN, make_runtime
 
@@ -33,6 +34,13 @@ def assert_leaf_prompt(prompt):
     assert "亲自 confirm-claim、执行任务、validate 和 submit" in prompt
     assert "不得 spawn/create 子代理" in prompt
     assert "通用的并行代理建议不适用于本业务叶子任务" in prompt
+
+
+def assert_deployed_skill_prompt(prompt, path, version):
+    assert f"版本 `{version}`" in prompt
+    assert f"`{Path(path) / 'SKILL.md'}`" in prompt
+    assert "同包 `references/` 中引用的文件" in prompt
+    assert "不得以全局 Skill catalog 中同名或旧版本 Skill 代替" in prompt
 
 
 def select_official_research(http, runtime):
@@ -64,6 +72,9 @@ def test_new_url_only_research_dispatch_bundle_and_sdk_require_no_undeclared_con
         assert dispatched["should_run"] is True
         assert dispatched["task_id"] == task_id
         assert_leaf_prompt(dispatched["prompt"])
+        with Session(runtime.engine) as session:
+            proof = deployment_proof(session, worker.settings.agent_id)
+            assert_deployed_skill_prompt(dispatched["prompt"], proof.metadata_json["skill_path"], "1.2.1")
         assert "未声明或空清单不要求 context/ 目录" in dispatched["prompt"]
         assert "无预置素材不属于 CONTEXT_MISSING" in dispatched["prompt"]
         worker.confirm_claim(task_id, dispatched["lease_token"], worker.settings.agent_id)
@@ -152,6 +163,17 @@ def test_actual_scoped_research_offer_freezes_leaf_prompt_and_preserves_input(sy
     worker = plan["worker_requests"][0]
     assert worker["task_id"] == task_id
     assert_leaf_prompt(worker["prompt"])
+    with Session(runtime.engine) as session:
+        proof = deployment_proof(session, worker["agent_id"])
+        base = session.get(AgentWorker, proof.entity_id)
+        path = proof.metadata_json["skill_path"]
+        assert proof.entity_id == "mpt-codex-research" != worker["agent_id"]
+        manifest = Path(base.launcher_path).with_suffix(".json")
+        assert hashlib.sha256(manifest.read_bytes()).hexdigest() == proof.metadata_json["manifest_sha256"]
+        assert json.loads(manifest.read_text(encoding="utf-8"))["skill_path"] == path
+        assert_deployed_skill_prompt(worker["prompt"], path, base.skill_version)
+    assert "交接完成前不加载任何 Skill" in worker["prompt"]
+    assert "交接返回明确任务 prompt 后" in worker["prompt"]
     assert "只执行一次交接文件" in worker["prompt"]
     assert "不传任何参数" in worker["prompt"]
     assert "禁止重写文件、手输 dispatch/claim 参数" in worker["prompt"]
@@ -172,9 +194,95 @@ def test_actual_scoped_research_offer_freezes_leaf_prompt_and_preserves_input(sy
     agent.settings.agent_id = "mpt-codex-research"
     restored = read_offer(envelope, hashlib.sha256(payload).hexdigest(), agent.settings, cli._handoff_roles())
     assert restored["prompt"] == worker["prompt"] and restored["offer_hash"] == worker["offer_hash"]
+    dispatched = scoped_dispatch(http, worker)
+    assert dispatched.status_code == 200, dispatched.text
+    assert_deployed_skill_prompt(dispatched.json()["prompt"], path, "1.2.1")
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        assert task.assigned_agent_id == worker["agent_id"]
+        assert task.input_data == before["input_data"] and task.input_hash == before["input_hash"]
+        assert task.attempt == before["attempt"] == 0 and task.max_attempts == before["max_attempts"]
     # Removing the leaf rule cannot retain the server's signed authorization.
     restored["prompt"] = restored["prompt"].removeprefix(BUSINESS_WORKER_LEAF_RULE)
     envelope.write_text(json.dumps(restored, ensure_ascii=False), encoding="utf-8")
     altered_digest = hashlib.sha256(envelope.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="invalid content run offer"):
         read_offer(envelope, altered_digest, agent.settings, cli._handoff_roles())
+
+
+def test_generic_dispatch_without_mpt_proof_keeps_name_only_prompt(tmp_path):
+    runtime = make_runtime(tmp_path)
+    with TestClient(app_for(runtime, tmp_path)) as http:
+        _, task_id = select_official_research(http, runtime)
+        agent = client_for(http, "research")
+        result = agent.dispatch(wait=0, task_id=task_id, task_type="content_research",
+                                launcher="C:/generic/research.ps1")
+        assert result["should_run"]
+        assert result["prompt"] == render_dispatch_task_prompt(
+            task_id=task_id, task_type="content_research", skill_name="glance-research-agent",
+            workspace_dir=result["workspace_dir"], launcher="C:/generic/research.ps1")
+        assert "本次已验证部署" not in result["prompt"]
+        with Session(runtime.engine) as session:
+            assert deployment_proof(session, agent.settings.agent_id) is None
+
+
+@pytest.mark.parametrize("kind", [TaskType.CONTENT_RESEARCH, TaskType.CONTENT_QC])
+def test_actual_dispatch_binds_research_and_script_staged_skill(tmp_path, kind):
+    runtime = make_runtime(tmp_path)
+    with TestClient(app_for(runtime, tmp_path)) as http:
+        content_id, task_id = select_official_research(http, runtime)
+        if kind == TaskType.CONTENT_QC:
+            with Session(runtime.engine) as session:
+                task_id = runtime.workflow_service(session).create_agent_task(
+                    content_id, kind, {"schema_version": 3}, allow_multiple=True).id
+        role = "research" if kind == TaskType.CONTENT_RESEARCH else "script"
+        agent = registered_client(http, runtime, role)
+        with Session(runtime.engine) as session:
+            before = session.get(AgentTask, task_id).model_dump(mode="json")
+            proof = deployment_proof(session, agent.settings.agent_id)
+            path = proof.metadata_json["skill_path"]
+        result = agent.dispatch(wait=0, task_id=task_id, task_type=kind.value, launcher="C:/client/ignored.ps1")
+        assert_deployed_skill_prompt(result["prompt"], path, role_spec(role).skill_version)
+        with Session(runtime.engine) as session:
+            task = session.get(AgentTask, task_id)
+            assert task.input_data == before["input_data"] and task.input_hash == before["input_hash"]
+            assert task.attempt == before["attempt"] and task.max_attempts == before["max_attempts"]
+
+
+@pytest.mark.parametrize("damage", ["proof_missing", "path_missing", "global_path", "manifest", "skill", "version"])
+def test_bad_marked_mpt_deployment_rejects_before_dispatch_without_consuming_task(tmp_path, damage):
+    runtime = make_runtime(tmp_path)
+    with TestClient(app_for(runtime, tmp_path)) as http:
+        _, task_id = select_official_research(http, runtime)
+        agent = registered_client(http, runtime, "research")
+        with Session(runtime.engine) as session:
+            before = session.get(AgentTask, task_id).model_dump(mode="json")
+            proof = deployment_proof(session, agent.settings.agent_id)
+            base = session.get(AgentWorker, proof.entity_id)
+            if damage == "proof_missing":
+                session.delete(proof)
+            elif damage in {"path_missing", "global_path"}:
+                data = dict(proof.metadata_json)
+                data.pop("skill_path")
+                if damage == "global_path":
+                    data["skill_path"] = str(tmp_path / "global-catalog/glance-research-agent")
+                proof.metadata_json = data
+                session.add(proof)
+            elif damage == "manifest":
+                manifest = Path(base.launcher_path).with_suffix(".json")
+                manifest.write_bytes(manifest.read_bytes() + b"\n")
+            elif damage == "skill":
+                (Path(proof.metadata_json["skill_path"]) / "SKILL.md").write_text("changed", encoding="utf-8")
+            else:
+                base.skill_version = "1.2.0"
+                session.add(base)
+            session.commit()
+        response = http.post("/api/v1/agent/dispatch?wait=0", headers=agent._headers(), json={
+            "agent_id": agent.settings.agent_id, "role_id": "research", "task_id": task_id,
+            "task_type": "content_research", "launcher": "C:/client/research.ps1",
+        })
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == ("DISPATCH_DEPLOYMENT_UNVERIFIED" if damage == "proof_missing"
+                                               else "DISPATCH_DEPLOYMENT_CHANGED")
+        with Session(runtime.engine) as session:
+            assert session.get(AgentTask, task_id).model_dump(mode="json") == before

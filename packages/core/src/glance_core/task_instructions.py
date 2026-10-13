@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from glance_core.models import TaskType
 
 BUSINESS_WORKER_LEAF_RULE = (
@@ -1270,15 +1272,27 @@ def render_dispatch_task_prompt(
     skill_name: str,
     workspace_dir: str,
     launcher: str = "<启动器>",
+    skill_path: str | None = None,
+    skill_version: str | None = None,
 ) -> str:
     """dispatch 命中任务时下发给宿主会话的完整任务 prompt。
 
     Skill 引用只出现在有任务的输出中——无任务轮次不触发技能加载。
     """
+    if (skill_path is None) != (skill_version is None):
+        raise ValueError("Deployed Skill path and version must be supplied together")
+    deployed_skill = (
+        "只使用本次已验证部署的 "
+        f"Skill `{skill_name}`，版本 `{skill_version}`：在 confirm-claim 后亲自读取绝对路径 "
+        f"`{Path(skill_path) / 'SKILL.md'}` 及同包 `references/` 中引用的文件。"
+        "不得以全局 Skill catalog 中同名或旧版本 Skill 代替，不猜测其他 Skill 路径。"
+        if skill_path is not None and skill_version is not None else ""
+    )
     return (
         BUSINESS_WORKER_LEAF_RULE
         + f"使用 Skill `{skill_name}` 处理 Glance 任务 `{task_id}`（类型 `{task_type}`）。"
-        f"所有 glance-agent 命令必须通过启动器 `{launcher}` 执行。"
+        + deployed_skill
+        + f"所有 glance-agent 命令必须通过启动器 `{launcher}` 执行。"
         f"第一步先执行 `confirm-claim {task_id}` 把预约租约转为正式租约；"
         f"工作区已就绪：`{workspace_dir}`，直接读取其中的 instructions.md 与 "
         "input.json 开始工作，不要运行 inspect；先确认必需输入完整，"
