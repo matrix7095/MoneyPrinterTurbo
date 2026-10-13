@@ -999,7 +999,15 @@ def acceptance_subject(
     return subject
 
 
-JOINT_VISUAL_MOTIONS = frozenset({"pan_right", "ken_burns_in"})
+JOINT_VISUAL_MOTIONS = frozenset({"pan_right", "pan_left", "ken_burns_in", "ken_burns_out", "focus_product"})
+# The fixed image_card renderer uses 30 output frames/second and then clamps.
+JOINT_VISUAL_ACTIVE_SECONDS = {
+    "pan_left": 240 / 30,
+    "pan_right": 240 / 30,
+    "focus_product": 240 / 30,
+    "ken_burns_in": 280 / 30,
+    "ken_burns_out": 280 / 30,
+}
 # hard_cut: independently observed 32-frame positive and one-frame boundary fault clips.
 JOINT_VISUAL_TRANSITIONS = frozenset({"short_fade", "hard_cut"})
 
@@ -1129,9 +1137,11 @@ def verify_visual_joint_evidence(root: Path, evidence: dict, review: dict | None
             raise ValueError("VISUAL_REVIEW_SEGMENT_MISMATCH")
         run_start = None
         previous_sha = None
+        active_end = min(segment["narration_end_sec"], segment["narration_start_sec"]
+                         + JOINT_VISUAL_ACTIVE_SECONDS[segment.get("motion", "ken_burns_in")])
         for frame in frames:
             time = seconds(frame["pts_seconds"])
-            if not segment["narration_start_sec"] + .2 <= time < segment["narration_end_sec"]:
+            if not segment["narration_start_sec"] + .2 <= time < active_end:
                 continue
             if frame["sha256"] != previous_sha:
                 run_start, previous_sha = time, frame["sha256"]

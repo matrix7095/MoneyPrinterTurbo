@@ -3,14 +3,15 @@
 import hashlib
 import json
 import shutil
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from fastapi.testclient import TestClient
-from glance_core.content_acceptance import acceptance_subject, resolved_visual_plan, source_context, verify_acceptance, verify_visual_joint_evidence
+from glance_core.content_acceptance import JOINT_VISUAL_ACTIVE_SECONDS, acceptance_subject, joint_visual_plan_supported, resolved_visual_plan, source_context, verify_acceptance, verify_visual_joint_evidence
 from glance_core.task_schemas import CONTENT_ACCEPTANCE_CHECKS, result_model_for
 from glance_core.models import AgentTask, Artifact, AuditEvent, Candidate, CandidateStatus, Content, ContentStatus, ProductionMode, RightsStatus, TaskStatus, TaskType
 from glance_media.frame_evidence import generate_frame_evidence
@@ -431,3 +432,93 @@ def test_real_visual_collection_creates_new_full_packs_without_claiming_observat
             assert first["manifest"]["review"]["observed_by_reviewer"] is False
             audio["video_sha256"] = artifact.sha256
             verify_visual_joint_evidence(root, first, None, audio, resolved_visual_plan(session, plan), passed=False)
+
+
+@pytest.fixture(scope="module", params=["pan_left", "pan_right", "focus_product", "ken_burns_in", "ken_burns_out"])
+def real_capped_motion(request, tmp_path_factory):
+    """Real visual render/decode only; synthetic audio/review stand-ins do not assert semantic QC."""
+    from glance_media.executor import _with_transition, layout_filter
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg/ffprobe required for real cap regression")
+    motion = request.param
+    root = tmp_path_factory.mktemp(f"motion-cap-{motion}")
+    image = Image.new("RGB", (1080, 1920), (245, 245, 235))
+    draw = ImageDraw.Draw(image)
+    for x in range(0, 1080, 90):
+        draw.line((x, 0, x, 1919), fill=(150, 165, 170), width=3)
+    for y in range(0, 1920, 120):
+        draw.line((0, y, 1079, y), fill=(150, 165, 170), width=3)
+    draw.rectangle((220, 450, 850, 1480), fill=(40, 110, 180), outline="black", width=12)
+    draw.ellipse((350, 700, 700, 1050), fill=(230, 180, 30), outline="white", width=8)
+    asset = root / "source.png"
+    image.save(asset)
+    frames_count = 270 if JOINT_VISUAL_ACTIVE_SECONDS[motion] == 8 else 300
+    duration = frames_count / 30
+    template = _with_transition(layout_filter("image_card", motion=motion), "hard_cut")
+    normal_video = root / "normal.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-loop", "1", "-i", str(asset),
+                    "-vf", template, "-frames:v", str(frames_count), "-threads", "1", "-c:v", "libx264",
+                    "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p", str(normal_video)],
+                   check=True, capture_output=True, timeout=120)
+    early_video = root / "early.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(normal_video), "-vf",
+                    "trim=end_frame=30,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=12",
+                    "-frames:v", str(frames_count), "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-qp", "0", "-pix_fmt", "yuv420p", str(early_video)],
+                   check=True, capture_output=True, timeout=120)
+    plan = {"segments": [{"asset_id": "motion-source", "layout": "image_card", "motion": motion,
+                           "transition": "hard_cut", "narration_start_sec": 0, "narration_end_sec": duration}]}
+    packs = {}
+    for name, video in (("normal", normal_video), ("early", early_video)):
+        manifest_path = generate_frame_evidence(video, digest(video), root / name, timed=True)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        subtitle = manifest_path.parent / "narration.ass"
+        subtitle.write_text("Synthetic cap validation subtitle binding", encoding="utf-8")
+        manifest.update(visual_plan=plan, render_templates=[template], subtitles={"path": subtitle.name,
+                        "sha256": digest(subtitle), "events": [{"index": 0, "start_sec": 0,
+                                                                "end_sec": duration, "text": "产品"}]})
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        evidence = {"manifest_path": manifest_path.relative_to(root).as_posix(), "manifest_sha256": digest(manifest_path),
+                    "manifest": manifest}
+        review = {"method": "native_contact_pages_asr_pcm", "video_sha256": digest(video),
+                  "manifest_sha256": evidence["manifest_sha256"], "realtime_motion_observed": False,
+                  "realtime_motion_required": False, "limitations": "Synthetic validator test; no native semantic acceptance.",
+                  "pages": [{"page_index": page["page_index"], "sha256": page["sha256"],
+                             "frame_indices": page["frame_indices"], "observed": True,
+                             "observation": "Contract observation stand-in only."} for page in manifest["pages"]],
+                  "segments": [{"segment_index": 0, "frame_index": 0, "pts_sec": 0, "motion_continuous": True,
+                                "observation": "Expected cap then hold; this tests active-window binding only."}],
+                  "boundaries": [], "subtitle_alignment": [{"event_index": 0, "word_indices": [0], "observed_sync": True,
+                                                              "observation": "Synthetic alignment stand-in only."}]}
+        audio = {"video_sha256": digest(video), "method": "local_asr_and_pcm", "asr_status": "available",
+                 "signal_status": "available", "signal": {"duration_sec": duration, "sample_rate_hz": 16000,
+                     "channels": 1, "decoded_pcm_sha256": "c" * 64, "window_sec": .1,
+                     "rms_dbfs": [-20] * round(duration * 10), "peak_amplitude": .5, "full_scale_sample_fraction": 0},
+                 "segments": [{"start_sec": 0, "end_sec": duration, "words": [
+                     {"word": "产品", "start_sec": 0, "end_sec": duration, "probability": .99}]}]}
+        packs[name] = (root, evidence, review, audio, plan)
+    return motion, packs
+
+
+def test_real_renderer_cap_hold_is_expected_and_early_freeze_is_rejected(real_capped_motion):
+    motion, packs = real_capped_motion
+    assert joint_visual_plan_supported(packs["normal"][-1])
+    frames = packs["normal"][1]["manifest"]["frames"]
+    assert frames[-1]["sha256"] == frames[-10]["sha256"]
+    # Chroma-aligned crop steps can repeat several frames while movement continues.
+    assert len({frame["sha256"] for frame in frames[:30]}) > 3
+    assert float(frames[-10]["pts_seconds"]) > JOINT_VISUAL_ACTIVE_SECONDS[motion]
+    verify(packs["normal"])
+    with pytest.raises(ValueError, match="REPEATED_MOVING_FRAMES"):
+        verify(packs["early"])
+    assert packs["normal"][1]["manifest"]["review"]["observed_by_reviewer"] is False
+
+
+def test_expected_cap_hold_never_waives_native_pacing_hard_gate(joint_pack):
+    result = {"passed": True, "issues": [], "contract_version": 2, "confidence": "high",
+              "subject": {"video_sha256": "a" * 64}, "visual_review": deepcopy(joint_pack[2]),
+              "checks": {key: {"passed": key != "pacing", "evidence": "Expected hold still has unacceptable pacing"}
+                         for key in CONTENT_ACCEPTANCE_CHECKS}}
+    with pytest.raises(ValueError, match="every hard check"):
+        result_model_for(TaskType.CONTENT_QC, "3").model_validate(result)

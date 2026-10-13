@@ -20,6 +20,10 @@ description: 处理 Glance 平台签发的深度内容研究任务。用于外�
 1. 只处理周期 `dispatch` 返回的明确任务；先按任务提示执行 `confirm-claim <task_id>`。
    `NO_TASK` 或 `AT_CAPACITY` 时直接结束本轮，不运行 `claim`、`inspect` 或重复 `dispatch`。
 2. 读取本轮已准备好的工作区、`instructions.md`、`input.json`、历史记录和结果 Schema。
+   `image_only` 可仅有合法公开的 `candidate.source_url` 等来源 URL：没有原片、空 `transcript`、
+   未声明或为空的 `context_files` / `context_manifest` 都不属于 `CONTEXT_MISSING`，
+   不要求 `context/` 目录；直接从公开 URL 联网核查，`source_images` 是本次应收集的输出。
+   仅核验明确声明的非空必需素材清单；其中缺文件或哈希不符仍须失败，不猜路径或伪造素材。
 3. 优先使用项目官网、原始仓库、论文和发布公告；区分事实、推断和未知信息。
 4. 检索预算：先列待核验要点清单再检索，同一要点搜索不超过 2 次，全任务搜索加
    抓取总预算不超过 20 次；独立的检索调用合并为一批并行发出。

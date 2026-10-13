@@ -87,6 +87,7 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         required=True,
         requirement_tags=("旗舰",),
         recommended_wake_minutes=30,
+        skill_version="1.2.0",
     ),
     AgentRole.SCRIPT: AgentRoleSpec(
         role=AgentRole.SCRIPT,

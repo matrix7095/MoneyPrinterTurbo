@@ -249,6 +249,13 @@ _CONTENT_RESEARCH = """\
 - `transcript`：素材字幕（可能为空）；如有带时间轴的紧凑视图，优先用它定位旁白和静音间隔。
 - `production_mode`：`footage`（有原片）或 `image_only`（无原片，画面靠网页原图）。
 
+`image_only` 研究可以只有合法公开的候选来源 URL，没有原片、预置图片或字幕。
+从 `candidate.source_url` 等已声明公开来源开始联网核查；空 `transcript`、未声明或为空的
+`context_files` / `context_manifest` 不属于 `CONTEXT_MISSING`，不要求存在 `context/` 目录。
+`source_images` 是本次联网研究应收集的输出，不是开始研究前必须已备好的输入素材。
+仅核验任务明确声明的非空必需素材清单；其中缺文件或哈希不符仍须上报环境故障，
+不得猜测路径、伪造素材或把其他任务的素材代入。
+
 ## 输出
 
 写入 `result.json`：
@@ -824,7 +831,11 @@ pages[] 必须按顺序覆盖每页（page_index/sha256/frame_indices/observed=t
 segments[] 覆盖全部计划段：segment_index/frame_index/pts_sec/motion_continuous/observation，
 结合实际原生观察、逐帧位移和独立ASR，写画面身份、旁白对应、字幕显示与运动/重复缺陷。
 boundaries[] 覆盖所有相邻段切换，boundary_index 与左右实际frame_index，
-写具体PTS和跨段主体/字幕/衔接观察。停止移动、重复镜头、短暂错误画面或字幕必须拒绝。
+写具体PTS和跨段主体/字幕/衔接观察。实际要求运动的时间窗内提前停止、重复镜头、短暂错误
+画面或字幕必须拒绝。固定30fps模板的 pan_left/pan_right/focus_product 在约8秒到顶，
+ken_burns_in/ken_burns_out 在约9.333秒到顶；到顶后的预期停留不能冒称提前停止，
+motion_continuous 只描述预期运动窗内的连续性，并在observation注明到顶时码与后续停留。
+这不免除pacing：仍须实际查看完整停留段，判断时长、重复和节奏能否通过九项硬闸门。
 
 subtitle_alignment[] 覆盖 manifest.subtitles.events 全部烧录 Default 字幕事件：
 event_index/word_indices/observed_sync/observation；word_indices 为 audio_evidence.segments
@@ -832,7 +843,8 @@ event_index/word_indices/observed_sync/observation；word_indices 为 audio_evid
 核对内容、词时码、段内/跨段对齐及PCM信号，不能把TTS原文当独立识别，普通同音识别差异
 需按来源/实际证据消歧。ASR低置信、静音/削波或硬项判断不足不能通过。
 
-本方法仅覆盖服务端冻结并已离线验证的 pan_right/ken_burns_in 和受支持切换，
+本方法仅覆盖服务端冻结并已离线验证的 pan_left/pan_right/ken_burns_in/ken_burns_out/
+focus_product 和 short_fade/hard_cut，
 不外推其他运动、模板或真实操作视频。应真实演示的卖点不能为适配本方法改为概念图；
 rights/来源/身份/前8秒价值兑现/真实或已明确概念路线仍按原硬标准判断。
 旧任务、旧prompt、旧failed结果不能采用本方法或获得新证据升级；服务端发布仍复验同一final。
@@ -1260,7 +1272,12 @@ def render_dispatch_task_prompt(
         f"所有 glance-agent 命令必须通过启动器 `{launcher}` 执行。"
         f"第一步先执行 `confirm-claim {task_id}` 把预约租约转为正式租约；"
         f"工作区已就绪：`{workspace_dir}`，直接读取其中的 instructions.md 与 "
-        "input.json 开始工作，不要运行 inspect；先确认输入和 context 清单完整，"
+        "input.json 开始工作，不要运行 inspect；先确认必需输入完整，"
+        "仅核验本任务明确声明的非空 context_files/context_manifest 素材清单；"
+        "未声明或空清单不要求 context/ 目录，不得臆造未下发的素材。"
+        "content_research 的 image_only 模式可从合法公开候选来源 URL 开始联网，"
+        "空 transcript、无预置素材不属于 CONTEXT_MISSING；source_images 是研究输出。"
+        "视觉/成片QC等已声明的必需素材缺文件或哈希不符仍须 fail，不能忽略。"
         "缺少必需输入时只用 `fail` 上报结构化环境错误并结束，不猜测、不补造、不重试；"
         "result.json 是临时任务工作区的输出文件，不是代码编辑；"
         "不要使用 apply_patch、编辑器或其它需要人工批准的文件变更工具写绝对路径，"
