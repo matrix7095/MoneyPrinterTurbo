@@ -765,6 +765,112 @@ def test_http_error_never_exposes_response_credentials(tmp_path):
     backend.close()
 
 
+@pytest.mark.parametrize(
+    "error_class", [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError]
+)
+def test_request_failure_journals_only_safe_labels(
+    setup, tmp_path, monkeypatch, error_class
+):
+    runner, _, native, journal, _ = setup
+    opaque = "opaque-credential-9f14d23ce57a"
+    private = tmp_path / "storage" / "private" / "runtime.json"
+    private.parent.mkdir(parents=True)
+    private.write_text(json.dumps(dict(admin_token=opaque)))
+    backend = c.HttpBackend("http://127.0.0.1:8000", private, tmp_path)
+    backend.client.close()
+
+    def fail(request):
+        raise error_class(opaque, request=request)
+
+    backend.client = httpx.Client(
+        base_url="http://127.0.0.1:8000",
+        headers={"Authorization": f"Bearer {opaque}"},
+        transport=httpx.MockTransport(fail),
+    )
+    ticks = iter([10, 10.25])
+    monkeypatch.setattr(c.time, "monotonic", lambda: next(ticks))
+    runner.backend = backend
+    with pytest.raises(c.ConductorError) as raised:
+        runner.run()
+    assert str(raised.value) == "CONDUCTOR_BACKEND_UNREACHABLE"
+    entries = [json.loads(line) for line in journal.log_path.read_text().splitlines()]
+    assert entries[0] == {
+        "seq": 1,
+        "kind": "backend_request_failure",
+        "error_class": error_class.__name__,
+        "method": "GET",
+        "endpoint": "/api/v1/contents/{content_id}/run",
+        "elapsed_seconds": 0.25,
+    }
+    assert opaque not in journal.log_path.read_text() + journal.path.read_text()
+    assert native.closed and native.sent == []
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "endpoint", "safe_method"),
+    [
+        (
+            "POST",
+            "/api/v1/contents/opaque-secret/run/stop?token=opaque-secret",
+            "/api/v1/contents/{content_id}/run/stop",
+            "POST",
+        ),
+        (
+            "PUT",
+            "/api/v1/content-runs/opaque-secret/intents/opaque-secret#opaque-secret",
+            "/api/v1/content-runs/{run_id}/intents/{request_id}",
+            "PUT",
+        ),
+        (
+            "POST",
+            "/api/v1/content-runs/opaque-secret/intents/opaque-secret/observation",
+            "/api/v1/content-runs/{run_id}/intents/{request_id}/observation",
+            "POST",
+        ),
+        (
+            "POST",
+            "/api/v1/content-runs/opaque-secret/host/attach",
+            "/api/v1/content-runs/{run_id}/host/attach",
+            "POST",
+        ),
+        ("opaque-secret", "/opaque-secret?opaque-secret", "unknown", "OTHER"),
+    ],
+)
+def test_request_failure_drops_unknown_class_paths_query_body_and_method(
+    tmp_path, method, path, endpoint, safe_method
+):
+    private = tmp_path / "storage" / "private" / "runtime.json"
+    private.parent.mkdir(parents=True)
+    private.write_text(json.dumps(dict(admin_token="opaque-secret")))
+    backend = c.HttpBackend("http://127.0.0.1:8000", private, tmp_path)
+    backend.client.close()
+    unknown_error = type("opaque-secret", (httpx.RequestError,), {})
+
+    def fail(request):
+        raise unknown_error("opaque-secret", request=request)
+
+    backend.client = httpx.Client(
+        base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(fail)
+    )
+    with pytest.raises(c.ConductorError, match="CONDUCTOR_BACKEND_UNREACHABLE"):
+        backend.request(method, path, {"credential": "opaque-secret"})
+    diagnostic = backend.last_request_failure
+    assert diagnostic["error_class"] == "RequestError"
+    assert diagnostic["endpoint"] == endpoint
+    assert diagnostic["method"] == safe_method
+    assert diagnostic["elapsed_seconds"] >= 0
+    assert "opaque-secret" not in json.dumps(diagnostic)
+    backend.client.close()
+    backend.client = httpx.Client(
+        base_url="http://127.0.0.1:8000",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+    backend.view(CONTENT)
+    assert backend.last_request_failure is None
+    backend.close()
+
+
 def test_finished_child_heartbeat_uses_host_idle_not_terminal_intent(setup):
     runner, backend, _, journal, _ = setup
     bind_fixture(runner, journal)

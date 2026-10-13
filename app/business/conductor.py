@@ -35,6 +35,38 @@ PARENT_EFFORT = "high"
 POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 30
 MAX_ROUNDS = 16
+REQUEST_ERROR_CLASSES = {
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadError",
+    "ReadTimeout",
+    "WriteError",
+    "WriteTimeout",
+    "PoolTimeout",
+    "CloseError",
+    "LocalProtocolError",
+    "RemoteProtocolError",
+    "ProxyError",
+    "UnsupportedProtocol",
+    "TooManyRedirects",
+    "DecodingError",
+}
+BACKEND_ENDPOINTS = (
+    (r"/api/v1/contents/[^/?#]+/run", "/api/v1/contents/{content_id}/run"),
+    (r"/api/v1/contents/[^/?#]+/run/stop", "/api/v1/contents/{content_id}/run/stop"),
+    (
+        r"/api/v1/content-runs/[^/?#]+/host/attach",
+        "/api/v1/content-runs/{run_id}/host/attach",
+    ),
+    (
+        r"/api/v1/content-runs/[^/?#]+/intents/[^/?#]+",
+        "/api/v1/content-runs/{run_id}/intents/{request_id}",
+    ),
+    (
+        r"/api/v1/content-runs/[^/?#]+/intents/[^/?#]+/observation",
+        "/api/v1/content-runs/{run_id}/intents/{request_id}/observation",
+    ),
+)
 
 
 class ConductorError(RuntimeError):
@@ -182,13 +214,32 @@ class HttpBackend:
             trust_env=False,
             follow_redirects=False,
         )
+        self.last_request_failure = None
 
     def request(self, method: str, path: str, body: dict | None = None):
+        self.last_request_failure = None
+        started = time.monotonic()
         try:
             response = self.client.request(
                 method, path, **({"json": body} if body is not None else {})
             )
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            # Only fixed labels and elapsed time survive; exception/request
+            # contents and dynamic path segments can contain credentials.
+            endpoint = "unknown"
+            for pattern, label in BACKEND_ENDPOINTS:
+                if re.fullmatch(pattern, path.split("?", 1)[0].split("#", 1)[0]):
+                    endpoint = label
+                    break
+            name = type(exc).__name__
+            self.last_request_failure = {
+                "error_class": name
+                if name in REQUEST_ERROR_CLASSES
+                else "RequestError",
+                "method": method if method in {"GET", "POST", "PUT"} else "OTHER",
+                "endpoint": endpoint,
+                "elapsed_seconds": round(max(0, time.monotonic() - started), 6),
+            }
             raise ConductorError("CONDUCTOR_BACKEND_UNREACHABLE") from None
         if response.status_code >= 300:
             raise ConductorError(f"CONDUCTOR_BACKEND_HTTP_{response.status_code}")
@@ -1043,6 +1094,14 @@ class Conductor:
                 if isinstance(exc, ConductorError)
                 else "CONDUCTOR_PROTOCOL_OR_IO_ERROR"
             )
+            if (
+                code == "CONDUCTOR_BACKEND_UNREACHABLE"
+                and isinstance(self.backend, HttpBackend)
+                and self.backend.last_request_failure is not None
+            ):
+                self.journal.record(
+                    "backend_request_failure", self.backend.last_request_failure
+                )
             if self.epoch is not None:
                 try:
                     request_id = (

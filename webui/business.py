@@ -126,6 +126,48 @@ def _semantics(st, connection, content_id):
             st.json(result["data"])
 
 
+def _execution(st, connection, content_id, content_status):
+    st.subheader("按需生产")
+    st.caption("点击运行一次，从当前阶段继续研究、制作、独立质量审核与发布；运行结束后停止。")
+    if st.button("刷新运行状态", key="business_execution_refresh"):
+        st.rerun()
+    try:
+        _, view = connection.request("GET", content_path(content_id) + "/execution")
+    except BusinessAPIError:
+        st.warning("运行状态暂不可用，请刷新后再试。")
+        return
+    state = view["state"]
+    if view.get("stop_requested") and view.get("run_state") == "draining":
+        st.info("已请求停止，等待现有工作结束。")
+    elif state == "STARTING":
+        st.info("正在启动，请稍后刷新运行状态。")
+    elif state == "RUNNING":
+        st.info("正在执行，请查看下方任务、质量审核和发布记录。")
+    elif state == "DRAINING" or view.get("stop_requested") and state in {"STARTING", "RUNNING"}:
+        st.info("已请求停止，等待本次运行结束。")
+    elif state == "UNKNOWN":
+        st.warning("暂时无法确认运行结果。请查看任务和发布记录；系统不会重复启动。")
+    elif state == "FAILED":
+        st.error("启动失败，请检查业务服务后再试。" if view.get("error_code") == "CONTENT_EXECUTION_START_FAILED" else "本次运行失败，请查看任务和质量审核结果后再试。")
+    elif state == "FINISHED":
+        st.info("本次运行已结束。请查看下方质量审核与平台发布记录。")
+    else:
+        st.info("当前内容尚未运行。")
+    disabled = state in {"STARTING", "RUNNING", "DRAINING", "UNKNOWN"} or view.get("run_state") == "draining" or content_status in {"PUBLISHED", "ARCHIVED", "REJECTED"}
+    if st.button("运行一次", disabled=disabled, key="business_execution_start"):
+        try:
+            connection.request("POST", content_path(content_id) + "/run/execute")
+            st.rerun()
+        except BusinessAPIError as exc:
+            st.error(str(exc))
+    if view.get("can_stop") and st.button("停止新增工作", key="business_execution_stop"):
+        try:
+            connection.request("POST", content_path(content_id) + "/execution/stop")
+            st.rerun()
+        except BusinessAPIError as exc:
+            st.error(str(exc))
+
+
 def _content(st, connection, contents):
     if not contents:
         st.info("先从候选列表选择一条内容。")
@@ -144,6 +186,7 @@ def _content(st, connection, contents):
     st.write(f"状态：{content['business_status']} · 阶段：{content.get('current_stage', '')}")
     if content.get("error_code"):
         st.error(f"{content['error_code']}：{content.get('error_message', '')}")
+    _execution(st, connection, content_id, content["business_status"])
     with st.expander("内容与来源上下文"):
         st.json(content)
     st.subheader("研究、脚本、视觉计划与质量审核")
