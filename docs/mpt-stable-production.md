@@ -6,6 +6,10 @@
 
 ## 当前验收清单
 
+按需原生宿主前置已实测：默认PATH的Codex CLI为0.144.6，不兼容桌面agents配置，专用配置下也拒绝当前模型；真正桌面进程使用0.162.0-alpha.17.2。新版App Server单次ephemeral诊断捕获真实服务端父子活动、子自身回复和完成事件。独立复核路由切片164条记录，其中唯一child thread/read响应返回executor/gpt-6-luna/max、ephemeral=true及正确父关联，父配置Sol/high；不是主模型自报。原始配置字段不代表每token遥测；该测试也未证明业务offer/lease/result、媒体生成或发布闭环。新诊断进程已清理，原Codex和生产服务未停止。证据 `native-app-rpc-routing-events.jsonl`、`native-app-rpc-routing-result.json`。
+
+真实MPT运动与时序盲测：四个两秒目标样本共228个实际解码帧，包含pan_right、ken_burns_in和short_fade。独立审核者查看全部连续帧，正常版允许1.033至1.2秒的实际淡入且无误拒；其他版准确发现开头0至0.4秒叠字缺失、红蓝镜头倒序，以及末尾截短0.4秒/缺12帧。Root在盲审结束后核对隔离答案与所有视频SHA，结果一致；倒序按实际颜色序列定位，不把构建窗口标注当成逐帧像素差异。仍是几何主体和纯音诊断，未验证真实语音、真实素材及生产内容，不能代替完整生产验收。证据 `mpt-motion-fault-probe/root-blind-review-proof.json`。
+
 真实MPT静态图片渲染故障盲测：四个两秒、1080×1920/30fps视频共240帧，使用真实MptMediaExecutor输出构建正常版和三个故障版。两名独立审核者实际查看全部40页连续帧，并用异常前后原图复核；Root在审核结束后读取隔离答案，逐项核对视频SHA、帧数和故障索引：正常版无误拒，单帧紫屏第30帧、字幕遮挡第38至40帧、主体遮挡第48至50帧均准确定位。此结论仅限静态几何、纯音诊断素材；尚未验证字幕时序偏移、运动裁切/转场、重复倒序、末尾截断及真实语音/生产成片，不改变CONTENT_QC门槛。证据 `mpt-visual-fault-probe/root-blind-review-proof.json`。
 
 一次启动接入核查：business选题请求立即准备上下文，Agent完成接口立即consume并推进下游，阶段推进已有事件式路径；现有CLI角色launcher仅领取任务包并输出prompt，不运行模型，缺口是外部角色执行接入。本机Codex App Server经stdio的initialize和account/read实测成功，现有ChatGPT账户可读，未创建thread/turn、未刷新凭据；这不证明原生子Agent或所需媒体工具可用。服务端“native”检查验证MPT部署、输入、租约和accepted submission，而非Codex parent/subagent身份；现有scheduler Skill明确要求真正native spawn，不可把新app-server聊天当作等价Worker。后续按需入口需保留这条交接边界。证据 `codex-host-readonly-probe.json`。
