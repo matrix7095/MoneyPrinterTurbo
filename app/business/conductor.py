@@ -213,6 +213,9 @@ class HttpBackend:
             timeout=30,
             trust_env=False,
             follow_redirects=False,
+            # Polling and the server both idle for five seconds. Avoid reusing
+            # a socket exactly as the server closes it; never retry a request.
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=0),
         )
         self.last_request_failure = None
 

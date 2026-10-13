@@ -765,6 +765,47 @@ def test_http_error_never_exposes_response_credentials(tmp_path):
     backend.close()
 
 
+def test_http_backend_uses_fresh_connections_without_retry(tmp_path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            requests.append((self.path, self.client_address[1]))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    private = tmp_path / "storage" / "private" / "runtime.json"
+    private.parent.mkdir(parents=True)
+    private.write_text(json.dumps(dict(admin_token="opaque-secret")))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    backend = c.HttpBackend(f"http://127.0.0.1:{server.server_port}", private, tmp_path)
+    try:
+        for _ in range(3):
+            assert backend.view(CONTENT) == {}
+        assert len(requests) == 3
+        assert len({port for _, port in requests}) == 3
+        assert all(path == f"/api/v1/contents/{CONTENT}/run" for path, _ in requests)
+        assert backend.client.timeout == httpx.Timeout(30)
+    finally:
+        backend.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
 @pytest.mark.parametrize(
     "error_class", [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError]
 )
