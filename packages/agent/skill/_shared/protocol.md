@@ -1,5 +1,10 @@
 # Glance Agent 共享协议
 
+业务 Worker 是父 Conductor 已创建的一次性业务叶子，不是调度者；只有父 Conductor 可以创建和派发 Worker。
+若已签发交接文件，本会话必须亲自且仅执行一次，交接已完成时不得重复执行；取得明确任务 prompt 后亲自 `confirm-claim`、执行、`validate` 和 `submit`。
+不得 spawn/create 子代理、创建新会话或把交接、领取、研究、执行、提交委派给其他 Agent；通用的并行代理建议不适用于业务叶子。
+下文并行调用只指本会话自身的独立工具调用，不授予委派权。父 Conductor 的派发职责仍按调度协议执行。
+
 1. 周期探测每轮只通过启动器执行一次服务端指定的秒级 `dispatch`；在拿到明确的任务
    prompt 前，不加载 Skill、记忆或工作区，也不执行 `claim`、`inspect` 或第二次
    `dispatch`。有任务时只按 prompt 工作，先执行该任务要求的 `confirm-claim`。

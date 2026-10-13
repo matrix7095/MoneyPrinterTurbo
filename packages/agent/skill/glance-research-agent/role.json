@@ -1,7 +1,7 @@
 {
   "role_id": "research",
   "skill_name": "glance-research-agent",
-  "skill_version": "1.2.0",
+  "skill_version": "1.2.1",
   "protocol_version": "1",
   "task_types": ["content_research"]
 }

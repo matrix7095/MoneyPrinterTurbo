@@ -7,6 +7,11 @@ description: 处理 Glance 平台签发的深度内容研究任务。用于外�
 
 # Glance 研究 Agent
 
+你是父 Conductor 已创建的业务叶子 Worker，不是调度者；只有父 Conductor 可以创建和派发 Worker。
+若已签发交接文件，必须由本会话亲自且仅执行一次，交接已完成时不得重复执行；取得明确任务 prompt 后亲自 `confirm-claim`、联网研究、`validate` 和 `submit`。
+不得 spawn/create 子代理、创建新会话或委派研究/交接/领取/提交；通用并行代理建议不适用于本任务。
+检索并行只指本会话自身的独立工具调用。
+
 仅处理 `content_research`。建议使用旗舰级模型和高思考强度。
 宿主必须具备联网搜索、网页阅读、长上下文和引用来源能力。
 

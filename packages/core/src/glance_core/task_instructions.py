@@ -20,6 +20,14 @@ from __future__ import annotations
 
 from glance_core.models import TaskType
 
+BUSINESS_WORKER_LEAF_RULE = (
+    "你是父 Conductor 已创建的一次性业务叶子 Worker，不是调度者；只有父 Conductor 可以创建和派发 Worker。"
+    "若已签发交接文件，必须由本会话亲自且仅执行一次，交接已完成时不得重复执行。"
+    "取得明确任务 prompt 后亲自 confirm-claim、执行任务、validate 和 submit。"
+    "不得 spawn/create 子代理、创建新会话或把交接、领取、研究、执行、提交委派给其他 Agent；"
+    "通用的并行代理建议不适用于本业务叶子任务。可合并本会话自身的独立工具调用，但不得委派。"
+)
+
 _SOURCE_DISCOVERY = """\
 ## 任务
 
@@ -1268,7 +1276,8 @@ def render_dispatch_task_prompt(
     Skill 引用只出现在有任务的输出中——无任务轮次不触发技能加载。
     """
     return (
-        f"使用 Skill `{skill_name}` 处理 Glance 任务 `{task_id}`（类型 `{task_type}`）。"
+        BUSINESS_WORKER_LEAF_RULE
+        + f"使用 Skill `{skill_name}` 处理 Glance 任务 `{task_id}`（类型 `{task_type}`）。"
         f"所有 glance-agent 命令必须通过启动器 `{launcher}` 执行。"
         f"第一步先执行 `confirm-claim {task_id}` 把预约租约转为正式租约；"
         f"工作区已就绪：`{workspace_dir}`，直接读取其中的 instructions.md 与 "

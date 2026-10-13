@@ -29,6 +29,7 @@ from glance_core.scheduler_profiles import (
     load_scheduler_config,
 )
 from glance_core.task_service import TaskConflictError
+from glance_core.task_instructions import BUSINESS_WORKER_LEAF_RULE
 from sqlalchemy import event
 from sqlalchemy.orm import with_loader_criteria
 from sqlmodel import select
@@ -254,7 +255,8 @@ def worker_prompt(request_id, skill_name, launcher):
         / ("worker-" + "-".join(request_id.rsplit(":", 2)[1:]) + Path(launcher).suffix)
     )
     return (
-        "你是本轮新建的一次性 MPT Worker，不复用或续接旧会话。"
+        BUSINESS_WORKER_LEAF_RULE
+        + "你是本轮新建的一次性 MPT Worker，不复用或续接旧会话。"
         f"使用 Skill `{skill_name}`；在读取业务工作区或任务内容前，只执行一次交接文件 "
         f"`{offer}`，不传任何参数。文件已冻结服务端授权的任务、角色、模型与思考强度；"
         "禁止重写文件、手输 dispatch/claim 参数或在文件缺失时绕过交接。"
