@@ -2,7 +2,7 @@
 
 更新日期：2026-10-13。本文随稳定生产修复提交。当前验收清单优先；后文保留历史检查点，旧调度恢复要求不再适用于按需生产。
 
-当前结论：尚未完成稳定生产验收。代码修复已在主目录部署并推送，脚本审核合同冲突已修复并通过新周期运行验证；第7版新成片音频联合证据审核已通过，但完整动态观看仍缺有效证据，不能承诺后续无人值守稳定产出。
+当前结论：尚未完成稳定生产验收。此前生产修复已部署，新按需宿主代码已提交、推送并集成主目录源码，但生产API尚未重启加载；真实执行与界面接入仍在验收。第7版旧成片的音频联合证据与全帧视觉方法已有记录，不能代替新内容的正式QC和真实发布，不能承诺后续稳定产出。
 
 ## 当前验收清单
 
@@ -10,7 +10,11 @@
 
 真实默认角色绑定已验证：一次原生父子运行在21.937秒内完成。服务端 thread/read 返回 child 的 default、gpt-6-luna/max、ephemeral=true 及正确父关联，started 活动中的 agentPath 与指定任务名一致；父子均完成并返回约定文本。证据 `native-app-rpc-default-binding-result.json`、`native-app-rpc-default-binding-events.jsonl`。这是身份与生命周期探针，未领取业务任务，也不是实际生产执行器的运行验收。
 
-完整帧证据工具已提交 `5a485cdbf4fcceb7060c60c205e2fdbd7f818763`，独立7项测试通过。Root 用该工具对既有归档 Eve 成片实际生成849张原始1080×1920 PNG与213页连续帧证据，逐项验证帧索引、PTS关联和全部图片哈希。视频 SHA 为 `94f54e5d77adf1a6ce3042bfb7f8469795dcfd16879d2ee5fdf558ae9343fee2`；证据目录 `eve7-complete-frame-pilot/`。独立视觉审核前568帧已完成，末段仍在审核。发现字幕跨卡分词、切镜后单帧字幕延迟等问题；静态概念图不能证明实际行走性能。此项只验证离线证据方法，不改变旧内容、旧质检和发布状态，也不替代实时运动感知或音频审核。
+完整帧证据工具已提交 `5a485cdbf4fcceb7060c60c205e2fdbd7f818763`并推送，独立7项测试通过。Root 用该工具对既有归档 Eve 成片实际生成849张原始1080×1920 PNG与213页连续帧证据，逐项验证帧索引、PTS关联和全部图片哈希。视频 SHA 为 `94f54e5d77adf1a6ce3042bfb7f8469795dcfd16879d2ee5fdf558ae9343fee2`；证据目录 `eve7-complete-frame-pilot/`。同一原生视觉审核者分三段实际看完全部213页、849帧，并复核关键原图；Root保存三份摘要并验证页序号0至212无遗漏或重复，证明为 `reviews/root-combined-coverage-proof.json`。发现字幕跨卡分词、切镜后单帧字幕延迟等问题；静态概念图不能证明实际行走性能。此项只验证离线证据方法，不改变旧内容、旧质检和发布状态，也不替代实时运动感知或音频审核。
+
+宿主合同与执行器已提交 `52618b1c174669c6748868b74a3c407446d037d6`并快进主目录源码。18文件最终综合复审APPROVE：指定211项测试及额外19项内容HTTP回归共230 passed，Ruff、AST、diff检查通过。Root完整 `test/business` 回归1256 passed / 598.46秒 / exit 0，18文件冻结SHA前后一致，7337条既有依赖警告；证明 `root-host-conductor-full-business-result.json`。生产API尚未加载这些更改。实际界面缺少run控制，因此另行补齐API宿主受管启动与界面启动、查询、协作停止；不能把创建permit或Popen成功记为实际宿主就绪。隔离真实NativeTransport、HTTP与SQLite验证已走到实际原生child的身份绑定、admission、claim和confirm；首次研究尝试随后返回 `CONDUCTOR_BACKEND_UNREACHABLE`，保留UNKNOWN/draining，未accepted或consumed。诊断仍在定位具体请求失败类型；自有测试进程清理不等于业务自然排空，正式执行链尚未通过。
+
+Windows后台窗修复提交 `0ee63d53bbe8592c3fa7dacefe62dfe8cd094e21` 已集成并推送，NativeTransport 使用 CREATE_NO_WINDOW，51项执行器测试及Ruff通过。该两行修复在前述1256项回归之后，定向验证单独记录，不冒充原冻结SHA范围。
 
 2026-10-13最新接入进度：单内容生产改为按需启动、完成后推进，不依赖定时任务。Content run前置合同已提交`b68dc2a85465d90bcf290f513eb568083fd93579`并快进主目录源码；生产API尚未重启加载该接口。它保留单内容范围、全局容量、45分钟期限、冻结offer和停止后已领取任务排空。独立审查发现的残缺scope降级派发、授权拒绝后SQLite写锁未释放两项已修复；独立复审APPROVE、76项定向测试通过，Root最终完整业务回归1141 passed / 565.64秒 / exit 0，14文件前后冻结SHA一致，7081条既有依赖弃用警告。新宿主定位模块不在此次回归范围，已单独通过12项测试和独立复审APPROVE，提交`dae4c97294e8708cff38f2c136ba9271a6083cf8`并推送主目录；它仅从实际CIM进程定位唯一Desktop binary，忽略其他项目的PATH CLI，不从PATH或缓存排序猜版本。实查仍为0.162.0-alpha.17.2，文件SHA与版本不等同于业务能力证明。新接口诚实显示`contract_only/awaiting_host`；宿主admission与真实Conductor正分工实现，尚未接入，不能据此声称一键生产已可用。
 
