@@ -34,6 +34,15 @@
 
 存储前提：本次完整审核需要生成连续帧包，还会产生审核Worker的下载副本。16:00核验C盘可用约0.57GB，不足以安全生成下一份完整生产审核包。此前4个已终态隔离诊断的frames/pages目录约2.43GiB，其清理遭自动审批拒绝，未执行，正等待具体确认；原生产素材、旧成片、清单、日志和最终v3验证包均保留。磁盘容量未恢复前，不启动大体积重渲染和审核包复制。
 
+待确认清理范围仅限实施工作树 `C:\Users\Administrator\.codex\worktrees\mpt-stable-production\MoneyPrinterTurbo` 下这4个目录：
+
+- `.artifacts/render-timeline-native-probe-final/content/render/joint-proof/frames`
+- `.artifacts/render-timeline-native-probe-final/content/render/joint-proof/pages`
+- `.artifacts/render-timeline-native-probe-final-v2/content/render/joint-proof/frames`
+- `.artifacts/render-timeline-native-probe-final-v2/content/render/joint-proof/pages`
+
+只读复核合计2,612,023,510字节；对应旧探针已终态。保留两探针的原视频、manifest、joint-manifest、字幕与日志，并保留整个最终 `render-timeline-native-probe-final-v3` 包及全部生产材料。未获本次具体确认前不删除。
+
 验证范围：`40227d4` 组合版本已执行 `python -m pytest test/business test/services/test_video_project.py -q --tb=short`，1455 passed/905.02秒，进程exit0；354个纳入快照的Python、Skill及role文件前后不变。安全证明为 `root-post-fixes-full-regression-result.json`、`root-post-fixes-source-freeze.json`、`root-post-fixes-full-regression.log`。8059条警告主要为现有依赖弃用提示，不等于测试失败。此前中断运行不计为通过；隔离研究、时轴验证和测试不代表本轮正式内容QC或真实发布成功。
 
 ## 本轮剩余验收
