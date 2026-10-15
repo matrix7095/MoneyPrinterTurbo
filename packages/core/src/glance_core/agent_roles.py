@@ -143,7 +143,7 @@ ROLE_SPECS: dict[AgentRole, AgentRoleSpec] = {
         required=False,
         requirement_tags=("普通", "图片生成"),
         recommended_wake_minutes=30,
-        skill_version="1.2.0",
+        skill_version="1.2.1",
     ),
     AgentRole.VIDEO: AgentRoleSpec(
         role=AgentRole.VIDEO,

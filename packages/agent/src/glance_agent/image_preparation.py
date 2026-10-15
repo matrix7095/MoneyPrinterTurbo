@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import stat
 import warnings
@@ -16,12 +17,16 @@ from glance_agent.workspace import file_sha256, load_json, write_json_atomic
 
 
 def _plain_path(path: Path) -> None:
-    if path.is_symlink() or (
-        path.exists()
-        and getattr(path.lstat(), "st_file_attributes", 0)
-        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    ):
-        raise ValueError(f"Image preparation refuses redirected paths: {path}")
+    for entry in (path, *path.parents):
+        try:
+            attributes = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(attributes.st_mode) or (
+            getattr(attributes, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise ValueError(f"Image preparation refuses redirected paths: {entry}")
 
 
 def _dimensions(task_input: dict, segment_index: int) -> tuple[int, int]:
@@ -59,8 +64,11 @@ def _dimensions(task_input: dict, segment_index: int) -> tuple[int, int]:
 
 
 def prepare_image(directory: Path, task_id: str, agent_id: str, source: Path, segment_index: int) -> dict:
-    """Prepare an immutable PNG and provenance receipt in this exact task workspace."""
+    """Keep immutable image evidence outside the disposable leased task workspace."""
+    directory = directory.expanduser().absolute()
     _plain_path(directory)
+    if not re.fullmatch(r"agt_[A-Za-z0-9_-]+", task_id) or directory.name != task_id:
+        raise ValueError("Image preparation requires this exact task workspace")
     for name in ("task.json", "input.json", ".lease.json"):
         _plain_path(directory / name)
     task, lease = load_json(directory / "task.json"), load_json(directory / ".lease.json")
@@ -116,9 +124,12 @@ def prepare_image(directory: Path, task_id: str, agent_id: str, source: Path, se
         raise ValueError("Prepared PNG exceeds the 25 MiB upload limit")
     input_hash = hashlib.sha256(frozen_input).hexdigest()
     key = hashlib.sha256(f"{source_hash}:{input_hash}:{segment_index}".encode()).hexdigest()
-    root = directory / "prepared-images"
+    # submit/fail/GC delete the entire leased workspace, including its credentials.
+    workspace_root = directory.parent
+    root = workspace_root.with_name(f"{workspace_root.name}-image-preparation-evidence") / task_id
     _plain_path(root)
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    _plain_path(root)
     destination = root / key
     _plain_path(destination)
     target, receipt = destination / "image.png", destination / "preparation.json"
@@ -142,8 +153,12 @@ def prepare_image(directory: Path, task_id: str, agent_id: str, source: Path, se
     else:
         with retained_source.open("xb") as handle:
             handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
         with target.open("xb") as handle:
             handle.write(prepared_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
         write_json_atomic(receipt, metadata)
     with Image.open(target) as actual:
         actual.load()

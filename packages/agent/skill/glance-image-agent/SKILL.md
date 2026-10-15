@@ -10,7 +10,7 @@ description: 处理 Glance 平台签发的 AI 图片素材生成任务。用于�
 仅处理 `asset_generate_image`。建议使用普通级控制模型，中等思考强度；连续性任务使用高。
 宿主必须具备原生生图、图片理解和文件上传能力。
 
-设置 `GLANCE_AGENT_ROLE_ID=image`、`GLANCE_AGENT_SKILL_NAME=glance-image-agent` 和版本 `1.2.0`。
+设置 `GLANCE_AGENT_ROLE_ID=image`、`GLANCE_AGENT_SKILL_NAME=glance-image-agent` 和版本 `1.2.1`。
 
 1. 只处理周期 `dispatch` 返回的明确任务；先按任务提示执行 `confirm-claim <task_id>`，
    再阅读已准备的指令、视觉规范、禁用元素与 Schema。`NO_TASK` 或 `AT_CAPACITY` 时
@@ -19,7 +19,8 @@ description: 处理 Glance 平台签发的 AI 图片素材生成任务。用于�
 3. 检查画幅、构图、连续性、品牌和人物标记。用户已明确授权本机尺寸准备时，
    对本轮原生生成的图片运行
    `glance-agent prepare-image <task_id> <原图文件> --segment-index <段索引>`。
-   该命令从冻结请求读取尺寸，保留原图，生成等比缩放及居中补边的 PNG 和准备记录；
+   该命令从冻结请求读取尺寸，生成等比缩放及居中补边的 PNG；原图、成品与准备记录
+   保存在租约工作区之外的持久证据目录，正常提交、失败上报或工作区清理后仍保留。
    原图比例偏差超过 2% 会拒绝，必须重新生成。它不会增加真实细节或替代独立素材质检。
    未获本机修改授权时继续使用原生工具修正尺寸；Pillow 缺失时使用已安装的 MPT 环境，
    不得假报尺寸、降低冻结要求或绕过审核。

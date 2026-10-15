@@ -1,6 +1,7 @@
 import builtins
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,14 +9,15 @@ from PIL import Image
 from typer.testing import CliRunner
 
 from glance_agent import cli
+from glance_agent import image_preparation
 from glance_agent.image_preparation import prepare_image
 from glance_agent.settings import AgentSettings
-from glance_agent.workspace import prepare_workspace
+from glance_agent.workspace import gc_workspaces, prepare_workspace
 
 
 @pytest.fixture
-def workspace(tmp_path, monkeypatch):
-    config = AgentSettings(token="isolated", agent_id="image-test", role_id="image", workspace_dir=tmp_path / "tasks")
+def workspace(tmp_path, monkeypatch, request):
+    config = AgentSettings(token="isolated", agent_id="image-test", role_id="image", workspace_dir=tmp_path / getattr(request, "param", "tasks"))
     directory = prepare_workspace(
         config.workspace_dir, lease_token="isolated-lease", api_url="http://127.0.0.1:9", agent_id=config.agent_id,
         bundle={"task": {"task_id": "agt_image_prepare", "task_type": "asset_generate_image"},
@@ -34,12 +36,17 @@ def run_prepare(workspace):
     return prepare_image(directory, "agt_image_prepare", config.agent_id, source, 3)
 
 
+def evidence_root(directory):
+    return directory.parent.with_name(f"{directory.parent.name}-image-preparation-evidence")
+
+
 def test_prepares_actual_dimensions_keeps_original_and_reuses(workspace):
-    directory, source, _ = workspace
+    directory, source, config = workspace
     originals = {path: path.read_bytes() for path in [source, *(directory / name for name in ("task.json", "input.json", ".lease.json"))]}
     result = run_prepare(workspace)
     target = Path(result["path"])
-    assert target.is_relative_to(directory)
+    assert target.is_relative_to(evidence_root(directory) / directory.name)
+    assert not target.is_relative_to(config.workspace_dir)
     with Image.open(target) as actual:
         assert actual.size == (1080, 1920)
         assert actual.getpixel((540, 960)) == (255, 0, 0)
@@ -61,7 +68,7 @@ def test_refuses_other_task(workspace, field, value):
     task_path.write_text(json.dumps(task))
     with pytest.raises(ValueError, match="exact asset_generate_image"):
         run_prepare(workspace)
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 def test_refuses_other_agent_lease(workspace):
@@ -84,7 +91,7 @@ def test_refuses_invalid_frozen_contract(workspace, input_data):
     (directory / "input.json").write_text(json.dumps(input_data))
     with pytest.raises(ValueError):
         run_prepare(workspace)
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 @pytest.mark.parametrize("size", [(1920, 1080), (1000, 1600)])
@@ -93,7 +100,7 @@ def test_refuses_wrong_aspect_instead_of_stretching(workspace, size):
     Image.new("RGB", size).save(source)
     with pytest.raises(ValueError, match="regenerate"):
         run_prepare(workspace)
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 def test_preserves_alpha_and_exact_nondefault_ratio(workspace):
@@ -127,6 +134,84 @@ def test_refuses_changed_retained_original(workspace):
     with pytest.raises(ValueError, match="refusing to overwrite"):
         run_prepare(workspace)
     assert raw.read_bytes() == b"changed original"
+
+
+def test_refuses_changed_receipt_without_replacing_evidence(workspace):
+    result = run_prepare(workspace)
+    receipt = Path(result["path"]).with_name("preparation.json")
+    changed = {**result, "upscaled": False}
+    receipt.write_text(json.dumps(changed))
+    before = {path: path.read_bytes() for path in receipt.parent.iterdir()}
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        run_prepare(workspace)
+    assert {path: path.read_bytes() for path in receipt.parent.iterdir()} == before
+
+
+@pytest.mark.parametrize("command", ["submit", "fail", "gc-age", "gc-count"])
+@pytest.mark.parametrize("workspace", ["tasks", "image-preparation-evidence"], indirect=True)
+def test_preparation_evidence_survives_actual_task_cleanup(workspace, monkeypatch, command):
+    directory, _, config = workspace
+    result = run_prepare(workspace)
+    evidence = Path(result["path"]).parent
+    assert not evidence.is_relative_to(config.workspace_dir)
+    before = {path.name: path.read_bytes() for path in evidence.iterdir()}
+    assert set(before) == {"original.png", "image.png", "preparation.json"}
+    assert all(b"isolated-lease" not in value for value in before.values())
+    assert all(b"lease_token" not in value for value in before.values())
+    (directory / "result.json").write_text("{}")
+    calls = []
+
+    class Client:
+        def __init__(self, settings):
+            assert settings == config
+
+        def complete(self, task_id, lease_token, agent_id, value):
+            assert (task_id, lease_token, agent_id, value) == (
+                directory.name, "isolated-lease", config.agent_id, {},
+            )
+            calls.append("submit")
+            return {"status": "ACCEPTED"}
+
+        def fail(self, task_id, lease_token, agent_id, **kwargs):
+            assert (task_id, lease_token, agent_id) == (
+                directory.name, "isolated-lease", config.agent_id,
+            )
+            calls.append("fail")
+            return {"status": "FAILED"}
+
+    monkeypatch.setattr(cli, "AgentClient", Client)
+    if command.startswith("gc-"):
+        (directory / ".lease.json").unlink()
+        options = {"now": datetime.now(UTC) + timedelta(days=2)} if command == "gc-age" else {"max_count": 0}
+        assert gc_workspaces(config.workspace_dir, **options) == 1
+    else:
+        args = [command, directory.name]
+        if command == "fail":
+            args += ["--code", "ENVIRONMENT_UNAVAILABLE", "--message", "isolated failure"]
+        completed = CliRunner().invoke(cli.app, args)
+        assert completed.exit_code == 0, completed.output
+        assert calls == [command]
+    assert not directory.exists()
+    assert {path.name: path.read_bytes() for path in evidence.iterdir()} == before
+    with Image.open(evidence / "image.png") as image:
+        assert image.size == (1080, 1920)
+
+
+def test_failed_receipt_write_cannot_publish_or_overwrite_partial_evidence(workspace, monkeypatch):
+    def fail_receipt(*args):
+        raise OSError("isolated receipt failure")
+
+    monkeypatch.setattr(image_preparation, "write_json_atomic", fail_receipt)
+    with pytest.raises(OSError, match="isolated receipt failure"):
+        run_prepare(workspace)
+    directory, source, _ = workspace
+    evidence, = (evidence_root(directory) / directory.name).iterdir()
+    assert not (evidence / "preparation.json").exists()
+    assert (evidence / "original.png").read_bytes() == source.read_bytes()
+    before = {path.name: path.read_bytes() for path in evidence.iterdir()}
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        run_prepare(workspace)
+    assert {path.name: path.read_bytes() for path in evidence.iterdir()} == before
 
 
 def test_cli_is_local_and_returns_receipt(workspace, monkeypatch):
@@ -208,7 +293,7 @@ def test_cli_refuses_foreign_or_malformed_fresh_identity(workspace, agent_id):
     result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
     assert result.exit_code == 2, result.output
     assert json.loads(result.output)["status"] == "REJECTED"
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 def test_cli_refuses_other_role(workspace):
@@ -217,7 +302,7 @@ def test_cli_refuses_other_role(workspace):
     result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
     assert result.exit_code == 2, result.output
     assert "requires the image role" in json.loads(result.output)["detail"]
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 @pytest.mark.parametrize("field,value", [("task_id", "agt_other"), ("lease_token", "")])
@@ -230,7 +315,7 @@ def test_cli_preserves_exact_lease_task_and_token_checks(workspace, field, value
     result = CliRunner().invoke(cli.app, ["prepare-image", "agt_image_prepare", str(source), "--segment-index", "3"])
     assert result.exit_code == 2, result.output
     assert "local task lease" in json.loads(result.output)["detail"]
-    assert not (directory / "prepared-images").exists()
+    assert not (evidence_root(directory)).exists()
 
 
 @pytest.mark.parametrize("arguments", [["../outside"], ["agt_unrelated"], ["agt_image_prepare", "--segment-index", "4"]])
@@ -255,17 +340,43 @@ def test_missing_pillow_has_diagnostic_cli_result(workspace, monkeypatch):
     assert json.loads(result.output)["status"] == "PREPARATION_UNAVAILABLE"
 
 
-def test_rejects_redirected_output_directory(workspace, tmp_path):
+@pytest.mark.parametrize("redirect_task_directory", [False, True])
+def test_rejects_redirected_output_directory(workspace, tmp_path, redirect_task_directory):
     directory, _, _ = workspace
     outside = tmp_path / "outside"
     outside.mkdir()
+    link = evidence_root(directory)
+    if redirect_task_directory:
+        link.mkdir()
+        link /= directory.name
     try:
-        (directory / "prepared-images").symlink_to(outside, target_is_directory=True)
+        link.symlink_to(outside, target_is_directory=True)
     except OSError:
         pytest.skip("Host does not permit test symlinks")
     with pytest.raises(ValueError, match="redirected"):
         run_prepare(workspace)
     assert list(outside.iterdir()) == []
+
+
+def test_rejects_redirected_source_parent(workspace, tmp_path):
+    directory, source, config = workspace
+    link = tmp_path / "source-link"
+    try:
+        link.symlink_to(source.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("Host does not permit test symlinks")
+    with pytest.raises(ValueError, match="redirected"):
+        prepare_image(directory, directory.name, config.agent_id, link / source.name, 3)
+    assert not (evidence_root(directory)).exists()
+
+
+def test_refuses_mismatched_workspace_path_before_writing_evidence(workspace):
+    directory, source, config = workspace
+    renamed = directory.with_name("agt_other")
+    directory.rename(renamed)
+    with pytest.raises(ValueError, match="exact task workspace"):
+        prepare_image(renamed, directory.name, config.agent_id, source, 3)
+    assert not (evidence_root(directory)).exists()
 
 
 def test_invalid_image_is_rejected_without_workspace_error(workspace):

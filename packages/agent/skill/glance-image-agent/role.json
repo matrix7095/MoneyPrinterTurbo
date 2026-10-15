@@ -1,1 +1,1 @@
-{"role_id":"image","skill_name":"glance-image-agent","skill_version":"1.2.0","protocol_version":"1","task_types":["asset_generate_image"]}
+{"role_id":"image","skill_name":"glance-image-agent","skill_version":"1.2.1","protocol_version":"1","task_types":["asset_generate_image"]}
