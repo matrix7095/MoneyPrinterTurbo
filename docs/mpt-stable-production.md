@@ -1,12 +1,42 @@
 # MoneyPrinterTurbo 稳定生产与运维记录
 
-更新日期：2026-10-13。本文随稳定生产修复提交。当前验收清单优先；后文保留历史检查点，旧调度恢复要求不再适用于按需生产。
+更新日期：2026-10-15。本文随稳定生产修复提交。当前验收清单优先；后文保留历史检查点，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
 
-当前结论：尚未完成稳定生产验收。此前生产修复已部署，新按需宿主代码已提交、推送并集成主目录源码，但生产API尚未重启加载；真实执行与界面接入仍在验收。第7版旧成片的音频联合证据与全帧视觉方法已有记录，不能代替新内容的正式QC和真实发布，不能承诺后续稳定产出。
+当前结论：尚未完成稳定生产验收。按需宿主与已验证Skill路径绑定修复 `2b5ffce` 已部署到主目录，API和界面已重启加载。Aurzen本次真实生产运行已启动，仍待新成片、独立正式QC和真实发布验证。第7版旧成片的证据及隔离研究成功均不能代替这些生产结果，当前不能承诺后续稳定产出。
+
+## 当前操作方式与部署证据
+
+本系统按需工作：在工作台选择内容，点击“运行一次”，从当前阶段继续到制作、独立审核和发布，完成后结束。无需创建或恢复业务定时任务。若本次新AI概念图片需要本机适配，可明确勾选仅本次授权；默认不勾选，原图、处理记录、冻结最低尺寸及独立审核仍保留。运行中通过“刷新运行状态”查看；需要收尾时使用“停止新增工作”，等待已有Worker结束，不重复启动。
+
+2026-10-15 14:14（Asia/Shanghai）核验：主目录API PID5668、界面PID27684分别监听8000和8510；授权内容API200、匿名401、界面健康200。运行时app、agent、collector、core、media全部来自主目录。七个角色通过实际部署验证，使用同一不可变stage `production-stable-20261013-2b5ffce-8000`；未注册未经验证的原生视频生成角色。`scheduler.enabled=false`、`handsfree_auto_topic_enabled=false`，自动审核及授权发布保留。MPT Runtime Watchdog为Ready，旧Glance守护Disabled；守护不触发生产。
+
+实际只读数据库核验：原3010个任务的输入、结果与指令哈希全部保持；当前3011个任务仅新增Aurzen正常生图修复任务 `agt_5b1689d5c7bb494e89361d85a865e8a2`，8个请求，attempt0。旧失败任务完整记录哈希未变。正常修复服务创建新版本并留有审计，不重置旧任务预算。部署证明 `storage/smoke/stable-production-20261013/deployed-state-20261015.json`，修复证明 `aurzen-manual-repair-proof.json`。私有一致性数据库备份和配置备份保存在同目录private中，不公开凭据。
+
+本次按需运行 `run_91f166dd8a353358a4fc5973d70862da` 已由正式API启动，`host_ready=true`，实际原生子线程身份为Sol/high/default/ephemeral，父子关系已验证；生图结果及后续发布尚未完成，不能把启动成功当作生产验收。
+
+已验证部署Skill实际读取的独立研究运行：`2b5ffce` 上task `agt_a297c8d9ae1b4719b14f2b913b0f5a0b` COMPLETED/attempt1，submission `sub_81dc4b2f125f476eb9a8ba6f7619a9f2` ACCEPTED，Core、submission、completed和消费记录同哈希 `f8d7e417a613d0cad518cf387e540a14fddf04d1120bcfd7d43dad2ea0d1c70c`。实际读取已签发stage中的SKILL.md及同包协议，18条命令exit0，649次HTTP均200，父子自然结束，无全局Skill读取。安全摘要 `staged-skill-native-safe-final-evidence.json`；初始消息独立正文哈希及developer指令继承未被接口暴露，不作已验证声明。
+
+验证范围：完整业务回归1339项覆盖 `1be5fff`；后继叶子合同修订独立241项、路径绑定修订独立327项通过，冻结源文件匹配。隔离研究和测试不代表生产图片、成片QC或真实发布成功。后文2026-10-13及更早段落均为历史记录。
 
 ## 当前验收清单
 
+叶子修订后的首次Sol/high隔离运行未再递归，但未正式claim即自然terminal，宿主记录 `CONDUCTOR_HANDOFF_NOT_CLAIMED`。已终态ephemeral线程无法恢复正文，因此未将无工具调用归因为权限或父指令继承；保留该失败记录。
+
+随后同一`634a446`源码与同一合法Research合同，仅增强受限本机观测的新运行已真实成功：task `agt_f2185c994c124a8ebe023067a311470d` 为COMPLETED/attempt1，submission `sub_8ff991b7345f426bbacc7746b2cc64f9` 为ACCEPTED。Core结果、submission、completed与mpt_agent_consumed均同哈希 `6689aa8f96bad5ce75e588cf8b1e95f5fe99817dd8763abb37b98a8333ece8fe`；Root独立只读实际SQLite重核claim/明确confirm、agent、run与Sol/high/default/ephemeral父子身份。native自然exit0，无超时、强制关闭或延迟清理，523 HTTP均200，1157源文件前后不变。证明 `accepted-research-safe-final-evidence.json` 与 `root-accepted-research-proof.json`。后继脚本角色未部署导致正常BLOCKED，不宣称完整生产周期完成。
+
+此历史成功运行实际读取了旧全局Research Skill，其文件不属于仓库冻结集；已部署Skill 1.2.1验证与实际读取并非同一件事。后继 `2b5ffce` 已补齐首次签发及任务提示对已验证部署Skill绝对路径的绑定，并用新隔离真实运行验证实际读取，保持全局用户Skill不变；新视频、v3正式QC与真实发布仍待完成。
+
+2026-10-13 实时复核：8000 API 为主目录进程 PID19344，8510 界面为主目录进程 PID16940；`GET /api/v1/agent/scheduler/config` 实际返回 `enabled=false`。待续内容 `content_0e05066e9e8b48c092e5f3c3ffaa3637` 仍为 `WAITING_AGENT/asset_generate`，研究、脚本及画面计划已完成，图片任务失败。尚未新增发布；不能以服务在线替代稳定产出验收。
+
+研究 context 合同和五种动效 active-window/cap 修订已提交并推送 `1be5ffff577d8dc9edb4af353a7f9aa0f64e2c49`。八文件独立复审APPROVE，精确十三模块443项通过（467.50秒、exit 0），八个SHA前后一致。Root完整 `test/business` 回归1339项通过（884.34秒、exit 0、7424条依赖警告），416个已跟踪源文件SHA前后一致，另核八文件冻结包含新增研究测试全部一致。此前失败任务、冻结输入和预算保持原状。完整回归证明记录位于实施工作树 `.artifacts/root-final-business-regression-result.json`；这只证明该提交源码回归，不替代下一次递归边界修订的验证或真实生产验收。
+
+新官方 Raspberry Pi 5 隔离真实研究验证已使用 `RESEARCH_ONLY` 候选及冻结源码，不把公开网页误记为有成片素材授权。已验证身份的研究Worker递归创建孙线程，宿主正常拒绝并停止，任务仍PENDING/attempt 0，无claim/submission。因此当前仍未证明研究accepted+consumed成功；正在检查一次性Worker提示的递归边界，不放宽宿主admission或改签发offer。
+
 当前执行方式：用户选择一个主题并启动一次生产，Codex 宿主在该次运行内推进研究、脚本、素材、渲染、独立审核与发布，结束后停止。无需周期性生产任务；内部任务派发、容量控制和租约保留。服务故障守护独立于生产触发。恢复业务定时任务或将全局 scheduler enabled 设为 true，不是当前验收条件。
+
+最新已推送实施提交为 `codex/mpt-stable-production` 的 `634a4465607468b8b3607f911e39974b7a3183b8`，尚未部署其新增界面与v3审核。叶子Worker修订七文件独立APPROVE、241项入口回归通过（91.68秒、exit 0），提交后七SHA仍与冻结记录一致；首次签发与后续任务提示共享叶子职责规则，Research staging/server版本均1.2.1，父宿主派发及业务身份校验保持原有边界。新的生产档位Sol/high隔离研究验证正在推进，提示修订不能当作实际执行成功。按需界面基础 `6b21cee` 已独立20项测试和复审通过；有限图片适配授权 `cbc7154` 已独立79项测试和复审通过，默认关闭、只限本run、新generation重新选择，不能修改已有授权或扩大Recovery预算。v3全帧联合证据 `c16ddfe` 已独立405项相关回归与33项新测试通过，保留旧v2与九项硬闸门；真实原生审核仍须单独验收。这些切片通过不能代替新视频和真实发布。
+
+连接故障已定位：5秒轮询与服务端5秒空闲连接关闭发生竞态，真实诊断捕获即时 `RemoteProtocolError`，并非已证明的请求超时。有界对照默认复用2/14失败、禁复用0/14；修复 `1dc43a5` 只禁HttpBackend空闲复用，保留30秒超时和原错误语义，不增加重试，独立60项测试通过。新隔离原生运行609次HTTP无该错误，研究Worker正常失败后实际terminal、stop、native exit 0自然收尾，无强制关闭；研究accepted/consumed仍未通过，失败因合法URL研究任务被误要求未声明的context材料，合同澄清正在修订。没有修改已失败任务或预算。
 
 真实默认角色绑定已验证：一次原生父子运行在21.937秒内完成。服务端 thread/read 返回 child 的 default、gpt-6-luna/max、ephemeral=true 及正确父关联，started 活动中的 agentPath 与指定任务名一致；父子均完成并返回约定文本。证据 `native-app-rpc-default-binding-result.json`、`native-app-rpc-default-binding-events.jsonl`。这是身份与生命周期探针，未领取业务任务，也不是实际生产执行器的运行验收。
 
