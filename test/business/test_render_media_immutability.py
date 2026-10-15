@@ -33,7 +33,8 @@ def render_fixture(tmp_path, monkeypatch):
     def fake_command(command, **kwargs):
         target = Path(command[-1])
         source = Path(command[command.index("-i") + 1])
-        target.write_bytes(source.read_bytes() + target.suffix.encode())
+        voice = Path(command[command.index("-i", command.index("-i") + 1) + 1]).read_bytes() if target.name == "final.mp4" else b""
+        target.write_bytes(source.read_bytes() + voice + target.suffix.encode())
 
     monkeypatch.setattr(media_executor, "run_command", fake_command)
     projects = {}
@@ -68,13 +69,6 @@ def render_fixture(tmp_path, monkeypatch):
 
     monkeypatch.setattr(media_executor, "VideoProject", Project)
 
-    def generate(**kwargs):
-        Path(kwargs["output_file"]).write_bytes(
-            Path(kwargs["video_path"]).read_bytes() + Path(kwargs["audio_path"]).read_bytes()
-        )
-        return True
-
-    monkeypatch.setattr("app.services.video.generate_video", generate)
     return executor, arguments
 
 
@@ -101,7 +95,12 @@ def test_committed_output_tampering_fails_before_regeneration(render_fixture, mo
     final, preview = executor.render(**arguments)
     receipt = final.with_name("outputs.json").read_bytes()
     final.write_bytes(b"tampered")
-    monkeypatch.setattr("app.services.video.generate_video", lambda **kw: pytest.fail("must not regenerate"))
+    actual_command = media_executor.run_command
+    def no_final_mux(command, **kwargs):
+        if Path(command[-1]).name == "final.mp4":
+            pytest.fail("must not regenerate")
+        return actual_command(command, **kwargs)
+    monkeypatch.setattr(media_executor, "run_command", no_final_mux)
     with pytest.raises(NonRetryableMediaError, match="integrity"):
         executor.render(**arguments)
     assert final.read_bytes() == b"tampered"
@@ -124,13 +123,16 @@ def test_interrupted_render_same_bytes_resume_and_changed_bytes_fail(render_fixt
     before = final.read_bytes()
     assert not final.with_name("outputs.json").exists()
     monkeypatch.setattr(media_executor, "run_command", actual_command)
-    generate = __import__("app.services.video", fromlist=["generate_video"]).generate_video
-    monkeypatch.setattr("app.services.video.generate_video",
-                        lambda **kw: Path(kw["output_file"]).write_bytes(b"different retry bytes"))
+    def changed_mux(command, **kwargs):
+        if Path(command[-1]).name == "final.mp4":
+            Path(command[-1]).write_bytes(b"different retry bytes")
+        else:
+            actual_command(command, **kwargs)
+    monkeypatch.setattr(media_executor, "run_command", changed_mux)
     with pytest.raises(NonRetryableMediaError, match="immutable"):
         executor.render(**arguments)
     assert final.read_bytes() == before and not final.with_name("outputs.json").exists()
-    monkeypatch.setattr("app.services.video.generate_video", generate)
+    monkeypatch.setattr(media_executor, "run_command", actual_command)
     resumed = executor.render(**arguments)
     assert resumed[0] == final and final.read_bytes() == before and resumed[1].is_file()
     assert json.loads(final.with_name("outputs.json").read_text()) == {
@@ -267,3 +269,17 @@ def test_two_real_renders_and_review_frames_remain_immutable(tmp_path):
         assert probe(output)["format"]["duration"]
         run_command(["ffmpeg", "-v", "error", "-i", str(output), "-f", "null", "-"], cwd=executor.root)
     assert (executor.package({"title": "new"}, final_path=second[0]) / "final.mp4").read_bytes() == second[0].read_bytes()
+
+
+def test_renderer_upgrade_creates_new_revision_without_replacing_old_outputs(render_fixture, monkeypatch):
+    executor, arguments = render_fixture
+    monkeypatch.setattr(media_executor, "RENDERER_VERSION", "local-ffmpeg-v1")
+    old = executor.render(**arguments)
+    frozen = {path: path.read_bytes() for path in old}
+    monkeypatch.setattr(media_executor, "RENDERER_VERSION", "local-ffmpeg-v2-cfr-pcm")
+    new = executor.render(**arguments)
+    assert old[0].parent != new[0].parent
+    assert {path: path.read_bytes() for path in old} == frozen
+    receipt = json.loads((executor.root / "render/mpt-render-request.json").read_text())
+    assert receipt["renderer_version"] == "local-ffmpeg-v2-cfr-pcm"
+    assert executor.render(**arguments) == new

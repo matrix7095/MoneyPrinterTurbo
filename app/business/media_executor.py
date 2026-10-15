@@ -1,6 +1,7 @@
 """Glance acquisition/QC helpers with MPT's real deterministic render backend."""
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -29,7 +30,7 @@ from glance_media.executor import (
 )
 from glance_media.render_plan import RenderPlan
 
-from app.services.video_project import VideoProject, _atomic_json, _lock
+from app.services.video_project import RENDERER_VERSION, VideoProject, _atomic_json, _lock
 
 
 class MptMediaExecutor(MediaExecutor):
@@ -59,7 +60,6 @@ class MptMediaExecutor(MediaExecutor):
         bgm_meta=None,
     ):
         from app.models.schema import VideoParams
-        from app.services.video import generate_video
 
         voice_path = self._local_asset(Path(voice_path))
         voice_duration = _finite_seconds(probe(voice_path)["format"]["duration"], label="Voice duration")
@@ -120,9 +120,17 @@ class MptMediaExecutor(MediaExecutor):
             segment.scene_id is not None for segment in plan.segments
         ) else None
         project_scenes = []
+        previous_frame = 0
         for index, segment in enumerate(plan.segments):
             start, end = segment.narration_start_sec, segment.narration_end_sec
             duration = end - start
+            # Quantize cumulative edges once, rather than rounding every WAV duration again.
+            end_frame = math.ceil(end * 30 - 1e-9)
+            frame_count = end_frame - previous_frame
+            if frame_count <= 0:
+                raise NonRetryableMediaError("Render segment is shorter than one video frame")
+            start_frame = previous_frame
+            previous_frame = end_frame
             if segment.scene_id is not None:
                 scene = scene_map.get(segment.scene_id)
                 if scene is None:
@@ -157,12 +165,12 @@ class MptMediaExecutor(MediaExecutor):
                 segment.layout, motion=segment.motion, focus_x=segment.focus_x, focus_y=segment.focus_y
             )
             filters = _with_transition(filters, segment.transition)
-            filters += f",setpts=PTS+{start:.6f}/TB,{subtitle_filter},setpts=PTS-STARTPTS"
+            filters += f",settb=1/30,setpts=PTS+{start_frame},{subtitle_filter},setpts=PTS-STARTPTS"
             footage = prepared / f"scene-{index:03d}.mp4"
             audio = prepared / f"scene-{index:03d}.wav"
             run_command(
                 ["ffmpeg", "-y", "-threads", "1", "-filter_threads", "1", *source_arguments,
-                 "-t", f"{duration:.6f}", "-an", "-vf", filters, *_encoder_args(encoder),
+                 "-frames:v", str(frame_count), "-an", "-vf", filters, *_encoder_args(encoder),
                  "-pix_fmt", "yuv420p", str(footage)],
                 cwd=self.root,
             )
@@ -172,13 +180,15 @@ class MptMediaExecutor(MediaExecutor):
                  "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(audio)],
                 cwd=self.root,
             )
-            project_scenes.append({"id": f"scene-{index:03d}", "footage": str(footage), "audio": str(audio)})
+            project_scenes.append({"id": f"scene-{index:03d}", "footage": str(footage),
+                                   "audio": str(audio), "frame_count": frame_count})
 
         project = VideoProject(self.root / "render" / "mpt-project")
         request = {"project_id": self.root.name, "scenes": project_scenes}
         if bgm_path is not None and not Path(bgm_path).is_file():
             raise NonRetryableMediaError("Requested BGM file is missing")
         request_receipt = {
+            "renderer_version": RENDERER_VERSION,
             "voice_sha256": sha256_file(voice_path),
             "bgm_sha256": sha256_file(Path(bgm_path)) if bgm_path else None,
             "bgm_volume": bgm_volume,
@@ -225,13 +235,22 @@ class MptMediaExecutor(MediaExecutor):
                 return final, preview
             with tempfile.TemporaryDirectory(prefix=".render-", dir=output_dir) as directory:
                 temporary = Path(directory) / "final.mp4"
-                bgm_succeeded = generate_video(
-                    video_path=status["export"]["path"], audio_path=str(voice_path), subtitle_path="",
-                    output_file=str(temporary), params=parameters,
-                    bgm_file_override=str(bgm_path) if bgm_path else None,
-                )
-                if bgm_path and not bgm_succeeded:
-                    raise NonRetryableMediaError("Requested BGM could not be mixed")
+                # Keep the approved CFR frames; MoviePy's rounded container duration can add/drop one.
+                command = ["ffmpeg", "-y", "-i", status["export"]["path"], "-i", str(voice_path)]
+                if bgm_path and parameters.bgm_volume and parameters.bgm_volume > 0:
+                    fade_duration = min(3.0, voice_duration)
+                    command += ["-i", str(bgm_path), "-filter_complex",
+                                f"[2:a]atrim=duration={voice_duration:.9f},"
+                                f"volume={parameters.bgm_volume},"
+                                f"afade=t=out:st={voice_duration - fade_duration:.9f}:"
+                                f"d={fade_duration:.9f}[music];"
+                                "[1:a][music]amix=inputs=2:duration=first:normalize=0[a]",
+                                "-map", "0:v:0", "-map", "[a]"]
+                else:
+                    command += ["-map", "0:v:0", "-map", "1:a:0"]
+                run_command(command + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                       "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
+                                       str(temporary)], cwd=self.root)
                 self._promote_immutable_output(temporary, final)
                 preview_temporary = Path(directory) / "preview.mp4"
                 run_command(

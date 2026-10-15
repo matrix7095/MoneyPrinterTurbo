@@ -24,7 +24,7 @@ from uuid import uuid4
 
 PREPARED_FORMATS = "mov,matroska,avi,mpegts,mpegvideo,ogg,flv,wav,mp3,flac,aac"
 SCHEMA_VERSION = 1
-RENDERER_VERSION = "local-ffmpeg-v1"
+RENDERER_VERSION = "local-ffmpeg-v2-cfr-pcm"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -200,6 +200,7 @@ def stage_graph(spec: dict) -> list[Stage]:
                 "scene",
                 timing,
                 scene["footage"],
+                scene.get("frame_count"),
                 settings.width,
                 settings.height,
                 settings.fps,
@@ -235,7 +236,7 @@ def stage_graph(spec: dict) -> list[Stage]:
                 "assembly",
                 "assembly",
                 assembly,
-                tuple(f"{s['id']}:scene" for s in spec["scenes"]),
+                tuple(key for s in spec["scenes"] for key in (f"{s['id']}:scene", f"{s['id']}:audio")),
             ),
             Stage("export", "export", final, ("assembly",)),
         ]
@@ -313,6 +314,7 @@ class VideoProject:
                 "audio",
                 "narration",
                 "duration",
+                "frame_count",
             }:
                 raise ProjectError("unknown scene fields")
             scene_id = _identifier(raw["id"])
@@ -333,12 +335,18 @@ class VideoProject:
                 raise ProjectError(
                     "narration requires prepared audio; this renderer does not generate speech"
                 )
+            frame_count = raw.get("frame_count")
+            if frame_count is not None and (
+                type(frame_count) is not int or not 1 <= frame_count <= settings.fps * 3600
+            ):
+                raise ProjectError("scene frame_count must be an integer covering at most 3600 seconds")
             scenes.append(
                 {
                     "id": scene_id,
                     "narration": narration,
                     "duration": duration,
                     "footage": self._asset(raw["footage"], Path(relative_to)),
+                    **({"frame_count": frame_count} if frame_count is not None else {}),
                     "audio": self._asset(raw["audio"], Path(relative_to))
                     if raw.get("audio")
                     else None,
@@ -725,6 +733,15 @@ class VideoProject:
                 duration = self._read(Path(results[f"{scene['id']}:timing"]["path"]))[
                     "duration"
                 ]
+                if "frame_count" in scene:
+                    if abs(scene["frame_count"] / settings.fps - duration) > 1 / settings.fps + 1e-6:
+                        raise ProjectError("scene frame_count does not match prepared audio timing")
+                    timing_args = ["-frames:v", str(scene["frame_count"])]
+                    audio_input, audio_output = [], ["-an"]
+                else:
+                    timing_args = ["-t", str(duration)]
+                    audio_input = ["-i", results[f"{scene['id']}:audio"]["path"]]
+                    audio_output = ["-map", "1:a:0", "-c:a", "aac", "-ar", "48000", "-ac", "2"]
                 vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height},setsar=1,fps={settings.fps}"
                 self._run(
                     base
@@ -735,28 +752,19 @@ class VideoProject:
                         PREPARED_FORMATS,
                         "-i",
                         str(self._asset_path(scene["footage"])),
-                        "-i",
-                        results[f"{scene['id']}:audio"]["path"],
+                        *audio_input,
                         "-map",
                         "0:v:0",
-                        "-map",
-                        "1:a:0",
+                        *audio_output,
                         "-vf",
                         vf,
-                        "-t",
-                        str(duration),
+                        *timing_args,
                         "-c:v",
                         "libx264",
                         "-preset",
                         "veryfast",
                         "-pix_fmt",
                         "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-ar",
-                        "48000",
-                        "-ac",
-                        "2",
                         "-movflags",
                         "+faststart",
                         str(output),
@@ -765,17 +773,34 @@ class VideoProject:
                     timeout,
                 )
             elif stage.kind == "assembly":
-                # Relative numeric links avoid concat syntax/path injection, including apostrophes.
+                # Independent PCM concat avoids adding an AAC encoder-delay clock at every cut.
+                # Relative numeric files also avoid concat syntax/path injection.
+                video_entries = []
                 for index, scene_spec in enumerate(spec["scenes"]):
+                    scene_path = results[f"{scene_spec['id']}:scene"]["path"]
+                    frame_count = int(self._run(
+                        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                         "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1", scene_path],
+                        cancel, timeout,
+                    ).strip())
+                    # MP4 format duration is rounded to milliseconds; concat must use the frame clock.
+                    video_entries.append(f"file '{index}.mp4'\nduration {frame_count / settings.fps:.9f}\n")
                     shutil.copyfile(
                         results[f"{scene_spec['id']}:scene"]["path"],
                         temporary / f"{index}.mp4",
                     )
+                    shutil.copyfile(
+                        results[f"{scene_spec['id']}:audio"]["path"],
+                        temporary / f"{index}.wav",
+                    )
                 listing = temporary / "concat.txt"
+                audio_listing = temporary / "audio.txt"
+                audio_listing.write_text(
+                    "".join(f"file '{index}.wav'\n" for index in range(len(spec["scenes"]))),
+                    encoding="utf-8",
+                )
                 listing.write_text(
-                    "".join(
-                        f"file '{index}.mp4'\n" for index in range(len(spec["scenes"]))
-                    ),
+                    "".join(video_entries),
                     encoding="utf-8",
                 )
                 self._run(
@@ -787,8 +812,24 @@ class VideoProject:
                         "1",
                         "-i",
                         str(listing),
-                        "-c",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "1",
+                        "-i",
+                        str(audio_listing),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
                         "copy",
+                        "-c:a",
+                        "aac",
+                        "-ar",
+                        "48000",
+                        "-ac",
+                        "2",
                         "-movflags",
                         "+faststart",
                         str(output),
