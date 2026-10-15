@@ -401,6 +401,7 @@ def bundle(
         service,
         session,
         get_runtime(request).workflow_service(session),
+        failure_recovery=get_runtime(request).schedule_failure_recovery,
     )
     if task.content_id:
         files = context_files_for(task, session)
@@ -675,7 +676,7 @@ def fail(
 @router.post("/agent/tasks/{task_id}/retry-recovery", dependencies=[Depends(require_admin)])
 def retry_failure_recovery(*, task_id: str, request: Request):
     try:
-        return get_runtime(request).schedule_failure_recovery(task_id)
+        return get_runtime(request).schedule_failure_recovery(task_id, reconcile_bundle_preflight=True)
     except KeyError:
         raise HTTPException(status_code=404, detail="Task not found") from None
     except TaskConflictError as exc:

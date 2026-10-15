@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ from glance_core.task_schemas import schema_for
 from glance_core.task_service import AgentTaskService, TaskConflictError, stable_hash
 from glance_core.workflow import WorkflowService
 from sqlmodel import Session, select
+
+logger = logging.getLogger(__name__)
 
 
 def sha256_file(path: Path) -> str:
@@ -342,8 +345,12 @@ def fail_bundle_preflight(
     lease_token: str,
     errors: list[dict[str, Any]],
     flow: WorkflowService,
+    *,
+    failure_recovery,
 ) -> None:
     """Stop a malformed leased task and start its Recovery chain server-side."""
+    if not callable(failure_recovery):
+        raise ValueError("MPT_FAILURE_RECOVERY_HANDLER_REQUIRED")
     message = "；".join(
         f"{'.'.join(str(part) for part in error.get('path', []))}: {error.get('message', '')}"
         for error in errors[:30]
@@ -369,20 +376,18 @@ def fail_bundle_preflight(
         )
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    recovery = flow.create_recovery_task(
-        failed,
-        code=failed.error_code or "ENVIRONMENT_MISSING_INPUT",
-        message=message,
-        retryable=False,
-        validation_errors=errors,
-        actor_id="bundle-preflight",
-    )
+    try:
+        recovery_id = failure_recovery(failed.id, validation_errors=errors)["recovery_task_id"]
+    except Exception:
+        # The terminal failure is already committed; never undo it on admission failure.
+        logger.exception("Bundle preflight failure pending recovery: %s", failed.id)
+        recovery_id = None
     raise HTTPException(
         status_code=409,
         detail={
             "code": failed.error_code,
             "message": message,
-            "recovery_task_id": recovery.id if recovery is not None else None,
+            "recovery_task_id": recovery_id,
         },
     )
 
@@ -393,7 +398,11 @@ def build_bundle(
     service: AgentTaskService,
     session: Session,
     flow: WorkflowService,
+    *,
+    failure_recovery,
 ) -> dict:
+    if not callable(failure_recovery):
+        raise ValueError("MPT_FAILURE_RECOVERY_HANDLER_REQUIRED")
     try:
         task = service.require_lease(task_id, token)
     except KeyError:
@@ -743,7 +752,7 @@ def build_bundle(
         context_manifest,
     )
     if bundle_errors:
-        fail_bundle_preflight(service, task, token, bundle_errors, flow)
+        fail_bundle_preflight(service, task, token, bundle_errors, flow, failure_recovery=failure_recovery)
     extra_context = scene_evidence_context(task, session, flow)
     extra_offset = len(context_files)
     for index, (name, data) in enumerate(extra_context, extra_offset):

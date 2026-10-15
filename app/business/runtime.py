@@ -33,6 +33,7 @@ CONSUMED = "mpt_discovery_consumed"
 AGENT_CONSUMED = "mpt_agent_consumed"
 OWNED = "mpt_task_owned"
 FAILURE_RECOVERY = "mpt_failure_recovery_created"
+FAILURE_RECOVERY_RECONCILED = "mpt_bundle_failure_recovery_reconciled"
 QC_RECOVERY = "mpt_content_qc_recovery_created"
 QC_PLAN_REJECTED = "mpt_content_qc_recovery_plan_rejected"
 QC_TARGET_REJECTION = "RECOVERY_QC_TARGET_CHANGED"
@@ -108,6 +109,41 @@ def _require_reconciled_content(session, content_id):
                 or AgentTaskService._intent_sequence(event) < 0
                 or data.get("status") != "FAILED"):
             raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+
+
+def _require_idle_bundle_recovery(session, content_id):
+    from app.business.content_run import load_run
+    from glance_core.models import PublicationRecord
+
+    run = load_run(session)
+    if run is not None and run.content_id == content_id and run.state not in {"stopped", "expired"}:
+        raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+    if (session.exec(select(AgentTask.id).where(
+            AgentTask.content_id == content_id,
+            AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+        )).first() or session.exec(select(SchedulerOffer.request_id).where(
+            SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == content_id)),
+            SchedulerOffer.expires_at > utc_now(),
+        )).first()):
+        raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+    if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first():
+        raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+    _require_reconciled_content(session, content_id)
+
+
+def _require_bundle_recovery_subject(session, source):
+    from glance_core.content_acceptance import acceptance_subject
+
+    content = session.get(Content, source.content_id)
+    if content is None or (content.business_status, content.current_stage) != (ContentStatus.WAITING_AGENT, "recovery"):
+        raise TaskConflictError("RECOVERY_CONTENT_NOT_CURRENT")
+    inputs = source.input_data
+    refs = {**inputs.get("upstream_task_ids", {}), "video_artifact_id": inputs.get("video_artifact_id")}
+    if acceptance_subject(session, source.content_id, refs,
+                          source_context_version=inputs.get("source_context_version"),
+                          audio_evidence=inputs.get("audio_evidence"),
+                          visual_evidence=inputs.get("visual_evidence")) != inputs.get("acceptance_subject"):
+        raise TaskConflictError("RECOVERY_SOURCE_SUBJECT_CHANGED")
 
 
 def settings_from_config(
@@ -344,7 +380,74 @@ class BusinessRuntime:
             raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
         return plan
 
-    def schedule_failure_recovery(self, task_id):
+    def _failure_recovery_metadata(self, task, recovery, *, targets=()):
+        return {"source_task_id": task.id, "source_input_hash": task.input_hash,
+                "source_attempt": task.attempt, "source_failure_hash": _failure_hash(task),
+                "recovery_input_hash": recovery.input_hash,
+                "target_hashes": {parent.id: {"input": parent.input_hash,
+                                              "result": stable_hash(parent.result_data)} for parent in targets}}
+
+    def _reconcile_bundle_failure(self, session, source, recovery):
+        """Adopt only a proven native preflight chain, without rewriting its frozen records."""
+        from glance_core.task_schemas import RecoveryPlan
+
+        _require_owned_input(session, recovery)
+        _require_current_revision(session, recovery)
+        self._require_accepted_native_task(session, recovery, consumed=False)
+        failure = recovery.input_data.get("failure") or {}
+        lineage = recovery.input_data.get("lineage") or {}
+        flow = self.workflow_service(session)
+        expected_class = flow.classify_recovery_failure(source, code=source.error_code, retryable=False)
+        signature = flow._root_cause_signature(expected_class, source.error_code[:120])
+        origins = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == "recovery_task_created",
+        )).all()
+        if (source.task_type != TaskType.CONTENT_QC or source.schema_version not in {"2", "3"}
+                or source.error_code not in {"ENVIRONMENT_MISSING_INPUT", "ENVIRONMENT_MISSING_CONTEXT"}
+                or recovery.task_type != TaskType.RECOVERY or recovery.status != TaskStatus.COMPLETED
+                or recovery.attempt < 1 or recovery.content_id != source.content_id
+                or failure.get("source_task_id") != source.id
+                or failure.get("source_task_type") != source.task_type.value
+                or failure.get("source_attempt") != source.attempt or failure.get("retryable") is not False
+                or failure.get("code") != source.error_code or failure.get("message") != source.error_message
+                or failure.get("failure_class") != expected_class
+                or lineage.get("parent_task_id") != source.id or lineage.get("repair_target_task_id") != source.id
+                or lineage.get("content_id") != source.content_id or lineage.get("source_attempt") != source.attempt
+                or lineage.get("target_task_type") != source.task_type.value
+                or lineage.get("repair_fingerprint") != flow._repair_fingerprint(
+                    source, failure_class=expected_class, code=source.error_code)
+                or lineage.get("root_cause_signature") != signature
+                or len(origins) != 1 or origins[0].actor_type != "system" or origins[0].actor_id != "bundle-preflight"
+                or origins[0].metadata_json != {
+                    "source_task_id": source.id, "failure_class": expected_class, "code": source.error_code,
+                    "root_cause_signature": signature, "round": lineage.get("round"), "target_task_id": source.id,
+                }):
+            raise TaskConflictError("RECOVERY_BUNDLE_ORIGIN_UNVERIFIED")
+        errors = failure.get("validation_errors")
+        if (not isinstance(errors, list) or not errors or any(not isinstance(error, dict) for error in errors)
+                or "；".join(f"{'.'.join(str(part) for part in error.get('path', []))}: {error.get('message', '')}"
+                            for error in errors[:30])[:4000] != source.error_message):
+            raise TaskConflictError("RECOVERY_BUNDLE_ORIGIN_UNVERIFIED")
+        RecoveryPlan.model_validate(recovery.result_data)
+        _require_bundle_recovery_subject(session, source)
+        _require_idle_bundle_recovery(session, source.content_id)
+        if session.exec(select(AuditEvent.id).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action.in_([FAILURE_RECOVERY, FAILURE_RECOVERY_RECONCILED, AGENT_CONSUMED,
+                                  "recovery_blocked", "recovery_escalated"]),
+        )).first() or session.exec(select(AgentTask.id).where(
+            AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
+        )).first():
+            raise TaskConflictError("RECOVERY_BUNDLE_ALREADY_APPLIED")
+        origin = origins[0]
+        metadata = {**self._failure_recovery_metadata(source, recovery),
+                    "origin_event_id": origin.id, "origin_metadata_hash": stable_hash(origin.metadata_json),
+                    "accepted_result_hash": stable_hash(recovery.result_data)}
+        session.add(AuditEvent(actor_type="admin", actor_id="mpt-admin-api", entity_type="agent_task",
+                               entity_id=recovery.id, action=FAILURE_RECOVERY_RECONCILED, metadata_json=metadata))
+
+    def schedule_failure_recovery(self, task_id, *, validation_errors=None, reconcile_bundle_preflight=False):
         from app.business.pipeline import workflow
 
         with Session(self.engine) as session:
@@ -369,6 +472,18 @@ class BusinessRuntime:
                             _require_owned_input(session, recovery)
                             if failure.get("code") != task.error_code:
                                 raise TaskConflictError("RECOVERY_FAILURE_CHANGED")
+                            receipts = session.exec(select(AuditEvent).where(
+                                AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                                AuditEvent.action.in_([FAILURE_RECOVERY, FAILURE_RECOVERY_RECONCILED]),
+                            )).all()
+                            if not receipts:
+                                if not reconcile_bundle_preflight:
+                                    raise TaskConflictError("RECOVERY_FAILURE_RECEIPT_MISSING")
+                                try:
+                                    self._reconcile_bundle_failure(session, task, recovery)
+                                except (OSError, ValueError, KeyError, TypeError) as exc:
+                                    raise TaskConflictError(str(exc)) from exc
+                                Session.commit(session)
                             return {"recovery_status": recovery.status.value, "recovery_task_id": recovery.id}
                     if task.content_id and session.exec(select(AgentTask.id).where(
                         AgentTask.content_id == task.content_id,
@@ -392,6 +507,7 @@ class BusinessRuntime:
                             repair_target_task_id=target.id if target is not None and task.error_code
                             == "GENERATED_IMAGE_CONSTRAINT_MISMATCH" else None,
                             actor_id="mpt-agent-failure",
+                            validation_errors=validation_errors,
                         )
                     if recovery is not None:
                         if recovery.id in {row.id for row in existing}:
@@ -404,14 +520,9 @@ class BusinessRuntime:
                             session.add(AuditEvent(
                                 actor_type="system", actor_id="mpt-agent-failure", entity_type="agent_task",
                                 entity_id=recovery.id, action=FAILURE_RECOVERY,
-                                metadata_json={"source_task_id": task.id, "source_input_hash": task.input_hash,
-                                               "source_attempt": task.attempt, "source_failure_hash": _failure_hash(task),
-                                               "recovery_input_hash": recovery.input_hash,
-                                               "target_hashes": {parent.id: {"input": parent.input_hash,
-                                                                           "result": stable_hash(parent.result_data)}
-                                                                 for parent in (target, flow.completed_task_for(
-                                                                     task.content_id, TaskType.SHORT_SCRIPT))}
-                                               if target is not None else {}},
+                                metadata_json=self._failure_recovery_metadata(task, recovery, targets=(
+                                    target, flow.completed_task_for(task.content_id, TaskType.SHORT_SCRIPT)
+                                ) if target is not None else ()),
                             ))
                     Session.commit(session)
                     return {"recovery_status": recovery.status.value if recovery else
@@ -714,10 +825,13 @@ class BusinessRuntime:
                     session.rollback()
 
     def _failure_recovery_needs_apply(self, session, recovery):
-        receipt = session.exec(select(AuditEvent).where(
+        receipts = session.exec(select(AuditEvent).where(
             AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
-            AuditEvent.action == FAILURE_RECOVERY,
-        )).first()
+            AuditEvent.action.in_([FAILURE_RECOVERY, FAILURE_RECOVERY_RECONCILED]),
+        )).all()
+        if len(receipts) > 1:
+            raise TaskConflictError("RECOVERY_FAILURE_RECEIPT_CHANGED")
+        receipt = receipts[0] if receipts else None
         if receipt is None:
             source = session.get(AgentTask, (recovery.input_data.get("failure") or {}).get("source_task_id"))
             origin = session.exec(select(AuditEvent.id).where(
@@ -729,6 +843,18 @@ class BusinessRuntime:
             return True  # Existing QC-origin Recovery keeps its portable consumer contract.
         _require_owned_input(session, recovery)
         self._require_native_deployment(session, recovery)
+        if receipt.action == FAILURE_RECOVERY_RECONCILED:
+            _require_current_revision(session, recovery)
+            _require_idle_bundle_recovery(session, recovery.content_id)
+            self._require_accepted_native_task(session, recovery, consumed=False)
+            origin = session.get(AuditEvent, receipt.metadata_json.get("origin_event_id"))
+            if (receipt.actor_type != "admin" or receipt.actor_id != "mpt-admin-api"
+                    or origin is None or origin.entity_id != recovery.id or origin.entity_type != "agent_task"
+                    or origin.action != "recovery_task_created" or origin.actor_type != "system"
+                    or origin.actor_id != "bundle-preflight"
+                    or stable_hash(origin.metadata_json) != receipt.metadata_json.get("origin_metadata_hash")
+                    or stable_hash(recovery.result_data) != receipt.metadata_json.get("accepted_result_hash")):
+                raise TaskConflictError("RECOVERY_FAILURE_RECEIPT_CHANGED")
         source = session.get(AgentTask, receipt.metadata_json.get("source_task_id"))
         if source is None:
             raise TaskConflictError("RECOVERY_SOURCE_MISSING")
@@ -740,6 +866,8 @@ class BusinessRuntime:
                 or (recovery.input_data.get("failure") or {}).get("source_task_id") != source.id
                 or recovery.content_id != source.content_id):
             raise TaskConflictError("RECOVERY_SOURCE_CHANGED")
+        if receipt.action == FAILURE_RECOVERY_RECONCILED:
+            _require_bundle_recovery_subject(session, source)
         _require_reconciled_content(session, source.content_id)
         for target_id, hashes in receipt.metadata_json.get("target_hashes", {}).items():
             target = session.get(AgentTask, target_id)
@@ -782,6 +910,50 @@ class BusinessRuntime:
             ):
                 raise TaskConflictError("RECOVERY_VISUAL_LINEAGE_STALE")
         return True
+
+    def _consume_reconciled_bundle_recovery(self, task_id):
+        """The caller holds the content lock; portable commits flush inside this one transaction."""
+        from app.business.pipeline import workflow
+
+        with _ConsumptionSession(self.engine) as session:
+            begin_immediate(session)
+            try:
+                recovery = session.get(AgentTask, task_id)
+                if recovery is None or recovery.task_type != TaskType.RECOVERY or recovery.status != TaskStatus.COMPLETED:
+                    raise TaskConflictError("Agent result is not accepted yet")
+                _require_owned_input(session, recovery)
+                digest = stable_hash(recovery.result_data)
+                marker = session.exec(select(AuditEvent).where(
+                    AuditEvent.entity_id == task_id, AuditEvent.action == AGENT_CONSUMED,
+                )).first()
+                if marker is not None:
+                    if marker.metadata_json.get("result_hash") != digest:
+                        raise TaskConflictError("RECOVERY_SOURCE_RESULT_CHANGED")
+                    return False
+                if not session.exec(select(AuditEvent.id).where(
+                    AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task_id,
+                    AuditEvent.action == FAILURE_RECOVERY_RECONCILED,
+                )).first():
+                    raise TaskConflictError("RECOVERY_FAILURE_RECEIPT_MISSING")
+                if self._failure_recovery_needs_apply(session, recovery):
+                    flow = workflow(session, effective_settings(session, self.settings))
+                    flow.tasks = self.task_service(session)
+                    repair = flow.apply_recovery_plan(recovery)
+                    if repair is not None:
+                        session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                               entity_id=repair.id, action=OWNED,
+                                               metadata_json={"input_hash": repair.input_hash}))
+                session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                       entity_id=task_id, action=AGENT_CONSUMED,
+                                       metadata_json={"result_hash": digest}))
+                Session.commit(session)
+                return True
+            except RuntimeSettingsError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError, NonRetryableMediaError) as exc:
+                raise TaskConflictError(str(exc)) from exc
+            finally:
+                session.rollback()
 
     def consume_agent(self, task_id: str, *, lock_timeout_seconds: float = 30) -> bool:
         with Session(self.engine) as session:
@@ -848,7 +1020,15 @@ class BusinessRuntime:
                     if marker.metadata_json.get("result_hash") != digest:
                         raise ValueError("Consumed Agent result changed")
                     return False
-                needs_apply = kind != TaskType.RECOVERY or self._failure_recovery_needs_apply(session, task)
+                reconciled_bundle = kind == TaskType.RECOVERY and session.exec(select(AuditEvent.id).where(
+                    AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task_id,
+                    AuditEvent.action == FAILURE_RECOVERY_RECONCILED,
+                )).first() is not None
+                needs_apply = not reconciled_bundle and (
+                    kind != TaskType.RECOVERY or self._failure_recovery_needs_apply(session, task)
+                )
+            if reconciled_bundle:
+                return self._consume_reconciled_bundle_recovery(task_id)
             action = pipeline.advance_after_agent(self.engine, self.settings, task_id) if needs_apply else None
             operations = {
                 "voice": pipeline.approve_script,
