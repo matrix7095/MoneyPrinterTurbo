@@ -1,10 +1,10 @@
 # MoneyPrinterTurbo 按需生产运行手册
 
-更新：2026-10-17 07:02（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
+更新：2026-10-17 07:06（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
 
 ## 当前验收状态
 
-**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署。第八轮正常接续后，脚本 QC、脚本审核、视觉计划、视觉计划 QC、新图片与素材 QC 均已完成并被服务端消费。新配音和新成片已生成，独立技术与封存清单核验 18 项通过；完整成片 QC 已正式不通过；恢复预算 round 3/3 耗尽后，系统正常归档该内容，未发布。诊断补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次正常推进不能证明此前提前返回的根因已解决。下表为 07:02（+08）快照。父子指令作用域及 ASR 证据判定一致性修复已独立审查、提交并部署；它们不能替代新一轮正式成片验收。
+**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署。第八轮正常接续后，脚本 QC、脚本审核、视觉计划、视觉计划 QC、新图片与素材 QC 均已完成并被服务端消费。新配音和新成片已生成，独立技术与封存清单核验 18 项通过；完整成片 QC 已正式不通过；恢复预算 round 3/3 耗尽后，系统正常归档该内容，未发布。诊断补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次正常推进不能证明此前提前返回的根因已解决。第九轮已从正常选题入口启动 IKEA PS 2026；研究 Worker 已实际领取，尚无新成片或发布。下表为 07:06（+08）快照。父子指令作用域及 ASR 证据判定一致性修复已独立审查、提交并部署；它们不能替代新一轮正式成片验收。
 
 | 项目 | 已核实状态 |
 | --- | --- |
@@ -12,7 +12,8 @@
 | 生产触发 | 按需从工作台点击“运行一次”。业务定时调度、自动选题关闭；不需要 Gemini 或周期生产任务。 |
 | 代码 | 配音修复 `db64dfb85bf1b0a5603aeca38b669b3ccbf4e93e`、规格口播合同修复 `05c43348e31e3bcfb29213535dab00463edc31ec`、诊断补丁 `0915005562b6387e889f554cd9c6f07aba7382a3` 均已推送 Main 与实施分支。最新修复提交 `c7ea02012d10dd86637d96c8fe1ef3f85d416fca` 只澄清父/子指令作用域和 schema v3 ASR 证据判定；部署前新增 SQLite 备份 `pre-instruction-scope-20261017.db`，119,066,624 字节、quick_check=ok，部署后当前内容 37 个任务的状态/attempt/instructions/input/result 哈希全部不变。本次诊断补丁 SQLite 备份 `pre-preclaim-diagnostics-20261017.db` 为 115,744,768 字节，quick_check=ok。部署前后 30 个任务的状态、attempt、instructions/input/result 哈希一致。 |
 | 自动化回归 | 最新指令/证据合同修复：主线程组合回归 **408 passed**（87 warnings，exit 0，262.35 秒）；作者 272 passed；独立 Conductor 审查 233 passed，独立音频合同/身份回归 136 passed。Ruff、compileall、diff 检查通过。此前诊断补丁：作者 456 项、独立审查 235 项、完整组合回归 **1737 passed**（8513 warnings，exit 0，941.79 秒；运行器 947.188 秒）；359 个源码/依赖文件前后一致。此前合同修复 1686 passed、配音修复 1651 passed 的证据保留。 |
-| 当前内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`。第八轮 `run_847ee6ec4e57016c589e5356c340e51f` 已停止；包装进程于 06:42:34 正常 exit 0，原生 PID `11436` 与包装进程 `10448` 均已退出，host_live=false。内容于 06:44:44 被系统归档，状态 `ARCHIVED/archived`，保留 `RECOVERY_BLOCKED`。新脚本 `agt_723466ed4dbb4c27a60c13aa3ae70f4e` 的脚本 QC `agt_bce2ee7f682a43c8980e92edad0453c1` 已通过；脚本审核 `agt_673ffed96d8a4596a65a693e7d737f7c`、视觉计划 `agt_8cbc3754e6ad4b289e6b37926f40d91c` 和视觉计划 QC `agt_916204acacf642b6aaab1af6e9a54d7f` 均已完成并被接受、消费。 |
+| 当前第九轮 | `content_865a305c1e99487bbf26bdb78b954ee9`，IKEA PS 2026，`image_only`。`run_75b82cbc9edb5b076da85ecde5d963bf`、generation 9 正常 running；包装 PID `13116`、原生 PID `14812` 均存活。研究任务 `agt_25f012f1fdfb4b5d8169496ce6129dee` 已 LEASED、attempt 1、intent CLAIMED；尚未接受研究结果，无新声画或发布记录。本次未开启本机图片适配权限。 |
+| 第八轮历史内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`。第八轮 `run_847ee6ec4e57016c589e5356c340e51f` 已停止；包装进程于 06:42:34 正常 exit 0，原生 PID `11436` 与包装进程 `10448` 均已退出，host_live=false。内容于 06:44:44 被系统归档，状态 `ARCHIVED/archived`，保留 `RECOVERY_BLOCKED`。新脚本 `agt_723466ed4dbb4c27a60c13aa3ae70f4e` 的脚本 QC `agt_bce2ee7f682a43c8980e92edad0453c1` 已通过；脚本审核 `agt_673ffed96d8a4596a65a693e7d737f7c`、视觉计划 `agt_8cbc3754e6ad4b289e6b37926f40d91c` 和视觉计划 QC `agt_916204acacf642b6aaab1af6e9a54d7f` 均已完成并被接受、消费。 |
 | 第八轮新配音 | asset `asset_48df80306acf44688d27fa7b6f245c10`，`audio/voice-wy1nvt3i/narration.mp3`，SHA-256 `9e83e9d4ec9aea2dede7510fb5aec55de653249c1e3fa4fabe6de4cbebb73ac9`，217,440 字节、36.24 秒，完整解码无错误。12 条 TTS 句子边界包含 `1920乘以1080`、`60到80英寸`；这不是可听读音或正式成片 QC 通过证明。 |
 | 第八轮新图片 | 图片任务 `agt_6eba426d344149eb9bdee5656f4cfbec` 已完成；8 张实际 PNG 均为 1080×1920、哈希和字节数匹配，原图处理证据保留。独立素材 QC `agt_0030940e76384b8ca784228bbed1a093` 正式 `passed=true`，已被接受、消费，结果哈希 `b0044f8e7959a8125f430317f060b0d8fc93f137885829c565a73f7da96d0f43`。 |
 | 第八轮新成片 | asset `asset_5d484c4d91314fbe9bec9b12a316e51e`，`render/revisions/83ee694daa4c4b1fb9220598d99e74cc/final.mp4`，4,201,438 字节，SHA-256 `cba7e2b291a510e3a3e51a717de224c8aaa2981b27ae2bc57130151c4716196a`。独立技术与封存清单核验合计 18 项 PASS：1088 帧、30 fps、1080×1920、首帧 PTS 0、CFR 连续、完整 AV 解码无错误；36.266667 秒视频对应 36.24 秒新配音，PCM lag 0、相关系数 0.9999788584。1088 帧图＋272 帧页共 1360 个文件哈希匹配，清单绑定本轮脚本、新配音、8 张新图和对应素材 QC；冻结 render spec 的 `bgm=null`。这些核验不证明发音、事实或正式内容 QC 通过。 |
@@ -90,9 +91,11 @@
 - [指令及音频合同修复验收](../storage/smoke/stable-production-20261013/instruction-scope-and-audio-contract-acceptance-20261017.json)，SHA-256 `e8accb503d48da3d11ffc72756132b304bad58f7268e70613b0481109a3280b8`。
 - [本次部署验证](../storage/smoke/stable-production-20261013/instruction-scope-deployed-verification-20261017.json)、[37 个历史任务字段对比](../storage/smoke/stable-production-20261013/instruction-scope-task-state-after-20261017.json)、[本次数据库备份](../storage/smoke/stable-production-20261013/pre-instruction-scope-backup-20261017.json)。
 
+- [第九轮 IKEA 选题](../storage/smoke/stable-production-20261013/ikea-selection-20261017.json)、[原生运行启动](../storage/smoke/stable-production-20261013/ikea-native-run-start-20261017.json)、[候选只读预筛](../storage/smoke/stable-production-20261013/new-candidate-readonly-preflight-20261017.json)。Spark Ring 和 G·GRIP Pro 被正常去重门禁拒绝，未强制创建重复内容。
+
 ## 仍需完成
 
-1. 第八轮已终止并归档，不再等待旧 Worker，不重放 offer、不重置预算或手工取消归档。现有服务没有给该归档内容附加新 ASR 并重新签发正式 QC 的入口；后续修复须先确认实际证据缺口与正常业务路径。父子指令作用域及音频合同对齐已部署，但不能据此宣称当前归档内容通过或稳定端到端生产已验收。
+1. 继续观察第九轮同一原生宿主与研究任务，按正常门禁接续脚本、声画及发布，不重复派发或把 heartbeat 当作完成。第八轮已终止并归档，不再等待旧 Worker，不重放 offer、不重置预算或手工取消归档。现有服务没有给该归档内容附加新 ASR 并重新签发正式 QC 的入口；后续修复须先确认实际证据缺口与正常业务路径。父子指令作用域及音频合同对齐已部署，但不能据此宣称当前归档内容通过或稳定端到端生产已验收。
 2. 完成发布审核并从正常发布流程取得这版成片对应的真实 `PUBLISHED` 状态、抖音作品 ID、URL 和截图证据。
 3. 用户授权的全机旧数据清理尚未完成。此前剩余候选的逻辑体积为 **25,936,296,584 字节**，不是当前重新汇总值或可释放物理空间。10 月 17 日 03:34 再核实：旧 Glance 为 5,906,578,968 字节、bootstrap 工作树为 9,504,598,141 字节、upstream rehearsal 工作树为 3,605,444,075 字节，未发现对应进程引用。重新授权后的旧数据库备份删除仍被自动审批以 `blocked by policy` 在进程创建前拒绝，upstream 工作树的正常归档也被固定任务保护拒绝；本轮新增删除量为 0。记录见 [本次清理复核](../storage/smoke/stable-production-20261013/cleanup-renewed-authorization-rejection-20261017.json)。
 4. 上述门禁通过并核实发布后，再更新本页验收结论；目前不可称为稳定端到端生产已验收。
