@@ -1,8 +1,12 @@
 # MoneyPrinterTurbo 稳定生产与运维记录
 
-更新日期：2026-10-16。本文记录当前验收状态；历史检查点另存独立文件，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
+更新日期：2026-10-17。本文记录当前验收状态；历史检查点另存独立文件，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
 
-当前结论：尚未完成稳定生产验收。修复组合 `40227d4` 已部署到主目录并推送main，1455项组合回归通过，API、界面与七个角色已重新验证。Aurzen已真实完成8张新图片、独立素材质检；首次成片的正式CONTENT_QC因时轴漂移未能执行。修复部署后旧Recovery已正常消费，2026-10-15 19:53正常render返回200并生成新成片，现为WAITING_AGENT/content_qc。2026-10-16 22:03已启动新按需运行，等待正式审核及真实发布结果；不能用隔离验证或运行启动代替生产验收。
+当前结论：尚未完成稳定生产验收。2f7be13组合修复已在10月17日00:18加载到主目录后台，新API监听PID12376、launcher22512；界面仍为主目录PID24868。授权API200、匿名401、界面健康200；七角色启动器/清单/Skill哈希一致，业务调度与自动选题仍关闭。升级前后3015个历史任务的输入、结果、指令及尝试预算哈希全部一致。新成片技术验收通过，但正式CONTENT_QC及真实发布仍未完成。
+
+当前按需运行：10月17日00:19通过正常execute入口仅启动一次run_5676c3e0d4b33935b790d0f78c0131be，generation3，有效期至02:19，实测窗口120分钟。原生父线程01a14582-9a0b-7ec2-a603-cae7f592baf1，正式QC子线程01a14582-f230-7143-ae8d-8debc315ab24，Sol/high/default/ephemeral；同一QC任务正常确认第2次尝试（2/3），原第1次未重置。新强确认回执及连续三次宿主业务续租已真实核对，绑定当前claim/lease/输入/attempt，审计主体明确为mpt-content-host，非伪造Worker心跳；仍无语义审核结果。证据deployed-native-liveness-20261017.json、aurzen-run3-start-20261017.json、run3-host-business-lease-renewal-20261017.json。
+
+第二轮运行复核：10月16日22:45:35，第二次正式QC的30分钟业务租约到期，Core正常回收为PENDING，attempt仍1/max3，结果为空。最后业务heartbeat为22:15:20；原生宿主虽每30秒上报存活，原实现只更新run观测，不续业务租约，长模型推理及断流重试暴露了此缺陷。22:48:41已通过正常execution/stop停止新增派发，原run有效期22:48:53保持，原生child随后于23:34:40自然终态，运行现为stopped、执行记录FINISHED/exit0、host_live=false，旧三个进程均已退出；没有强杀、恢复过期租约或重置尝试次数。尚无正式CONTENT_QC通过或发布结果，不能把191次imageView事件计为完成审核。证据 `native-qc-business-lease-expiry-20261016.json`、`run2-lease-loss-cooperative-stop-20261016.json`。后续有效租约的宿主续租修复d953775已提交并经独立审查，完整回归1509项已通过；待安全部署后，再从正常入口续接剩余尝试。
 
 10月16日独立重渲染技术验收18项PASS：真实新视频为 `asset_d8ece8e213614f2b9c43fa66bd3cdd4c`（`asset_8d57c284b88942b7a19a1b9901774c6d` 是验收输入凭据），SHA256 `75a83899a2e1e66d38baa5a857897fa292393653365b4dd7274e66cf1a3f579b`。新鲜ffprobe核实1080帧、36秒、1080×1920、30fps、首PTS0；1080连续帧及270页原校验通过，脚本、研究、8图片和完整原旁白链保持，新音频35.976秒。旧final仍保留。安全证据 `release-render-20261016-independent.json`，SHA256 `bf6a8d3d9a42093c1a816fd107f6723a79523532518fe8a4edb8072f5b4b4e4d`；正式CONTENT_QC和发布仍须分别取得结果。
 
@@ -53,16 +57,24 @@ Windows原生清理程序已不在运行；MEMORY.DMP及2.01GB的旧WATCHDOG转�
 
 后续只读核对另一任务“检查电脑运行状态和磁盘占用”（`01a13f9f-a944-77c0-9c00-bf8f74b88d45`）的已完成记录，找到额外释放来源：该任务报告清理uv缓存、旧CosyVoice环境、Codex安装/诊断文件、NVIDIA安装缓存及少量工作树缓存，净释放23.37GiB，清理后可用26.01GiB。其记录与本轮观察到的文件消失及容量相符；净释放量来自该任务的前后取样，未在此逐文件重算，不与逻辑体积相加。本线程没有向该任务发送指令，也没有委托它重试本线程被拒绝的删除。对账证据 `cleanup-cross-task-reconciliation-20261016.json`；此前“无法归因”的描述指独立复核当时，现已有来源记录。
 
-另已定位终态维护误报：旧Recovery为CONTEXT_MISSING/repair_task_context且恰一次消费，维护扫描却把所有非mark_recovery_blocked方案都送入专属QC目标拒绝回执校验。该日志最后写入早于新QC创建，并非当前审核任务的新失败。最小修复 `93ecb3d` 仅在策略确实适用时调用原严格校验，普通上下文链跳过该策略，真正QC拒绝的回执缺失/篡改仍拒绝。回归先复现RED，作者及独立审查三模块各189项通过；独立证据 `terminal-context-policy-independent-review-evidence.json`，SHA256 `76ca809730c4e3971566fd92b34b6aea2edbebcca86e84d5136b877e2882b3d9`。已推送实施分支并合入主目录源码；后台仍是原PID28492，等待当前活动运行安全结束后重启加载此维护修复，不把磁盘源码更新当作进程已加载。
+另已定位终态维护误报：旧Recovery为CONTEXT_MISSING/repair_task_context且恰一次消费，维护扫描却把所有非mark_recovery_blocked方案都送入专属QC目标拒绝回执校验。该日志最后写入早于新QC创建，并非当前审核任务的新失败。最小修复 `93ecb3d` 仅在策略确实适用时调用原严格校验，普通上下文链跳过该策略，真正QC拒绝的回执缺失/篡改仍拒绝。回归先复现RED，作者及独立审查三模块各189项通过；独立证据 `terminal-context-policy-independent-review-evidence.json`，SHA256 `76ca809730c4e3971566fd92b34b6aea2edbebcca86e84d5136b877e2882b3d9`。已推送实施分支并合入主目录源码；初次合入时后台仍是原PID28492。原活动运行自然结束后，已于10月17日00:18随2f7be13在新后台PID12376加载，不能把此前仅磁盘源码更新误写为当时已加载。
 
 界面全局刷新也已复现缺陷：点击“刷新业务状态”会在内容选择控件渲染前额外rerun，清除所选内容并跳回首条。修复 `b22c800` 移除这次多余rerun，按钮点击本身仍触发正常刷新。真实Streamlit AppTest先在旧代码复现失败；修复后验证保留选题、展示服务端新状态及全程GET请求，作者与Root独立两模块各10项通过。2026-10-16 22:36已在主目录独立重启界面并复测：8510新PID24868、launcher2796，界面健康200；选择Aurzen后全局刷新仍保留该选题，显示WAITING_AGENT/content_qc和正在执行。8000仍为原PID28492，原生审核运行及心跳保持；守护已恢复Enabled。证据 `webui-deployed-b22c800-20261016.json`、`webui-refresh-fixed-production-20261016.png`。
 
-验证范围：`40227d4` 组合版本已执行 `python -m pytest test/business test/services/test_video_project.py -q --tb=short`，1455 passed/905.02秒，进程exit0；354个纳入快照的Python、Skill及role文件前后不变。安全证明为 `root-post-fixes-full-regression-result.json`、`root-post-fixes-source-freeze.json`、`root-post-fixes-full-regression.log`。8059条警告主要为现有依赖弃用提示，不等于测试失败。此前中断运行不计为通过；隔离研究、时轴验证和测试不代表本轮正式内容QC或真实发布成功。
+单次运行窗口修复 `6825158` 已推送实施分支：仅后续新run由45分钟改为有上限的120分钟，旧run及重复启动保持原expires。理由是实际生图/素材审核/渲染已用约27分钟，完整270页成片审核另需较长时间，原45分钟难覆盖整条按需链。作者及独立审查四模块各183项通过，含原16轮上限、过期drain、任务预算及权限边界；精准9项先RED后PASS。独立证据 `content-run-120min-independent-review-evidence.json`，SHA256 `d8ccbf37f27f679ad616f7dc14f3f9bf4516acf28bc2a6d74396735c0a05d02f`。已随2f7be13在新后台加载，第三轮实际窗口120分钟，旧run未续期；120分钟是一次执行许可，不是周期触发或业务定时任务。
+
+协作取消组合 `a355034`、`2f7be13` 已补齐手动停止和自动到期后的失效租约收尾：只处理本连接真实活动turn、完整原claim/task/run/child绑定且当前任务PENDING的情形；自动取消另须可信带时区截止时间已到。有效LEASED、未知身份、未来或无效期限及其他内部失败不会被误取消。每个turn只请求一次，响应不当作终态，等待匹配的真实completed/interrupted/failed事件。作者与独立Sol十模块分别422 passed/139.46秒、422 passed/140.63秒，冻结源码前后不变；独立证据 `native-interrupt-v2-independent-review-evidence.json`，SHA256 `2d3a1654ef48edbc6bc1775e127fe14b8b271177828ac69d36872251674c35fc`。固定原生二进制的隔离真实烟测也已PASS：唯一child真实interrupted、parent idle、自然exit0，未调用生产API；结果 `native-interrupt-live-smoke-v2-result-20261017.json`，SHA256 `eb1be8c47778391e65d0a06759c4fd2ad7c536c2415898d128c9ce43031b35fb`。首次烟测脚本把正常关闭后的EOF误判为失败，旧失败原件保留；仅修正测试收尾后重新验证，未改写旧结果。
+
+验证范围：`40227d4` 组合版本已执行 `python -m pytest test/business test/services/test_video_project.py -q --tb=short`，1455 passed/905.02秒，进程exit0；354个纳入快照的Python、Skill及role文件前后不变。`d953775` 的同范围1509 passed/934.38秒及354文件不变证明另已保存；最终 `2f7be13` 组合的全量验证正在独立运行，使用新前缀 `root-final-native-liveness-regression-20261017`，不能把旧1509结果写成当前全量已通过。此前中断运行不计为通过；隔离研究、时轴验证、协议烟测和测试不代表本轮正式内容QC或真实发布成功。
+
+宿主业务续租修复 `d953775` 已通过作者及独立Sol六模块各275项测试，分别61.14秒及61.05秒，并已推送实施分支。新的宿主心跳只在原生子任务、run、generation、epoch、原始领取及确认回执、输入、当前attempt和未过期租约全部匹配时续租；事件去重先于续租，观测与续租审计原子提交。Core原执行期限及预算保持，宿主不伪造Worker在线心跳。旧弱回执和当前PENDING任务均不会补证或复活。独立证据 `content-host-lease-v1-independent-review-evidence.json`，SHA256 `c11efdfdf89306de8421fe5f7f65c1c8c4bed9e2e9b0ea122c681f03fca3c397`；新的完整业务及视频回归1509 passed/934.38秒，exit0；354文件前后SHA不变，结果证明为 `root-native-liveness-regression-20261016-full-regression-result.json`，SHA256 `ed4bcf8adca817c3fcd5c2d40f2ceb9316cf41445bc3fffc20b6c2a608ce11d6`。该续租修复已随2f7be13在主目录新后台PID12376加载，并有第三轮真实强绑定续租记录。
+
+23:14再次核对两份旧Codex修复备份数据库：2026-10-09 restart-backup和2026-10-10 upgrade-backup共3,167,350,784字节，无进程引用及路径重解析。用户明确要求全部删除后，原生PowerShell单文件删除仍在进程创建前被自动审批拒绝，理由仅为 `blocked by policy`；未执行，仍按未清理记录。证据 `obsolete-codex-backups-deletion-rejected-20261016.json`。当时C盘可用约28.0GB，不能把被拒绝文件计入释放量。
 
 ## 本轮剩余验收
 
 1. 核实全盘清理最终结果及容量变化来源，保留生产和最终验证证据；不重复请求已给出的清理授权。
-2. 核对新revision实际1080帧/36秒及冻结输入，通过已启动的按需宿主执行新正式CONTENT_QC（task `agt_a8b81f02da8b4b028cd4b27afe6dd2e1`，run `run_206c5da4b85850e89712b625f17df73f`）。不能用隔离时轴证明代替该项。
+2. 新revision已独立通过18项技术检查，实际1080帧/36秒，final SHA256为 `75a83899a2e1e66d38baa5a857897fa292393653365b4dd7274e66cf1a3f579b`。正式CONTENT_QC尚未通过：第二轮曾因业务租约过期回到PENDING/attempt1，原宿主已自然收尾。安全部署后，第三轮已从正常入口确认同一任务的第2次尝试（2/3），现为LEASED且有真实宿主续租审计，等待实际结果。没有复活旧租约或重置预算；技术检查不能代替正式审核。
 3. 通过后续独立审核与正常发布流程，核实本轮新作品的PUBLISHED记录、真实平台ID/URL和截图，再完成总体稳定生产验收并更新本文。
 
 ## 历史证据
