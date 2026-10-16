@@ -7,7 +7,9 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from glance_core.models import Content, ContentStatus, RightsStatus
 from streamlit.testing.v1 import AppTest
+from sqlmodel import Session
 
 from test.business.test_content_http import seed_candidate
 from test.business.test_discovery_http import make_runtime
@@ -103,6 +105,73 @@ def test_workbench_issues_real_discovery_selects_content_and_reads_pending_tasks
         content = http.get(f"/api/v1/contents/{content_id}", headers={"Authorization": "Bearer test-admin"}).json()
         assert content["tasks"][0]["task_type"] == "content_research"
         assert content["content"]["business_status"] == "WAITING_AGENT"
+
+
+def test_workbench_refresh_preserves_selection_and_reads_latest_status(tmp_path, monkeypatch):
+    monkeypatch.delenv("MPT_UPSTREAM_COMPATIBILITY", raising=False)
+    monkeypatch.setenv("MPT_BUSINESS_ADMIN_TOKEN", "test-admin")
+    monkeypatch.delenv("MPT_BUSINESS_ADMIN_TOKEN_FILE", raising=False)
+    runtime = make_runtime(tmp_path)
+    with TestClient(semantic_app(runtime)) as http:
+        candidate_ids = []
+        with Session(runtime.engine) as session:
+            for suffix in ("first", "second"):
+                candidate, _ = runtime.workflow_service(session).ingest_candidate(
+                    source_type="agent",
+                    source_id=f"refresh-project-{suffix}",
+                    source_url=f"https://example.org/refresh-{suffix}",
+                    original_title=f"Refresh Project {suffix}",
+                    rights_status=RightsStatus.EXPLICIT_LICENSE,
+                )
+                candidate_ids.append(candidate.id)
+
+        for candidate_id in candidate_ids:
+            response = http.post(
+                f"/api/v1/candidates/{candidate_id}/select?production_mode=image_only",
+                headers={"Authorization": "Bearer test-admin"},
+            )
+            assert response.status_code == 200, response.text
+        content_rows = http.get(
+            "/api/v1/contents", headers={"Authorization": "Bearer test-admin"}
+        ).json()
+        selected_id = content_rows[-1]["id"]
+
+        calls = []
+
+        def through_asgi(method, url, **options):
+            calls.append((method, urlsplit(url).path))
+            options.pop("timeout")
+            options["follow_redirects"] = options.pop("allow_redirects")
+            return http.request(method, urlsplit(url).path, **options)
+
+        monkeypatch.setattr(requests, "request", through_asgi)
+        page = AppTest.from_string(
+            "from webui.business import render_business_page\nrender_business_page({}, '.')",
+            default_timeout=30,
+        ).run()
+        assert not page.exception
+        page.selectbox(key="business_selected_content").select(selected_id).run()
+        assert not page.exception
+        assert page.session_state["business_selected_content"] == selected_id
+
+        with Session(runtime.engine) as session:
+            content = session.get(Content, selected_id)
+            content.business_status = ContentStatus.FAILED
+            content.current_stage = "recovery_blocked"
+            session.add(content)
+            session.commit()
+
+        calls.clear()
+        page.button(key="business_refresh").click().run()
+
+        assert not page.exception
+        assert page.session_state["business_selected_content"] == selected_id
+        assert any(
+            element.value == "状态：FAILED · 阶段：recovery_blocked"
+            for element in page.markdown
+        )
+        assert any(method == "GET" for method, _ in calls)
+        assert all(method != "POST" for method, _ in calls)
 
 
 def test_main_production_entry_does_not_recover_or_write_legacy_tasks(tmp_path, monkeypatch):

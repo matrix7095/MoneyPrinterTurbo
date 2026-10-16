@@ -255,8 +255,7 @@ def render_business_page(configuration, root_dir):
             return
         connection = BusinessConnection(base, token)
         _, contents = connection.request("GET", "/api/v1/contents")
-        if st.button("刷新业务状态", key="business_refresh"):
-            st.rerun()
+        st.button("刷新业务状态", key="business_refresh")
         with st.expander("发现新项目"):
             direction = st.text_input("发现方向", key="business_direction")
             query = st.text_input("检索要求", key="business_query")
