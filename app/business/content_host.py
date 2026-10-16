@@ -36,6 +36,8 @@ UNRESOLVED = {
 BLOCKED = {"UNKNOWN", "OBSERVATION_LOST", "REJECTED"}
 OBSERVATION = "mpt_content_host_observation"
 CLAIM = "mpt_content_run_claim"
+LEASE_RENEWED = "mpt_content_host_lease_renewed"
+LEASE_DEADLINE = "mpt_content_host_lease_deadline"
 
 
 def host_live(run):
@@ -257,7 +259,107 @@ def validate_child(run, worker, child, *, terminal=False):
         raise TaskConflictError("CONTENT_HOST_CHILD_MISMATCH")
 
 
-def observe_host(session, run_id, request_id, payload):
+def _renew_child_lease(session, run, request_id, intent, worker, payload, tasks):
+    """A fresh native observation may renew only its exactly proven current lease."""
+    if intent["state"] != "CLAIMED" or run.state not in {"running", "draining"}:
+        return
+    task = session.get(AgentTask, worker["task_id"])
+    now = utc_now()
+    if (
+        task is None
+        or task.status != TaskStatus.LEASED
+        or task.lease_expires_at is None
+        or as_utc(task.lease_expires_at) <= now
+        or not task.lease_token_hash
+        or task.assigned_agent_id != worker["agent_id"]
+        or task.attempt_started_at is None
+        or task.started_at is None
+        or not 1 <= task.attempt <= task.max_attempts
+    ):
+        return
+    from app.business.runtime import _require_owned_input
+
+    _require_owned_input(session, task)
+    _, frozen_hash = offer_receipt(session, request_id)
+    binding = accepted_binding(session, task, task.assigned_agent_id)
+    expected = {
+        "claim_id": intent["claim_id"],
+        "run_id": run.run_id,
+        "generation": run.generation,
+        "host_epoch": run.host_epoch,
+        "request_id": request_id,
+        "offer_hash": frozen_hash,
+        "task_id": task.id,
+        "agent_id": task.assigned_agent_id,
+        "lease_token_hash": task.lease_token_hash,
+        "child_id": intent["child"]["child_id"],
+        "parent_thread_id": run.parent_thread_id,
+        "started_at": as_utc(task.started_at).isoformat(),
+    }
+    if (
+        binding is None
+        or any(binding.get(key) != value for key, value in expected.items())
+        or intent["host_epoch"] != run.host_epoch
+        or intent["offer_hash"] != frozen_hash
+        or run.offer_children.get(request_id) != expected["child_id"]
+        or worker["request_id"] != request_id
+        or worker["content_id"] != run.content_id
+        or task.content_id != run.content_id
+        or worker["input_hash"] != task.input_hash
+        or worker["task_type"] != task.task_type.value
+        or not as_utc(task.started_at) <= as_utc(task.attempt_started_at) <= now
+    ):
+        return
+    claims = session.exec(select(AuditEvent).where(
+        AuditEvent.action == CLAIM,
+        AuditEvent.metadata_json["claim_id"].as_string() == intent["claim_id"],
+    )).all()
+    if (
+        len(claims) != 1
+        or claims[0].actor_type != "system"
+        or claims[0].actor_id != "mpt-content-host"
+        or claims[0].entity_type != "agent_task"
+        or claims[0].entity_id != task.id
+        or claims[0].metadata_json != binding
+    ):
+        return
+    # The claim's lease hash distinguishes attempts. Older confirmation receipts
+    # lack exact start/hash proof and remain observable, never retroactively renewed.
+    confirmations = session.exec(select(AuditEvent).where(
+        AuditEvent.entity_type == "agent_task",
+        AuditEvent.entity_id == task.id,
+        AuditEvent.action == "claim_confirmed",
+        AuditEvent.actor_type == "agent",
+        AuditEvent.actor_id == task.assigned_agent_id,
+        AuditEvent.metadata_json["lease_token_hash"].as_string() == task.lease_token_hash,
+    )).all()
+    if (
+        len(confirmations) != 1
+        or confirmations[0].metadata_json.get("attempt") != task.attempt
+        or confirmations[0].metadata_json.get("attempt_started_at")
+        != as_utc(task.attempt_started_at).isoformat()
+    ):
+        return
+    # Also reject ambiguous live handles rather than renewing either owner.
+    reserved_tasks(session)
+    previous_expiry = as_utc(task.lease_expires_at).isoformat()
+    renewed = tasks._apply_lease_heartbeat(
+        task, now=now, touch_worker=False, deadline_actor_id="lease-host",
+    )
+    session.add(AuditEvent(
+        actor_type="system", actor_id="mpt-content-host", entity_type="agent_task",
+        entity_id=task.id, action=LEASE_RENEWED if renewed else LEASE_DEADLINE,
+        metadata_json={
+            **expected, "input_hash": task.input_hash, "event_id": payload.event_id,
+            "attempt": task.attempt,
+            "attempt_started_at": as_utc(task.attempt_started_at).isoformat(),
+            "previous_lease_expires_at": previous_expiry,
+            "lease_expires_at": as_utc(task.lease_expires_at).isoformat() if renewed else None,
+        },
+    ))
+
+
+def observe_host(session, run_id, request_id, payload, *, tasks):
     begin_immediate(session)
     repeat = event_repeat(session, run_id, request_id, payload)
     if repeat:
@@ -321,6 +423,7 @@ def observe_host(session, run_id, request_id, payload):
                 or intent["child"] is None
             ):
                 raise TaskConflictError("CONTENT_HOST_INTENT_NOT_OBSERVABLE")
+            _renew_child_lease(session, run, request_id, intent, worker, payload, tasks)
             if intent["state"] == "OBSERVATION_LOST":
                 intent["state"] = "CLAIMED" if intent["claim_id"] else "VERIFIED"
         elif payload.outcome == "TERMINAL":
@@ -411,6 +514,7 @@ def record_claim(session, task, scope):
         "lease_token_hash": task.lease_token_hash,
         "child_id": intent["child"]["child_id"],
         "parent_thread_id": run.parent_thread_id,
+        "started_at": as_utc(task.started_at).isoformat(),
     }
     session.add(
         AuditEvent(

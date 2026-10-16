@@ -2,12 +2,15 @@
 
 import copy
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Event
 from uuid import uuid4
 
 import pytest
 from glance_core.models import (
     AgentTask,
+    AgentWorker,
     AuditEvent,
     RuntimeSetting,
     SchedulerOffer,
@@ -15,11 +18,15 @@ from glance_core.models import (
     utc_now,
     as_utc,
     TaskType,
+    TaskLeasePolicy,
 )
-from glance_core.task_service import TaskConflictError
+from glance_core.task_service import AgentTaskService, TaskConflictError
 from sqlmodel import Session, select
 
-from app.business.content_host import CLAIM, accepted_binding, authorize_publish
+from app.business.content_host import (
+    CLAIM, LEASE_RENEWED, LEASE_DEADLINE, OBSERVATION,
+    accepted_binding, authorize_publish,
+)
 from app.business.content_run import RUN_KEY, load_run
 from app.business.quarantine import IsolatedTaskService
 from test.business.test_content_http import RESEARCH, client_for
@@ -38,6 +45,37 @@ from test.business.test_discovery_http import ADMIN
 system = shared_system
 
 
+def test_host_heartbeat_renews_confirmed_lease_before_thirty_minute_reaper(
+    host_offer, monkeypatch,
+):
+    runtime, http, _, task_id, _, worker = host_offer
+    verify_fixture_worker(http, worker)
+    with Session(runtime.engine) as session:
+        session.add(TaskLeasePolicy(task_type=worker["task_type"], lease_minutes=30))
+        session.commit()
+    claim = raw_dispatch(http, worker).json()
+    client_for(http, "research").confirm_claim(
+        task_id, claim["lease_token"], worker["agent_id"]
+    )
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        started = as_utc(task.attempt_started_at)
+        original_expiry = as_utc(task.lease_expires_at)
+    clock = [started + timedelta(minutes=29)]
+    monkeypatch.setattr("app.business.content_host.utc_now", lambda: clock[0])
+    monkeypatch.setattr("glance_core.task_service.utc_now", lambda: clock[0])
+    response = observation(http, worker, "HEARTBEAT", child=fixture_child(worker))
+    assert response.status_code == 200, response.text
+    clock[0] = started + timedelta(minutes=31)
+    with Session(runtime.engine) as session:
+        assert runtime.task_service(session).reap_expired_leases() == 0
+        task = session.get(AgentTask, task_id)
+        assert task.status == TaskStatus.LEASED
+        assert as_utc(task.lease_expires_at) > original_expiry
+        assert task.attempt == 1 and task.max_attempts == 3
+        assert as_utc(task.attempt_started_at) == started
+
+
 @pytest.fixture
 def host_offer(system):
     runtime, http = system
@@ -47,6 +85,430 @@ def host_offer(system):
         "worker_requests"
     ][0]
     return runtime, http, content_id, task_id, run, worker
+
+
+@pytest.fixture
+def confirmed_host(host_offer):
+    runtime, http, _, task_id, _, worker = host_offer
+    verify_fixture_worker(http, worker)
+    with Session(runtime.engine) as session:
+        session.add(TaskLeasePolicy(task_type=worker["task_type"], lease_minutes=30))
+        session.commit()
+    claim = raw_dispatch(http, worker).json()
+    client_for(http, "research").confirm_claim(
+        task_id, claim["lease_token"], worker["agent_id"]
+    )
+    return (*host_offer, claim)
+
+
+def lease_events(session, task_id):
+    return session.exec(select(AuditEvent).where(
+        AuditEvent.entity_id == task_id,
+        AuditEvent.action.in_([LEASE_RENEWED, LEASE_DEADLINE]),
+    )).all()
+
+
+def test_host_renewal_is_new_event_only_atomic_and_does_not_impersonate_worker(
+    confirmed_host, monkeypatch,
+):
+    runtime, http, content_id, task_id, _, worker, _ = confirmed_host
+    with Session(runtime.engine) as session:
+        before = session.get(AgentTask, task_id).model_dump(mode="json")
+        worker_before = session.get(AgentWorker, worker["agent_id"]).model_dump(mode="json")
+        run_before = load_run(session)
+    now = utc_now() + timedelta(minutes=20)
+    monkeypatch.setattr("app.business.content_host.utc_now", lambda: now)
+    response = observation(http, worker, "HEARTBEAT", child=fixture_child(worker), event_id="renew-once")
+    assert response.status_code == 200
+    with Session(runtime.engine) as session:
+        renewed = session.get(AgentTask, task_id).model_dump(mode="json")
+        assert renewed["lease_expires_at"] != before["lease_expires_at"]
+        events = lease_events(session, task_id)
+        assert len(events) == 1 and events[0].action == LEASE_RENEWED
+        assert events[0].actor_id == "mpt-content-host"
+        assert events[0].metadata_json["event_id"] == "renew-once"
+        assert events[0].metadata_json["attempt"] == 1
+        assert session.get(AgentWorker, worker["agent_id"]).model_dump(mode="json") == worker_before
+        run = load_run(session)
+        assert run.expires_at == run_before.expires_at
+        assert run.ready_rounds == run_before.ready_rounds == 1
+    now += timedelta(minutes=5)
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker), event_id="renew-once").json() == response.json()
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, task_id).model_dump(mode="json") == renewed
+        assert len(lease_events(session, task_id)) == 1
+    # Draining accepts only this already owned lease; no run deadline is extended.
+    assert http.post(f"/api/v1/contents/{content_id}/run/stop", headers=ADMIN).status_code == 200
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    with Session(runtime.engine) as session:
+        assert len(lease_events(session, task_id)) == 2
+        assert load_run(session).state == "draining"
+        assert load_run(session).expires_at == run_before.expires_at
+
+
+@pytest.mark.parametrize("invalid", [
+    "pending", "completed", "expired", "expiry-boundary", "owner", "lease-hash",
+    "attempt", "attempt-start", "task-start", "old-confirmation", "missing-confirmation",
+    "duplicate-confirmation", "old-claim", "claim-id", "claim-duplicate", "input",
+    "owned-proof", "offer-hash", "child-map", "observation-lost", "stopped",
+    "generation", "epoch", "parent", "child", "run", "idle", "terminal",
+])
+def test_host_heartbeat_never_renews_unproven_or_replaced_lease(
+    confirmed_host, monkeypatch, invalid,
+):
+    runtime, http, _, task_id, _, original_worker, _ = confirmed_host
+    worker = copy.deepcopy(original_worker)
+    child = fixture_child(worker)
+    overrides = {}
+    now = utc_now() + timedelta(minutes=1)
+    monkeypatch.setattr("app.business.content_host.utc_now", lambda: now)
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        row = session.get(RuntimeSetting, RUN_KEY)
+        run = json.loads(row.value)
+        intent = run["intents"][worker["request_id"]]
+        confirmation = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "claim_confirmed",
+        )).one()
+        claim = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == CLAIM,
+        )).one()
+        if invalid in {"pending", "completed"}:
+            task.status = TaskStatus.PENDING if invalid == "pending" else TaskStatus.COMPLETED
+        elif invalid in {"expired", "expiry-boundary"}:
+            task.lease_expires_at = now - timedelta(seconds=1 if invalid == "expired" else 0)
+        elif invalid == "owner":
+            task.assigned_agent_id = "another-agent"
+        elif invalid == "lease-hash":
+            task.lease_token_hash = "another-lease"
+        elif invalid == "attempt":
+            task.attempt += 1
+        elif invalid == "attempt-start":
+            task.attempt_started_at += timedelta(seconds=1)
+        elif invalid == "task-start":
+            task.started_at -= timedelta(seconds=1)
+        elif invalid == "old-confirmation":
+            confirmation.metadata_json = {"attempt": 1, "implicit": False}
+        elif invalid == "missing-confirmation":
+            session.delete(confirmation)
+        elif invalid == "duplicate-confirmation":
+            session.add(AuditEvent(**confirmation.model_dump(exclude={"id"})))
+        elif invalid == "old-claim":
+            claim.metadata_json = {key: value for key, value in claim.metadata_json.items() if key != "started_at"}
+        elif invalid == "claim-id":
+            intent["claim_id"] = "another-claim"
+        elif invalid == "claim-duplicate":
+            session.add(AuditEvent(**claim.model_dump(exclude={"id"})))
+        elif invalid == "input":
+            task.input_data = {"changed": True}
+        elif invalid == "owned-proof":
+            owned = session.exec(select(AuditEvent).where(AuditEvent.entity_id == task_id, AuditEvent.action == "mpt_task_owned")).all()
+            for proof in owned:
+                session.delete(proof)
+        elif invalid == "offer-hash":
+            intent["offer_hash"] = "changed"
+        elif invalid == "child-map":
+            run["offer_children"][worker["request_id"]] = "another-child"
+        elif invalid == "observation-lost":
+            intent["state"] = "OBSERVATION_LOST"
+        elif invalid == "stopped":
+            run["state"] = "stopped"
+        elif invalid == "generation":
+            overrides["generation"] = worker["run_generation"] + 1
+        elif invalid == "epoch":
+            overrides["host_epoch"] = worker["host_epoch"] + 1
+        elif invalid == "parent":
+            child["parent_thread_id"] = "another-parent"
+        elif invalid == "child":
+            child["child_id"] = "another-child"
+        elif invalid == "run":
+            worker["run_id"] = "run_" + "0" * 32
+        elif invalid == "idle":
+            worker["request_id"], child = "host", None
+        elif invalid == "terminal":
+            intent["state"] = "TERMINAL"
+        session.add(task)
+        if invalid != "missing-confirmation":
+            session.add(confirmation)
+        session.add(claim)
+        row.value = json.dumps(run)
+        session.add(row)
+        session.commit()
+        session.refresh(task)
+        before = task.model_dump(mode="json")
+    response = observation(http, worker, "HEARTBEAT", child=child, **overrides)
+    assert response.status_code in {200, 409}, response.text
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, task_id).model_dump(mode="json") == before
+        assert lease_events(session, task_id) == []
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_unclaimed_or_unconfirmed_host_does_not_get_business_lease(host_offer, confirmed):
+    runtime, http, _, task_id, _, worker = host_offer
+    verify_fixture_worker(http, worker)
+    if confirmed:
+        assert raw_dispatch(http, worker).json()["should_run"]
+    with Session(runtime.engine) as session:
+        before = session.get(AgentTask, task_id).model_dump(mode="json")
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, task_id).model_dump(mode="json") == before
+        assert lease_events(session, task_id) == []
+
+
+@pytest.mark.parametrize("last_attempt", [False, True])
+def test_host_renewal_preserves_exact_four_times_deadline_and_releases_atomically(
+    confirmed_host, monkeypatch, last_attempt,
+):
+    runtime, http, _, task_id, _, worker, _ = confirmed_host
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        started = as_utc(task.attempt_started_at)
+        if last_attempt:
+            task.max_attempts = task.attempt
+            session.add(task)
+            session.commit()
+    clock = [started]
+    monkeypatch.setattr("app.business.content_host.utc_now", lambda: clock[0])
+    # Keep the same original lease alive with normal new observations through 4x.
+    for minutes in [29, 58, 87, 116, 120]:
+        clock[0] = started + timedelta(minutes=minutes)
+        assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    clock[0] += timedelta(microseconds=1)
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        assert task.status == (TaskStatus.FAILED if last_attempt else TaskStatus.PENDING)
+        assert task.lease_token_hash is None and task.lease_expires_at is None
+        assert task.attempt == 1 and as_utc(task.attempt_started_at) == started
+        assert (task.not_before is None) == last_attempt
+        deadline = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "execution_deadline_exceeded",
+        )).one()
+        assert deadline.actor_id == "lease-host"
+        assert deadline.actor_type == "system"
+        assert [event.action for event in lease_events(session, task_id)].count(LEASE_DEADLINE) == 1
+    # Further observations never revive the released attempt.
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    with Session(runtime.engine) as session:
+        assert len(lease_events(session, task_id)) == 6
+
+
+@pytest.mark.parametrize("deadline", [False, True])
+def test_host_renewal_and_observation_roll_back_together_then_retry_once(
+    confirmed_host, monkeypatch, deadline,
+):
+    import app.business.content_host as host
+
+    runtime, http, _, task_id, _, worker, _ = confirmed_host
+    real_record = host.record_event
+    now = utc_now() + timedelta(minutes=1)
+    if deadline:
+        with Session(runtime.engine) as session:
+            started = as_utc(session.get(AgentTask, task_id).attempt_started_at)
+        for minutes in [29, 58, 87, 116, 120]:
+            now = started + timedelta(minutes=minutes)
+            monkeypatch.setattr(host, "utc_now", lambda: now)
+            assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+        now += timedelta(microseconds=1)
+    monkeypatch.setattr(host, "utc_now", lambda: now)
+    with Session(runtime.engine) as session:
+        before = session.get(AgentTask, task_id).model_dump(mode="json")
+        run_before = session.get(RuntimeSetting, RUN_KEY).value
+        events_before = session.exec(select(AuditEvent.id).order_by(AuditEvent.id)).all()
+
+    def failed_record(*args, **kwargs):
+        raise RuntimeError("injected observation persistence failure")
+
+    monkeypatch.setattr(host, "record_event", failed_record)
+    with pytest.raises(RuntimeError, match="injected observation"):
+        observation(http, worker, "HEARTBEAT", child=fixture_child(worker), event_id="retry-atomic")
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, task_id).model_dump(mode="json") == before
+        assert session.get(RuntimeSetting, RUN_KEY).value == run_before
+        assert session.exec(select(AuditEvent.id).order_by(AuditEvent.id)).all() == events_before
+    monkeypatch.setattr(host, "record_event", real_record)
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker), event_id="retry-atomic").status_code == 200
+    with Session(runtime.engine) as session:
+        assert len(lease_events(session, task_id)) == (6 if deadline else 1)
+        if deadline:
+            assert session.get(AgentTask, task_id).status == TaskStatus.PENDING
+            assert len(session.exec(select(AuditEvent).where(
+                AuditEvent.entity_id == task_id, AuditEvent.action == "execution_deadline_exceeded",
+            )).all()) == 1
+        receipts = session.exec(select(AuditEvent).where(
+            AuditEvent.action == OBSERVATION,
+            AuditEvent.metadata_json["event_id"].as_string() == "retry-atomic",
+        )).all()
+        assert len(receipts) == 1
+
+
+def test_repeated_confirm_never_upgrades_old_weak_confirmation_evidence(confirmed_host):
+    runtime, http, _, task_id, _, worker, claim = confirmed_host
+    with Session(runtime.engine) as session:
+        confirmation = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "claim_confirmed",
+        )).one()
+        confirmation.metadata_json = {"attempt": 1, "implicit": False}
+        session.add(confirmation)
+        session.commit()
+        session.refresh(confirmation)
+        old = confirmation.model_dump(mode="json")
+    client_for(http, "research").confirm_claim(task_id, claim["lease_token"], worker["agent_id"])
+    with Session(runtime.engine) as session:
+        assert session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "claim_confirmed",
+        )).one().model_dump(mode="json") == old
+        before = session.get(AgentTask, task_id).model_dump(mode="json")
+    assert observation(http, worker, "HEARTBEAT", child=fixture_child(worker)).status_code == 200
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, task_id).model_dump(mode="json") == before
+        assert lease_events(session, task_id) == []
+
+
+@pytest.mark.parametrize("winner", ["host", "reaper", "new-claim", "new-claim-same-agent"])
+def test_host_heartbeat_serializes_with_reaper_and_new_claim(
+    confirmed_host, monkeypatch, winner,
+):
+    from glance_core.database import begin_immediate
+    from sqlalchemy import event
+
+    runtime, http, _, task_id, _, worker, _ = confirmed_host
+    with Session(runtime.engine) as session:
+        started = as_utc(session.get(AgentTask, task_id).attempt_started_at)
+    clock = [started + timedelta(minutes=29 if winner == "host" else 31)]
+    monkeypatch.setattr("app.business.content_host.utc_now", lambda: clock[0])
+    monkeypatch.setattr("glance_core.task_service.utc_now", lambda: clock[0])
+    held, release, second_started, second_done = Event(), Event(), Event(), Event()
+    original_apply = AgentTaskService._apply_lease_heartbeat
+    new_lease = {}
+
+    def hold_host(service, task, **kwargs):
+        held.set()
+        assert release.wait(5)
+        return original_apply(service, task, **kwargs)
+
+    def host_request():
+        if winner != "host":
+            second_started.set()
+        try:
+            return observation(http, worker, "HEARTBEAT", child=fixture_child(worker))
+        finally:
+            if winner != "host":
+                second_done.set()
+
+    def competitor():
+        with Session(runtime.engine) as session:
+            if winner == "host":
+                second_started.set()
+                try:
+                    begin_immediate(session)
+                    return runtime.task_service(session).reap_expired_leases()
+                finally:
+                    second_done.set()
+
+            def before_commit(_session):
+                held.set()
+                assert release.wait(5)
+
+            event.listen(session, "before_commit", before_commit)
+            try:
+                service = AgentTaskService(session, runtime.settings.agent_submission_dir)
+                if winner.startswith("new-claim"):
+                    claimed = service.claim(
+                        agent_id=worker["agent_id"] if winner == "new-claim-same-agent" else "competing-agent",
+                        task_id=task_id,
+                        capabilities={TaskType.CONTENT_RESEARCH}, role_id="research",
+                    )
+                    assert claimed is not None
+                    new_lease.update(claimed[0].model_dump(mode="json"))
+                    return 1
+                begin_immediate(session)
+                return service.reap_expired_leases()
+            finally:
+                event.remove(session, "before_commit", before_commit)
+
+    if winner == "host":
+        monkeypatch.setattr(AgentTaskService, "_apply_lease_heartbeat", hold_host)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(host_request if winner == "host" else competitor)
+        assert held.wait(5)
+        if winner == "host":
+            clock[0] = started + timedelta(minutes=31)
+        second = pool.submit(competitor if winner == "host" else host_request)
+        try:
+            assert second_started.wait(5)
+            assert not second_done.wait(0.05)
+        finally:
+            release.set()
+        first_result, second_result = first.result(timeout=5), second.result(timeout=5)
+    host_result = first_result if winner == "host" else second_result
+    competitor_result = second_result if winner == "host" else first_result
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        if winner == "host":
+            assert host_result.status_code == 200 and competitor_result == 0
+            assert task.status == TaskStatus.LEASED and task.attempt == 1
+            assert len(lease_events(session, task_id)) == 1
+        elif winner == "reaper":
+            assert host_result.status_code == 200 and competitor_result == 1
+            assert task.status == TaskStatus.PENDING and task.attempt == 1
+            assert task.lease_token_hash is None and lease_events(session, task_id) == []
+        else:
+            assert host_result.status_code == (409 if winner == "new-claim-same-agent" else 200)
+            assert competitor_result == 1
+            assert task.model_dump(mode="json") == new_lease
+            assert task.attempt == 2
+            assert task.assigned_agent_id == (worker["agent_id"] if winner == "new-claim-same-agent" else "competing-agent")
+            assert lease_events(session, task_id) == []
+
+
+def test_public_worker_confirm_and_heartbeat_keep_exact_existing_semantics(
+    confirmed_host, monkeypatch,
+):
+    runtime, http, _, task_id, _, worker, claim = confirmed_host
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        started = as_utc(task.attempt_started_at)
+        confirmation = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "claim_confirmed",
+        )).one().model_dump(mode="json")
+        assert confirmation["metadata_json"] == {
+            "attempt": 1, "implicit": False,
+            "attempt_started_at": started.isoformat(),
+            "lease_token_hash": task.lease_token_hash,
+        }
+    clock = [started + timedelta(minutes=1)]
+    monkeypatch.setattr("glance_core.task_service.utc_now", lambda: clock[0])
+    with Session(runtime.engine) as session:
+        service = runtime.task_service(session)
+        with pytest.raises(TaskConflictError, match="Lease is missing"):
+            service.heartbeat(task_id, "invalid-token")
+        service.confirm_claim(task_id=task_id, lease_token=claim["lease_token"], agent_id=worker["agent_id"])
+    for minutes in [29, 58, 87, 116, 120]:
+        clock[0] = started + timedelta(minutes=minutes)
+        with Session(runtime.engine) as session:
+            task = runtime.task_service(session).heartbeat(task_id, claim["lease_token"])
+            assert task.attempt == 1 and as_utc(task.attempt_started_at) == started
+            assert as_utc(session.get(AgentWorker, worker["agent_id"]).last_seen_at) == clock[0]
+    clock[0] += timedelta(microseconds=1)
+    with Session(runtime.engine) as session:
+        with pytest.raises(TaskConflictError, match="Execution deadline exceeded"):
+            runtime.task_service(session).heartbeat(task_id, claim["lease_token"])
+    # A fresh session observes the deadline release even though public heartbeat raised.
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        assert task.status == TaskStatus.PENDING and task.lease_token_hash is None
+        assert task.attempt == 1 and as_utc(task.attempt_started_at) == started
+        assert session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "claim_confirmed",
+        )).one().model_dump(mode="json") == confirmation
+        deadline = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == task_id, AuditEvent.action == "execution_deadline_exceeded",
+        )).one()
+        assert deadline.actor_id == "lease-guard"
+        assert lease_events(session, task_id) == []
 
 
 def offer_path(worker):

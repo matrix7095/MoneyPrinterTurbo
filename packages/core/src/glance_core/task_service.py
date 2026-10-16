@@ -1033,7 +1033,12 @@ class AgentTaskService:
                     entity_type="agent_task",
                     entity_id=task.id,
                     action="claim_confirmed",
-                    metadata_json={"attempt": task.attempt, "implicit": implicit},
+                    metadata_json={
+                        "attempt": task.attempt,
+                        "implicit": implicit,
+                        "attempt_started_at": as_utc(task.attempt_started_at).isoformat(),
+                        "lease_token_hash": task.lease_token_hash,
+                    },
                 )
             )
         self.session.commit()
@@ -1047,7 +1052,23 @@ class AgentTaskService:
         runtime_info: dict[str, Any] | None = None,
     ) -> AgentTask:
         task = self.require_lease(task_id, lease_token)
-        now = utc_now()
+        renewed = self._apply_lease_heartbeat(task, now=utc_now(), runtime_info=runtime_info)
+        self.session.commit()
+        if not renewed:
+            raise TaskConflictError("Execution deadline exceeded; lease was released")
+        self.session.refresh(task)
+        return task
+
+    def _apply_lease_heartbeat(
+        self, task: AgentTask, *, now, runtime_info=None,
+        touch_worker: bool = True, deadline_actor_id: str = "lease-guard",
+    ) -> bool:
+        """Apply the shared lease policy after caller authorization, without committing.
+
+        Trusted host callers must verify the current confirmed lease in their own
+        write transaction. Only a worker-authenticated heartbeat touches its registry.
+        False means the existing execution deadline released the lease.
+        """
         lease_minutes = lease_minutes_for_task(self.session, task, self.lease_minutes)
         if task.attempt_started_at and now > as_utc(task.attempt_started_at) + timedelta(
             minutes=lease_minutes * 4
@@ -1064,32 +1085,29 @@ class AgentTaskService:
             self._record_publish_intent_state(
                 task,
                 status="INTERRUPTED",
-                actor_id="lease-guard",
+                actor_id=deadline_actor_id,
                 reason="EXECUTION_DEADLINE_EXCEEDED",
             )
             self.session.add(
                 AuditEvent(
                     actor_type="system",
-                    actor_id="lease-guard",
+                    actor_id=deadline_actor_id,
                     entity_type="agent_task",
                     entity_id=task.id,
                     action="execution_deadline_exceeded",
                 )
             )
-            self.session.commit()
-            raise TaskConflictError("Execution deadline exceeded; lease was released")
+            return False
         task.lease_expires_at = now + timedelta(minutes=lease_minutes)
         task.last_heartbeat_at = now
         self.session.add(task)
-        if task.assigned_agent_id:
+        if touch_worker and task.assigned_agent_id:
             self._touch_worker(
                 task.assigned_agent_id,
                 task_id=task.id,
                 runtime_info=runtime_info,
             )
-        self.session.commit()
-        self.session.refresh(task)
-        return task
+        return True
 
     def complete(
         self,

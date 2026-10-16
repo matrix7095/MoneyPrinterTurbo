@@ -923,6 +923,25 @@ def test_finished_child_heartbeat_uses_host_idle_not_terminal_intent(setup):
     assert backend.events[-1][2]["child"] is None
 
 
+def test_parent_heartbeat_reports_same_live_child_with_fresh_event_ids(setup):
+    runner, backend, native, journal, _ = setup
+    w = bind_fixture(runner, journal)
+    child = dict(child_id="child", metadata_rpc_id="verified-metadata")
+    runner.current.update(child=child, admitted=True)
+    runner.children["child"] = dict(terminal=False)
+    for _ in range(2):
+        runner.last_heartbeat = -100
+        runner._heartbeat()
+    first, second = backend.events[-2:]
+    assert first[:2] == second[:2] == ("HEARTBEAT", w["request_id"])
+    assert first[2]["child"] == second[2]["child"] == child
+    assert first[2]["event_id"] != second[2]["event_id"]
+    native.eof = True
+    runner.last_heartbeat = -100
+    runner._heartbeat()
+    assert backend.events[-1] == second
+
+
 def test_actual_child_terminal_without_claim_stops_incomplete_handoff(setup):
     runner, backend, native, _, _ = setup
     original = backend.observe

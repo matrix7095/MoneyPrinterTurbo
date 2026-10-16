@@ -52,11 +52,14 @@ def content_spawn_intent(*, run_id: str, request_id: str, payload: SpawnIntentRe
 
 
 @router.post("/content-runs/{run_id}/intents/{request_id}/observation")
-def content_host_observation(*, run_id: str, request_id: str, payload: HostObservationRequest, session: Annotated[Session, Depends(get_session)]):
+def content_host_observation(*, request: Request, run_id: str, request_id: str, payload: HostObservationRequest, session: Annotated[Session, Depends(get_session)]):
     from app.business.content_host import observe_host
 
     try:
-        return observe_host(session, run_id, request_id, payload)
+        return observe_host(
+            session, run_id, request_id, payload,
+            tasks=get_runtime(request).task_service(session),
+        )
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
