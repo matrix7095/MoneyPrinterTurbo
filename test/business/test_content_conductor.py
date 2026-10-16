@@ -1702,6 +1702,377 @@ def test_actual_child_terminal_without_claim_stops_incomplete_handoff(setup):
     assert native.turn_count == 1 and native.closed
 
 
+@pytest.mark.parametrize("text, category", [
+    ("I cannot use tools in this environment. opaque_lease_0123", "child_self_reported_tool_unavailable"),
+    ("找不到交接文件。 admin_secret bootstrap_secret lease_secret", "handoff_path_missing"),
+    ("Permission denied. UNKNOWN_OPAQUE_SECRET", "authorization_refusal"),
+    ("unrecognized free text UNKNOWN_OPAQUE_SECRET", "unknown"),
+    (None, "unknown"),
+    ({"secret": "UNKNOWN_OPAQUE_SECRET"}, "unknown"),
+    ("x" * 9000 + " permission denied", "unknown"),
+])
+def test_unclaimed_terminal_records_only_bound_child_self_report(setup, text, category):
+    runner, backend, native, journal, _ = setup
+    original_request, original_observe = native.request, backend.observe
+
+    def request(method, params):
+        rpc = original_request(method, params)
+        if method == "thread/read":
+            native.queue.insert(2, dict(
+                method="item/completed", params=dict(
+                    threadId=params["threadId"], turnId="turn_" + params["threadId"],
+                    item=dict(type="agentMessage", id="message", text=text),
+                ),
+            ))
+        return rpc
+
+    def observe(run_id, request_id, body):
+        result = original_observe(run_id, request_id, body)
+        if body["outcome"] == "TERMINAL":
+            backend.state["intents"][request_id].update(
+                state="TERMINAL", claimbinding_summary=dict(claim_id=None),
+            )
+        return result
+
+    native.request, backend.observe = request, observe
+    assert runner.run()["status"] == "CONDUCTOR_HANDOFF_NOT_CLAIMED"
+    records = [json.loads(line) for line in journal.log_path.read_text().splitlines()]
+    diagnostic = next(record for record in records if record["kind"] == "handoff_not_claimed_diagnostic")
+    assert diagnostic["category"] == category
+    assert diagnostic["has_message"] is isinstance(text, str)
+    assert diagnostic["message_sha256"] == (c.prompt_sha256(text) if isinstance(text, str) else None)
+    assert diagnostic["message_bytes"] == (len(text.encode("utf-8")) if isinstance(text, str) else 0)
+    assert diagnostic["classification_truncated"] is (isinstance(text, str) and len(text) > 8192)
+    assert diagnostic["completed_tool_item_count"] == diagnostic["completed_command_item_count"] == 0
+    persisted = journal.log_path.read_text() + journal.path.read_text()
+    if isinstance(text, str):
+        assert text not in persisted
+    for secret in ("opaque_lease_0123", "admin_secret", "bootstrap_secret", "lease_secret", "UNKNOWN_OPAQUE_SECRET"):
+        assert secret not in persisted
+    assert not any("diagnostic" in key for key in runner.current)
+    assert native.turn_count == 1 and native.closed
+
+
+@pytest.fixture
+def preclaim_diagnostic_run(setup):
+    runner, backend, native, journal, _ = setup
+    original_request, original_observe = native.request, backend.observe
+    items = []
+    options = {"early": False, "before_spawn": False}
+
+    def request(method, params):
+        rpc = original_request(method, params)
+        if method == "turn/start" and options["before_spawn"]:
+            spawn = native.queue.pop()
+            native.queue.extend([
+                child_turn_event("turn_child_1", child_id="child_1"), *items,
+                child_turn_event("turn_child_1", "completed", "child_1"), spawn,
+            ])
+        if method == "thread/read":
+            # Real child/turn identities are established by the normal verification path.
+            response, started, completed, parent_done = native.queue
+            native.queue.clear()
+            events = [parent_done] if options["before_spawn"] else [started, *items, completed, parent_done]
+            native.queue.extend([*events, response] if options["early"] else [response, *events])
+        return rpc
+
+    def observe(run_id, request_id, body):
+        result = original_observe(run_id, request_id, body)
+        if body["outcome"] == "TERMINAL":
+            backend.state["intents"][request_id].update(
+                state="TERMINAL", claimbinding_summary=dict(claim_id=None),
+            )
+        return result
+
+    native.request, backend.observe = request, observe
+
+    def finish_run():
+        assert runner.run()["status"] == "CONDUCTOR_HANDOFF_NOT_CLAIMED"
+        assert native.closed and native.turn_count == 1
+        assert len([method for method, _ in native.sent if method == "thread/read"]) == 1
+        records = [json.loads(line) for line in journal.log_path.read_text().splitlines()]
+        return next(record for record in records if record["kind"] == "handoff_not_claimed_diagnostic")
+
+    return runner, native, journal, items, options, finish_run
+
+
+def diagnostic_item(kind="agentMessage", *, thread="child_1", turn="turn_child_1", **fields):
+    return dict(method="item/completed", params=dict(
+        threadId=thread, turnId=turn,
+        item=dict(id="item", type=kind, **fields),
+    ))
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_preclaim_counts_native_action_types_and_unknown_types_without_outputs(preclaim_diagnostic_run, early):
+    _, _, journal, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = early
+    # Literal fixture mirrors the pinned SDK schema, not implementation constants.
+    actions = ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+               "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView", "sleep", "imageGeneration"]
+    ignored = ["userMessage", "hookPrompt", "functionCallOutput", "plan", "reasoning",
+               "enteredReviewMode", "exitedReviewMode", "contextCompaction"]
+    for kind in actions + ignored + ["futureNativeAction"]:
+        items.append(diagnostic_item(kind, arguments={"token": "SECRET_ARGS"},
+                                     output="SECRET_OUTPUT", text="Permission denied SECRET_REASONING"))
+    items.append(diagnostic_item(text="Tools are unavailable. SECRET_MESSAGE"))
+    result = finish_run()
+    assert result["completed_tool_item_count"] == 10
+    assert result["completed_command_item_count"] == 1
+    assert result["completed_unrecognized_item_count"] == 1
+    assert result["category"] == "child_self_reported_tool_unavailable"
+    assert result["early_items_truncated"] is False
+    assert "SECRET_" not in journal.log_path.read_text() + journal.path.read_text()
+    # No arbitrary types are added to the new diagnostic record.
+    assert "futureNativeAction" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_preclaim_foreign_child_turn_and_post_terminal_items_do_not_leak(preclaim_diagnostic_run, early):
+    _, native, journal, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = early
+    items.extend([
+        diagnostic_item(thread="parent", text="Permission denied WRONG_PARENT"),
+        diagnostic_item(thread="foreign", text="Permission denied WRONG_CHILD"),
+        diagnostic_item(turn="wrong_turn", text="Permission denied WRONG_TURN"),
+        diagnostic_item(text="Tools are unavailable. CURRENT_MESSAGE"),
+        child_turn_event("turn_child_1", "completed", "child_1"),
+        diagnostic_item(text="Permission denied AFTER_TERMINAL"),
+    ])
+    result = finish_run()
+    assert result["category"] == "child_self_reported_tool_unavailable"
+    assert result["message_sha256"] == c.prompt_sha256("Tools are unavailable. CURRENT_MESSAGE")
+    persisted = journal.log_path.read_text() + journal.path.read_text()
+    for marker in ("WRONG_PARENT", "WRONG_CHILD", "WRONG_TURN", "AFTER_TERMINAL", "CURRENT_MESSAGE"):
+        assert marker not in persisted
+    assert native.closed
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_preclaim_turn_replacement_clears_previous_message(preclaim_diagnostic_run, early):
+    _, _, _, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = early
+    items.extend([
+        diagnostic_item(text="Permission denied OLD_TURN"),
+        child_turn_event("new_turn", child_id="child_1"),
+        diagnostic_item(turn="turn_child_1", text="Permission denied STALE_MESSAGE"),
+        diagnostic_item(turn="new_turn", text="unrecognized new message"),
+        child_turn_event("new_turn", "completed", "child_1"),
+    ])
+    result = finish_run()
+    assert result["turn_id"] == "new_turn"
+    assert result["category"] == "unknown"
+    assert result["message_sha256"] == c.prompt_sha256("unrecognized new message")
+
+
+def test_preclaim_early_diagnostic_limit_does_not_change_turn_capacity_or_stop(preclaim_diagnostic_run):
+    _, _, journal, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = True
+    items.extend(diagnostic_item("mcpToolCall", arguments="SECRET_ARGS") for _ in range(90))
+    result = finish_run()
+    assert result["completed_tool_item_count"] == 64
+    assert result["early_items_truncated"] is True
+    assert result["has_message"] is False
+    assert "SECRET_ARGS" not in journal.log_path.read_text()
+
+
+def test_preclaim_before_parent_spawn_replays_only_after_metadata_verification(preclaim_diagnostic_run):
+    _, _, _, items, options, finish_run = preclaim_diagnostic_run
+    options["before_spawn"] = True
+    items.extend([diagnostic_item("imageView", path="SECRET_PATH"),
+                  diagnostic_item(text="handoff file is missing. SECRET_MESSAGE")])
+    result = finish_run()
+    assert result["category"] == "handoff_path_missing"
+    assert result["completed_tool_item_count"] == 1
+    assert result["has_message"] is True
+
+
+def test_preclaim_64_diagnostic_items_do_not_consume_64_turn_slots(preclaim_diagnostic_run):
+    _, _, _, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = True
+    items.extend(diagnostic_item("imageView") for _ in range(64))
+    for index in range(31):
+        items.extend([child_turn_event(f"next_{index}", child_id="child_1"),
+                      child_turn_event(f"next_{index}", "completed", "child_1")])
+    result = finish_run()
+    assert result["turn_id"] == "next_30"
+    assert result["completed_tool_item_count"] == 0  # Previous turns are isolated.
+    assert result["early_items_truncated"] is False
+
+
+def test_preclaim_missing_message_stays_unknown(preclaim_diagnostic_run):
+    result = preclaim_diagnostic_run[-1]()
+    assert result["category"] == "unknown" and result["has_message"] is False
+    assert result["message_sha256"] is None and result["message_bytes"] == 0
+    assert result["category_source"] == "child_message_self_report"
+
+
+def test_preclaim_early_cache_contains_only_derived_metadata(early_turn_context):
+    runner, _, native, journal, _ = early_turn_context
+    secret = "Permission denied opaque_lease_0123 admin_secret bootstrap_secret UNKNOWN_OPAQUE"
+    native.queue.extend([child_turn_event(),
+                         diagnostic_item(thread="child", turn="child_turn", text=secret)])
+    while native.queue:
+        runner._pump()
+    assert runner.current["early_turn_events"][-1][3]["message_sha256"] == c.prompt_sha256(secret)
+    memory = json.dumps(runner.current, ensure_ascii=False)
+    persisted = journal.log_path.read_text() + journal.path.read_text()
+    for marker in ("opaque_lease_0123", "admin_secret", "bootstrap_secret", "UNKNOWN_OPAQUE"):
+        assert marker not in memory + persisted
+    assert runner.current.get("child") is None
+
+
+def test_preclaim_failed_metadata_does_not_publish_self_report(preclaim_diagnostic_run):
+    runner, native, journal, items, _, _ = preclaim_diagnostic_run
+    native.fault = "model"
+    items.append(diagnostic_item(text="Permission denied SECRET_MESSAGE"))
+    assert runner.run()["status"] == "CONDUCTOR_CHILD_METADATA_MISMATCH"
+    persisted = journal.log_path.read_text() + journal.path.read_text()
+    assert "handoff_not_claimed_diagnostic" not in persisted
+    assert "SECRET_MESSAGE" not in persisted
+    assert not any("diagnostic" in key for key in runner.current)
+
+
+@pytest.mark.parametrize("text", [
+    "No authorization required.", "不需要授权。", "不是工具不可用。",
+    "Permission denied was the previous worker's error; my tools work.",
+    "If tools are unavailable, ask for help.", "I cannot use tools if access expires.",
+    'The example says "permission denied".', '"Permission denied" is a quoted example.',
+    "此前需要授权，现在已经可以执行。", "如果工具不可用，需要进一步检查。",
+    "I cannot use tools? No, tools are available.",
+    "Tools are unavailable was an earlier report, not my current state.",
+    "Permission denied is a literal string in the supplied prompt.",
+    "Tools are unavailable on paper only; the tool is working.",
+])
+def test_preclaim_classifier_ambiguous_or_negated_reports_are_unknown(text):
+    assert c.preclaim_item_summary(dict(type="agentMessage", text=text))["category"] == "unknown"
+
+
+@pytest.mark.parametrize("thread,turn", [("foreign", "turn_child_1"), ("child_1", "foreign_turn"), ("parent", "turn_child_1")])
+def test_preclaim_foreign_classifier_failure_cannot_pollute_bound_task(preclaim_diagnostic_run, monkeypatch, thread, turn):
+    _, _, _, items, _, finish_run = preclaim_diagnostic_run
+    original = c.preclaim_item_summary
+
+    def classify(item):
+        if item.get("text") == "FOREIGN_FAILURE":
+            raise UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogate")
+        return original(item)
+
+    monkeypatch.setattr(c, "preclaim_item_summary", classify)
+    items.extend([diagnostic_item(thread=thread, turn=turn, text="FOREIGN_FAILURE"),
+                  diagnostic_item(text="I cannot use tools")])
+    result = finish_run()
+    assert result["capture_failed"] is False
+    assert result["category"] == "child_self_reported_tool_unavailable"
+
+
+@pytest.mark.parametrize("thread,turn", [("foreign", "child_turn"), ("child", "foreign_turn")])
+def test_preclaim_unrelated_surrogate_never_enters_classifier(interrupt_context, thread, turn):
+    runner, _, _, _, _ = interrupt_context
+    # Isolate optional diagnostics; the unchanged generic journal has its own UTF-8 boundary.
+    runner._capture_preclaim_item(
+        dict(threadId=thread, turnId=turn), dict(type="agentMessage", text="\ud800"),
+    )
+    assert "preclaim_diagnostic" not in runner.current
+    assert not runner.current.get("preclaim_diagnostic_failed")
+
+
+def test_preclaim_early_foreign_candidate_failure_stays_with_that_candidate(preclaim_diagnostic_run, monkeypatch):
+    _, _, _, items, options, finish_run = preclaim_diagnostic_run
+    original = c.preclaim_item_summary
+
+    def classify(item):
+        if item.get("text") == "FOREIGN_FAILURE":
+            raise RuntimeError("SECRET_FOREIGN_FAILURE")
+        return original(item)
+
+    monkeypatch.setattr(c, "preclaim_item_summary", classify)
+    options["before_spawn"] = True
+    items.extend([
+        child_turn_event("foreign_turn", child_id="foreign"),
+        diagnostic_item(thread="foreign", turn="foreign_turn", text="FOREIGN_FAILURE"),
+        diagnostic_item(text="I cannot use tools"),
+    ])
+    result = finish_run()
+    assert result["capture_failed"] is False
+    assert result["category"] == "child_self_reported_tool_unavailable"
+
+
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("new_turn", [False, True])
+def test_preclaim_capture_failure_is_owned_by_exact_turn(preclaim_diagnostic_run, monkeypatch, early, new_turn):
+    _, _, _, items, options, finish_run = preclaim_diagnostic_run
+    options["early"] = early
+    original = c.preclaim_item_summary
+
+    def classify(item):
+        if item.get("text") == "OLD_TURN_FAILURE":
+            raise ValueError("PRIVATE_OLD_ERROR")
+        return original(item)
+
+    monkeypatch.setattr(c, "preclaim_item_summary", classify)
+    turn_id = "new_turn" if new_turn else "turn_child_1"
+    items.extend([
+        diagnostic_item(text="OLD_TURN_FAILURE"),
+        child_turn_event(turn_id, child_id="child_1"),
+        diagnostic_item(turn=turn_id, text="I cannot use tools"),
+        child_turn_event(turn_id, "completed", "child_1"),
+    ])
+    result = finish_run()
+    assert result["turn_id"] == turn_id
+    assert result["category"] == "child_self_reported_tool_unavailable"
+    assert result["capture_failed"] is (not new_turn)
+
+
+@pytest.mark.parametrize("failure", ["capture", "write"])
+def test_preclaim_diagnostic_failure_keeps_original_stop(preclaim_diagnostic_run, monkeypatch, failure):
+    runner, _, journal, items, _, finish_run = preclaim_diagnostic_run
+    items.append(diagnostic_item(text="I cannot use tools"))
+    if failure == "capture":
+        def fail_capture(item):
+            raise RuntimeError("SECRET_ERROR")
+        monkeypatch.setattr(c, "preclaim_item_summary", fail_capture)
+        result = finish_run()
+        assert result["has_message"] is False and result["capture_failed"] is True
+    else:
+        original = journal.record
+
+        def record(kind, data):
+            if kind == "handoff_not_claimed_diagnostic":
+                raise OSError("SECRET_ERROR")
+            return original(kind, data)
+
+        monkeypatch.setattr(journal, "record", record)
+        assert runner.run()["status"] == "CONDUCTOR_HANDOFF_NOT_CLAIMED"
+        assert runner.native.closed and runner.native.turn_count == 1
+    assert "SECRET_ERROR" not in journal.log_path.read_text() + journal.path.read_text()
+
+
+@pytest.mark.parametrize("scope", ["run", "generation", "epoch", "request", "offer", "child"])
+def test_preclaim_diagnostic_rejects_changed_binding(interrupt_context, scope):
+    runner, _, native, journal, _ = interrupt_context
+    child, worker_data = runner.current["child"], runner.current["worker"]
+    journal.state["intents"][worker_data["request_id"]].update(
+        child=child, offer_hash=worker_data["offer_hash"],
+    )
+    if scope == "run":
+        runner.run_id = "run_" + "c" * 32
+    elif scope == "generation":
+        runner.generation = 2
+    elif scope == "epoch":
+        runner.epoch = 2
+    elif scope == "request":
+        worker_data["request_id"] = "another-request"
+    elif scope == "offer":
+        worker_data["offer_hash"] = "c" * 64
+    else:
+        child["child_id"] = "different-child"
+    native.queue.append(diagnostic_item(thread="child", turn="child_turn", text="Permission denied SECRET_CROSS_SCOPE"))
+    runner._pump()
+    assert "preclaim_diagnostic" not in runner.current
+    assert "SECRET_CROSS_SCOPE" not in journal.log_path.read_text() + journal.path.read_text()
+
+
 def test_attach_response_lost_reconciles_and_stops_without_spawn(setup):
     runner, backend, native, _, _ = setup
     original = backend.attach

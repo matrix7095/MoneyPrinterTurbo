@@ -36,6 +36,18 @@ POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 30
 MAX_ROUNDS = 16
 MAX_EARLY_CHILD_EVENTS = 64
+MAX_EARLY_DIAGNOSTIC_ITEMS = 64
+MAX_DIAGNOSTIC_TEXT_CHARS = 8192
+# ThreadItem action types from the pinned native SDK; counts do not imply success.
+DIAGNOSTIC_TOOL_ITEMS = frozenset({
+    "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+    "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView",
+    "sleep", "imageGeneration",
+})
+DIAGNOSTIC_NON_ACTION_ITEMS = frozenset({
+    "userMessage", "hookPrompt", "functionCallOutput", "plan", "reasoning",
+    "enteredReviewMode", "exitedReviewMode", "contextCompaction",
+})
 REQUEST_ERROR_CLASSES = {
     "ConnectError",
     "ConnectTimeout",
@@ -140,6 +152,62 @@ def event_summary(message: dict) -> dict:
         json.dumps(message, ensure_ascii=False).encode("utf-8")
     )
     return result
+
+
+def preclaim_item_summary(item):
+    """Derive fixed metadata immediately; never cache or persist message text."""
+    kind = item.get("type")
+    if not isinstance(kind, str) or kind in DIAGNOSTIC_NON_ACTION_ITEMS:
+        return None
+    summary = {
+        "completed_tool_item_count": int(kind in DIAGNOSTIC_TOOL_ITEMS),
+        "completed_command_item_count": int(kind == "commandExecution"),
+        "completed_unrecognized_item_count": int(
+            kind not in DIAGNOSTIC_TOOL_ITEMS and kind != "agentMessage"
+        ),
+    }
+    if kind != "agentMessage":
+        return summary
+    text = item.get("text")
+    summary.update(category="unknown", has_message=isinstance(text, str),
+                   message_sha256=None, message_bytes=0, classification_truncated=False)
+    if not isinstance(text, str):
+        return summary
+    encoded = text.encode("utf-8")
+    summary.update(message_sha256=hashlib.sha256(encoded).hexdigest(),
+                   message_bytes=len(encoded),
+                   classification_truncated=len(text) > MAX_DIAGNOSTIC_TEXT_CHARS)
+    # These are child self-reports only, never facts about tools or authorization.
+    excerpt = text[:MAX_DIAGNOSTIC_TEXT_CHARS].strip().casefold()
+    if (
+        re.search(r'\b(if|unless|would|could|might|may|previous|previously|earlier|historical|'
+                  r'quoted|quote|example|hypothetical|was|were|but)\b', excerpt)
+        or any(marker in excerpt for marker in (
+            '"', '`', '“', '”', '「', '」', '?', '？', "no authorization required",
+            "not required", "no longer", "is false", "is not true", "not the case",
+            "如果", "假如", "除非", "此前", "之前", "先前", "历史", "引用", "举例", "示例",
+            "不是", "并非", "不需要", "无需", "并未", "没有被", "不代表", "不意味着", "已解决",
+        ))
+    ):
+        return summary
+    # Only an explicit first assertion is classified; qualified prose stays unknown.
+    statement = re.split(r"[.!。！\n]", excerpt, maxsplit=1)[0].strip()
+    for category, phrases in (
+        ("authorization_refusal", ("permission denied", "blocked by policy",
+                                   "not authorized", "authorization required",
+                                   "权限被拒绝", "策略拦截", "未获授权", "需要授权")),
+        ("handoff_path_missing", ("handoff file is missing", "handoff path does not exist",
+                                  "dispatch offer file is missing", "找不到交接文件",
+                                  "交接路径不存在", "缺少交接文件")),
+        ("child_self_reported_tool_unavailable", ("i cannot use tools", "i can't use tools",
+                                                 "tools are unavailable", "no tools are available",
+                                                 "tool access is unavailable", "没有可用工具",
+                                                 "无法调用工具", "工具不可用", "未提供工具")),
+    ):
+        if statement.removesuffix(" in this environment") in phrases:
+            summary["category"] = category
+            break
+    return summary
 
 
 class Journal:
@@ -810,6 +878,12 @@ class Conductor:
                 and method == "item/started"
             ):
                 self._child_started(params, item)
+            if method == "item/completed":
+                try:
+                    self._capture_preclaim_item(params, item)
+                except Exception:
+                    # Optional diagnostics cannot change admission or stopping.
+                    pass
         if method == "turn/completed":
             thread_id = params.get("threadId")
             if thread_id == self.parent:
@@ -822,6 +896,116 @@ class Conductor:
         worker = self.current["worker"]
         return (self.run_id, self.generation, self.epoch, self.parent,
                 self.parent_turn, worker["request_id"], worker["offer_hash"])
+
+    def _capture_preclaim_item(self, params, item):
+        if not self.current or not isinstance(item, dict):
+            return
+        if self.current.get("child"):
+            self._child_diagnostic_item(params, item)
+            return
+        events = self.current.get("early_turn_events", [])
+        thread_id, turn_id = params.get("threadId"), params.get("turnId")
+        if (
+            self.current.get("early_turn_scope") != self._early_turn_scope()
+            or not isinstance(turn_id, str) or not turn_id
+            or not isinstance(thread_id, str) or not thread_id
+            or (self.current.get("started") and self.current["started"]["child_id"] != thread_id)
+        ):
+            return
+        previous = next((event for event in reversed(events)
+                         if event[0].startswith("turn/") and event[1:3] == (thread_id, turn_id)), None)
+        if not previous or previous[0] != "turn/started":
+            return
+        try:
+            summary = preclaim_item_summary(item)
+        except Exception:
+            # A candidate is not yet verified; keep failure metadata scoped to it.
+            summary = {"capture_failed": True}
+        if summary is None:
+            return
+        if sum(event[0] == "item/completed" for event in events) >= MAX_EARLY_DIAGNOSTIC_ITEMS:
+            self.current["early_diagnostic_truncated"] = True
+            return
+        # Share replay order, but do not consume the original 64 turn-event slots.
+        events.append(("item/completed", thread_id, turn_id, summary))
+
+    def _child_diagnostic_item(self, params, item, *, summarized=False):
+        child = self.current.get("child") or {}
+        worker = self.current["worker"]
+        state = self.children.get(child.get("child_id"), {})
+        intent = self.journal.state["intents"].get(worker["request_id"], {})
+        turn_id = params.get("turnId")
+        if (
+            not self.current.get("admitted")
+            or params.get("threadId") != child.get("child_id")
+            or not turn_id or turn_id != state.get("turn_id")
+            or state.get("turns", {}).get(turn_id) != "inProgress"
+            or state.get("terminal") is not False
+            or child.get("parent_thread_id") != self.parent
+            or child.get("started") != self.current.get("started")
+            or (child.get("started") or {}).get("parent_turn_id") != self.parent_turn
+            or not child.get("metadata_rpc_id")
+            or intent.get("child") != child
+            or intent.get("offer_hash") != worker.get("offer_hash")
+            or worker.get("run_id") != self.run_id
+            or worker.get("run_generation") != self.generation
+            or worker.get("host_epoch") != self.epoch
+        ):
+            return
+        try:
+            summary = item if summarized else preclaim_item_summary(item)
+        except Exception:
+            self.current["preclaim_diagnostic_failed"] = True
+            return
+        if summary is None:
+            return
+        if summary.get("capture_failed"):
+            self.current["preclaim_diagnostic_failed"] = True
+            return
+        scope = self._early_turn_scope() + (child["child_id"], turn_id)
+        observation = self.current.get("preclaim_diagnostic")
+        if not observation or observation["scope"] != scope:
+            observation = {
+                "scope": scope, "category": "unknown", "has_message": False,
+                "message_sha256": None, "message_bytes": 0,
+                "classification_truncated": False, "completed_tool_item_count": 0,
+                "completed_command_item_count": 0, "completed_unrecognized_item_count": 0,
+            }
+            self.current["preclaim_diagnostic"] = observation
+        for key in ("completed_tool_item_count", "completed_command_item_count",
+                    "completed_unrecognized_item_count"):
+            observation[key] += summary[key]
+        if "has_message" in summary:
+            for key in ("category", "has_message", "message_sha256", "message_bytes",
+                        "classification_truncated"):
+                observation[key] = summary[key]
+
+    def _record_unclaimed_diagnostic(self):
+        try:
+            worker, child = self.current["worker"], self.current["child"]
+            turn_id = self.children[child["child_id"]].get("turn_id")
+            observation = self.current.pop("preclaim_diagnostic", None) or {}
+            if observation.get("scope") != self._early_turn_scope() + (child["child_id"], turn_id):
+                observation = {}
+            self.journal.record("handoff_not_claimed_diagnostic", {
+                "run_id": self.run_id, "generation": self.generation,
+                "host_epoch": self.epoch, "request_id": worker["request_id"],
+                "child_id": child["child_id"], "turn_id": turn_id,
+                "category": observation.get("category", "unknown"),
+                "category_source": "child_message_self_report",
+                "has_message": observation.get("has_message", False),
+                "message_sha256": observation.get("message_sha256"),
+                "message_bytes": observation.get("message_bytes", 0),
+                "classification_truncated": observation.get("classification_truncated", False),
+                "early_items_truncated": self.current.pop("early_diagnostic_truncated", False),
+                "capture_failed": self.current.pop("preclaim_diagnostic_failed", False),
+                "completed_tool_item_count": observation.get("completed_tool_item_count", 0),
+                "completed_command_item_count": observation.get("completed_command_item_count", 0),
+                "completed_unrecognized_item_count": observation.get("completed_unrecognized_item_count", 0),
+            })
+        except Exception:
+            # Even disk-full or a diagnostic bug leaves the existing stop intact.
+            pass
 
     def _buffer_child_turn(self, method, params):
         thread_id = params.get("threadId")
@@ -843,8 +1027,10 @@ class Conductor:
         scope = self._early_turn_scope()
         if self.current.get("early_turn_scope") != scope:
             self.current.update(early_turn_scope=scope, early_turn_events=[])
+            self.current.pop("early_diagnostic_truncated", None)
+            self.current.pop("preclaim_diagnostic_failed", None)
         events = self.current["early_turn_events"]
-        if len(events) >= MAX_EARLY_CHILD_EVENTS:
+        if sum(event[0].startswith("turn/") for event in events) >= MAX_EARLY_CHILD_EVENTS:
             raise ConductorError("CONDUCTOR_EARLY_CHILD_EVENT_LIMIT")
         # The native child can start before its parent's spawn notification arrives.
         events.append((method, thread_id, turn["id"], turn["status"]))
@@ -863,6 +1049,9 @@ class Conductor:
                 if turn_id not in turns:
                     turns[turn_id] = "inProgress"
                     state.update(turn_id=turn_id, terminal=False)
+                    if self.current and self.current.get("child", {}).get("child_id") == thread_id:
+                        self.current.pop("preclaim_diagnostic", None)
+                        self.current.pop("preclaim_diagnostic_failed", None)
             return
         if (
             not state.get("turn_id") or turn_id != state["turn_id"]
@@ -929,6 +1118,8 @@ class Conductor:
         ):
             self.current.pop("early_turn_events", None)
             self.current.pop("early_turn_scope", None)
+            self.current.pop("early_diagnostic_truncated", None)
+            self.current.pop("preclaim_diagnostic_failed", None)
             self._observe("REJECTED", worker["request_id"])
             self._stop("CONDUCTOR_CHILD_METADATA_MISMATCH")
             return
@@ -960,9 +1151,17 @@ class Conductor:
         ):
             for method, thread_id, turn_id, status in events:
                 if thread_id == child["child_id"]:
-                    self._child_turn(method, {
-                        "threadId": thread_id, "turn": {"id": turn_id, "status": status},
-                    }, notify=False)
+                    if method == "item/completed":
+                        try:
+                            self._child_diagnostic_item(
+                                {"threadId": thread_id, "turnId": turn_id}, status, summarized=True,
+                            )
+                        except Exception:
+                            self.current["preclaim_diagnostic_failed"] = True
+                    else:
+                        self._child_turn(method, {
+                            "threadId": thread_id, "turn": {"id": turn_id, "status": status},
+                        }, notify=False)
         if self.children[child["child_id"]]["terminal"]:
             self._observe("TERMINAL", worker["request_id"], child)
 
@@ -1242,6 +1441,7 @@ class Conductor:
                         if intent.get("state") == "TERMINAL" and not (
                             intent.get("claimbinding_summary") or {}
                         ).get("claim_id"):
+                            self._record_unclaimed_diagnostic()
                             self._stop("CONDUCTOR_HANDOFF_NOT_CLAIMED")
                             continue
                     if business_resolved:
@@ -1314,6 +1514,10 @@ class Conductor:
             self.journal.save()
             raise ConductorError(code) from None
         finally:
+            if self.current:
+                for key in ("preclaim_diagnostic", "early_turn_events", "early_turn_scope",
+                            "early_diagnostic_truncated", "preclaim_diagnostic_failed"):
+                    self.current.pop(key, None)
             known_drained = (
                 all(child["terminal"] for child in self.children.values())
                 and self.parent_idle
