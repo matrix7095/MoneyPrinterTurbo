@@ -552,6 +552,8 @@ class Conductor:
         self.responses = {}
         self.metadata = {}
         self.children = {}
+        self.interrupt_attempts = set()
+        self.interrupt_requests = {}
         self.stop_reason = None
         self.last_heartbeat = monotonic()
 
@@ -635,6 +637,83 @@ class Conductor:
             self._observe("HEARTBEAT")
         self.last_heartbeat = self.monotonic()
 
+    def _record_interrupt(self, record, kind):
+        try:
+            self.journal.save()
+            self.journal.record(kind, dict(record))
+            return True
+        except OSError:
+            # A failed audit write never authorizes a request or closes a live child.
+            return False
+
+    def _interrupt_pending_child(self, view):
+        if (
+            view.get("stop_requested") is not True
+            or view.get("stop_reason") != "operator_stop"
+            or view.get("state") != "draining"
+            or self.stop_reason != "CONDUCTOR_STOP_REQUESTED"
+            or not self.current
+            or not self.current.get("admitted")
+            or not self.native.alive()
+        ):
+            return
+        worker, child = self.current["worker"], self.current.get("child")
+        if not child:
+            return
+        try:
+            binding = self._own_binding(view)
+            validate_worker(worker, view, self.run_id, self.content_id)
+        except (ConductorError, KeyError, TypeError, ValueError):
+            return
+        intent = view.get("intents", {}).get(worker["request_id"]) or {}
+        summary = intent.get("claimbinding_summary") or {}
+        state = self.children.get(child["child_id"]) or {}
+        turn_id = state.get("turn_id")
+        if (
+            intent.get("state") != "CLAIMED"
+            or intent.get("host_epoch") != self.epoch
+            or intent.get("offer_hash") != worker["offer_hash"]
+            or intent.get("child") != child
+            or not intent.get("claim_id")
+            or summary.get("claim_id") != intent["claim_id"]
+            or summary.get("task_id") != worker["task_id"]
+            or summary.get("task_status") != "PENDING"
+            or summary.get("accepted") is True
+            or summary.get("consumed") is True
+            or view.get("offer_children", {}).get(worker["request_id"]) != child["child_id"]
+            or child.get("parent_thread_id") != self.parent
+            or child.get("started") != self.current.get("started")
+            or state.get("terminal") is not False
+            or not turn_id
+            or state.get("turns", {}).get(turn_id) != "inProgress"
+            or worker["request_id"] not in self.journal.state["intents"]
+        ):
+            return
+        key = (self.run_id, self.generation, self.epoch, self.parent, child["child_id"], turn_id)
+        if key in self.interrupt_attempts:
+            return
+        self.interrupt_attempts.add(key)
+        record = {
+            **binding, "request_id": worker["request_id"], "task_id": worker["task_id"],
+            "claim_id": intent["claim_id"], "offer_hash": worker["offer_hash"],
+            "child_id": child["child_id"], "turn_id": turn_id,
+            "reason": "OPERATOR_STOP_LOST_LEASE", "state": "SEND_INTENT",
+        }
+        self.journal.state["intents"][worker["request_id"]].setdefault("interrupts", {})[turn_id] = record
+        if not self._record_interrupt(record, "interrupt_send_intent"):
+            return
+        try:
+            rpc_id = self.native.request("turn/interrupt", {
+                "threadId": child["child_id"], "turnId": turn_id,
+            })
+        except (ConductorError, OSError, ValueError):
+            record["state"] = "SEND_UNCERTAIN"
+            self._record_interrupt(record, "interrupt_send_uncertain")
+            return
+        self.interrupt_requests[rpc_id] = record
+        record.update(state="SENT", rpc_id=rpc_id)
+        self._record_interrupt(record, "interrupt_sent")
+
     def _rpc(self, method, params, timeout=30):
         identifier = self.native.request(method, params)
         deadline = self.monotonic() + timeout
@@ -678,7 +757,14 @@ class Conductor:
             identifier = message.get("id")
             if isinstance(identifier, bool) or not isinstance(identifier, (str, int)):
                 raise ConductorError("CONDUCTOR_NATIVE_INVALID_RPC_ID")
-            if identifier in self.metadata:
+            if identifier in self.interrupt_requests:
+                record = self.interrupt_requests.pop(identifier)
+                record["state"] = (
+                    "REJECTED" if "error" in message else
+                    "ACKNOWLEDGED" if isinstance(message.get("result"), dict) else "INVALID_RESPONSE"
+                )
+                self._record_interrupt(record, "interrupt_response")
+            elif identifier in self.metadata:
                 started = self.metadata.pop(identifier)
                 self._verify_child(identifier, started, message)
             else:
@@ -690,6 +776,15 @@ class Conductor:
         if method == "turn/started" and params.get("threadId") == self.parent:
             self.parent_turn = params["turn"]["id"]
             self.parent_idle = False
+        elif method == "turn/started" and params.get("threadId") in self.children:
+            state = self.children[params["threadId"]]
+            turn = params.get("turn") or {}
+            turn_id = turn.get("id")
+            if isinstance(turn_id, str) and turn_id and turn.get("status") == "inProgress":
+                turns = state.setdefault("turns", {})
+                if turn_id not in turns:
+                    turns[turn_id] = "inProgress"
+                    state.update(turn_id=turn_id, terminal=False)
         if method in {"item/started", "item/completed"}:
             item = params.get("item") or {}
             if (
@@ -706,7 +801,18 @@ class Conductor:
                     self._observe("UNKNOWN", self.current["worker"]["request_id"])
                     self._stop("CONDUCTOR_SPAWN_NOT_OBSERVED")
             elif thread_id in self.children:
-                self.children[thread_id]["terminal"] = True
+                state = self.children[thread_id]
+                turn = params.get("turn") or {}
+                if (
+                    not state.get("turn_id")
+                    or turn.get("id") != state["turn_id"]
+                    or state.get("turns", {}).get(turn.get("id")) != "inProgress"
+                    or turn.get("status") not in {"completed", "interrupted", "failed"}
+                    or state["terminal"]
+                ):
+                    return
+                state["terminal"] = True
+                state["turns"][turn["id"]] = turn["status"]
                 if (
                     self.current
                     and self.current.get("child", {}).get("child_id") == thread_id
@@ -1031,6 +1137,7 @@ class Conductor:
                     "expired",
                 }:
                     self.stop_reason = self.stop_reason or "CONDUCTOR_STOP_REQUESTED"
+                self._interrupt_pending_child(view)
                 expires = datetime.fromisoformat(view["expires_at"]).timestamp()
                 if self.clock() >= expires and not self.stop_reason:
                     self._stop("CONDUCTOR_RUN_EXPIRED")

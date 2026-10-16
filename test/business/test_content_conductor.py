@@ -205,7 +205,8 @@ class FakeNative:
             )
             self.queue.extend(
                 [
-                    dict(method="turn/completed", params=dict(threadId=child_id)),
+                    child_turn_event("turn_" + child_id, child_id=child_id),
+                    child_turn_event("turn_" + child_id, "completed", child_id),
                     dict(method="turn/completed", params=dict(threadId="parent")),
                 ]
             )
@@ -364,6 +365,383 @@ def bind_fixture(runner, journal):
     runner.current = dict(worker=w)
     journal.state["intents"][w["request_id"]] = {}
     return w
+
+
+def child_turn_event(turn_id="child_turn", status="inProgress", child_id="child"):
+    return dict(
+        method="turn/started" if status == "inProgress" else "turn/completed",
+        params=dict(threadId=child_id, turn=dict(id=turn_id, status=status, items=[])),
+    )
+
+
+@pytest.fixture
+def interrupt_context(setup):
+    runner, backend, native, journal, plans = setup
+    w = bind_fixture(runner, journal)
+    started = dict(parent_thread_id="parent", parent_turn_id="turn_1", item_id="spawn",
+                   agent_path="/root/" + w["title"], child_id="child")
+    child = dict(child_id="child", parent_thread_id="parent", native_agent_type="default",
+                 model=w["model"], reasoning_effort=w["reasoning_effort"], ephemeral=True,
+                 started=started, metadata_rpc_id="verified-rpc",
+                 issued_prompt_sha256=c.prompt_sha256(w["prompt"]))
+    runner.current.update(started=started, child=child, admitted=True)
+    runner.stop_reason = "CONDUCTOR_STOP_REQUESTED"
+    runner.children["child"] = dict(terminal=False)
+    backend.state.update(
+        stop_requested=True, stop_reason="operator_stop", state="draining",
+        offer_children={w["request_id"]: "child"},
+    )
+    backend.state["intents"][w["request_id"]] = dict(
+        state="CLAIMED", host_epoch=1, offer_hash=w["offer_hash"], child=copy.deepcopy(child),
+        claim_id="original-claim",
+        claimbinding_summary=dict(claim_id="original-claim", task_id=w["task_id"],
+                                  task_status="PENDING", current_attempt=1,
+                                  accepted=False, consumed=False),
+    )
+    native.queue.append(child_turn_event())
+    runner._pump()
+    return runner, backend, native, journal, plans
+
+
+def test_child_turn_identity_is_captured_only_from_live_native_event(interrupt_context):
+    runner, _, _, _, _ = interrupt_context
+    assert runner.children["child"]["turn_id"] == "child_turn"
+    assert not runner.children["child"]["terminal"]
+
+
+def test_operator_stop_interrupts_verified_pending_original_claim_once(interrupt_context):
+    runner, backend, native, journal, plans = interrupt_context
+    for _ in range(3):
+        runner._interrupt_pending_child(backend.view(CONTENT))
+    assert [(method, params) for method, params in native.sent if method == "turn/interrupt"] == [
+        ("turn/interrupt", dict(threadId="child", turnId="child_turn")),
+    ]
+    assert not native.closed and native.turn_count == 0 and plans == []
+    assert not runner.children["child"]["terminal"]
+    assert "interrupt_send_intent" in journal.log_path.read_text()
+
+
+def test_old_child_turn_completion_does_not_finish_new_active_turn(interrupt_context):
+    runner, backend, native, _, _ = interrupt_context
+    native.queue.append(child_turn_event("new_child_turn"))
+    runner._pump()
+    native.queue.append(child_turn_event(status="completed"))
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert not any(event[0] == "TERMINAL" for event in backend.events)
+
+
+@pytest.mark.parametrize("status", ["completed", "interrupted", "failed"])
+def test_interrupt_ack_waits_for_same_turn_real_terminal(interrupt_context, status):
+    runner, backend, native, _, _ = interrupt_context
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    rpc_id = next(iter(runner.interrupt_requests))
+    native.queue.append(dict(id=rpc_id, result={}))
+    runner._pump()
+    assert not runner.children["child"]["terminal"] and not native.closed
+    assert not any(event[0] == "TERMINAL" for event in backend.events)
+    invalid = child_turn_event()
+    invalid["method"] = "turn/completed"
+    native.queue.extend([invalid, child_turn_event("parent_turn", "completed", "parent")])
+    runner._pump()
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    runner.last_heartbeat = -100
+    runner._pump()
+    assert any(event[0] == "HEARTBEAT" for event in backend.events)
+    native.queue.append(child_turn_event(status=status))
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert len([event for event in backend.events if event[0] == "TERMINAL"]) == 1
+    native.queue.extend([child_turn_event(status=status), child_turn_event()])
+    runner._pump()
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert len([event for event in backend.events if event[0] == "TERMINAL"]) == 1
+
+
+def test_new_active_turn_is_not_finished_by_old_completion_or_ack(interrupt_context):
+    runner, backend, native, _, _ = interrupt_context
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    old_rpc = next(iter(runner.interrupt_requests))
+    native.queue.append(child_turn_event("new_turn"))
+    runner._pump()
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    native.queue.extend([dict(id=old_rpc, result={}), child_turn_event(status="interrupted")])
+    runner._pump()
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert runner.children["child"]["turn_id"] == "new_turn"
+    assert [p["turnId"] for method, p in native.sent if method == "turn/interrupt"] == ["child_turn", "new_turn"]
+    native.queue.append(child_turn_event("new_turn", "interrupted"))
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert len([event for event in backend.events if event[0] == "TERMINAL"]) == 1
+
+
+@pytest.mark.parametrize("weak", [
+    "leased", "status-missing", "status-unknown", "not-stopped", "expired-stop",
+    "not-draining", "unverified", "terminal", "missing-turn", "journal-only-turn",
+    "run", "generation", "epoch", "parent", "process", "intent-missing",
+    "not-claimed", "claim-missing", "claim-mismatch", "task", "offer", "intent-epoch",
+    "child", "child-map", "accepted", "consumed", "native-dead", "started", "internal-stop",
+])
+def test_interrupt_predicate_fails_closed(interrupt_context, weak):
+    runner, backend, native, journal, plans = interrupt_context
+    view = backend.view(CONTENT)
+    intent = view["intents"][worker()["request_id"]]
+    summary = intent["claimbinding_summary"]
+    if weak == "leased":
+        summary["task_status"] = "LEASED"
+    elif weak == "status-missing":
+        summary.pop("task_status")
+    elif weak == "status-unknown":
+        summary["task_status"] = "UNKNOWN"
+    elif weak == "not-stopped":
+        view["stop_requested"] = False
+    elif weak == "expired-stop":
+        view["stop_reason"] = "expired"
+    elif weak == "not-draining":
+        view["state"] = "running"
+    elif weak == "unverified":
+        runner.current["admitted"] = False
+    elif weak == "terminal":
+        runner.children["child"]["terminal"] = True
+    elif weak == "missing-turn":
+        runner.children["child"].pop("turn_id")
+    elif weak == "journal-only-turn":
+        runner.children["child"] = dict(terminal=False, turn_id="child_turn")
+        journal.state["intents"][worker()["request_id"]]["child_turn_id"] = "child_turn"
+    elif weak in {"run", "generation", "epoch", "parent", "process"}:
+        field = dict(run="run_id", generation="generation", epoch="host_epoch",
+                     parent="parent_thread_id", process="process_identity")[weak]
+        view[field] = 2 if weak in {"generation", "epoch"} else "changed"
+    elif weak == "intent-missing":
+        view["intents"] = {}
+    elif weak == "not-claimed":
+        intent["state"] = "VERIFIED"
+    elif weak == "claim-missing":
+        intent["claim_id"] = None
+    elif weak == "claim-mismatch":
+        summary["claim_id"] = "another-claim"
+    elif weak == "task":
+        summary["task_id"] = "another-task"
+    elif weak == "offer":
+        intent["offer_hash"] = "changed"
+    elif weak == "intent-epoch":
+        intent["host_epoch"] = 2
+    elif weak == "child":
+        intent["child"]["child_id"] = "another-child"
+    elif weak == "child-map":
+        view["offer_children"][worker()["request_id"]] = "another-child"
+    elif weak in {"accepted", "consumed"}:
+        summary[weak] = True
+    elif weak == "native-dead":
+        native.eof = True
+    elif weak == "started":
+        runner.current["started"] = {"child_id": "another-child"}
+    elif weak == "internal-stop":
+        runner.stop_reason = "CONDUCTOR_CONTENT_TERMINAL"
+    runner._interrupt_pending_child(view)
+    assert not any(method == "turn/interrupt" for method, _ in native.sent)
+    assert not native.closed and plans == []
+    assert "interrupt_send_intent" not in journal.log_path.read_text()
+
+
+@pytest.mark.parametrize("fault", ["send-uncertain", "rpc-error", "missing-ack", "malformed-ack"])
+def test_interrupt_uncertainty_never_retries_or_fakes_terminal(
+    interrupt_context, monkeypatch, fault,
+):
+    runner, backend, native, journal, plans = interrupt_context
+    original = native.request
+
+    def request(method, params):
+        rpc = original(method, params)
+        if fault == "send-uncertain":
+            raise c.ConductorError("CONDUCTOR_NATIVE_SEND_UNCERTAIN")
+        if fault == "rpc-error":
+            native.queue.append(dict(id=rpc, error=dict(code=-32603, message="PRIVATE_NATIVE_PAYLOAD")))
+        elif fault == "malformed-ack":
+            native.queue.append(dict(id=rpc, result=None))
+        return rpc
+
+    monkeypatch.setattr(native, "request", request)
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    for _ in range(3):
+        runner.last_heartbeat = -100
+        runner._pump()
+        runner._interrupt_pending_child(backend.view(CONTENT))
+    assert len([method for method, _ in native.sent if method == "turn/interrupt"]) == 1
+    assert not runner.children["child"]["terminal"] and not native.closed and plans == []
+    assert any(event[0] == "HEARTBEAT" for event in backend.events)
+    assert not any(event[0] == "TERMINAL" for event in backend.events)
+    assert "PRIVATE_NATIVE_PAYLOAD" not in journal.log_path.read_text()
+
+
+@pytest.mark.parametrize("phase", ["save-before-send", "log-before-send", "save-after-send"])
+def test_interrupt_audit_failure_keeps_live_identity_without_extra_send(
+    interrupt_context, monkeypatch, phase,
+):
+    runner, backend, native, journal, _ = interrupt_context
+    save, record = journal.save, journal.record
+    saves = []
+
+    def fail_save():
+        saves.append(True)
+        if phase == "save-before-send" or len(saves) >= 2:
+            raise OSError("injected audit save failure")
+        save()
+
+    def fail_record(kind, data):
+        if kind == "interrupt_send_intent":
+            raise OSError("injected audit log failure")
+        record(kind, data)
+
+    if phase == "log-before-send":
+        monkeypatch.setattr(journal, "record", fail_record)
+    else:
+        monkeypatch.setattr(journal, "save", fail_save)
+    for _ in range(2):
+        runner._interrupt_pending_child(backend.view(CONTENT))
+    assert len([method for method, _ in native.sent if method == "turn/interrupt"]) == (1 if phase == "save-after-send" else 0)
+    assert not native.closed and not runner.children["child"]["terminal"]
+
+
+def test_child_turn_seen_before_metadata_does_not_authorize_interrupt(interrupt_context):
+    runner, backend, native, _, _ = interrupt_context
+    runner.current["admitted"] = False
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    assert not any(method == "turn/interrupt" for method, _ in native.sent)
+    child = runner.current["child"]
+    runner.stop_reason = None
+    runner._verify_child(child["metadata_rpc_id"], child["started"], dict(result=dict(thread=dict(
+        id="child", parentThreadId="parent", agentRole="default", ephemeral=True,
+        model=worker()["model"], reasoningEffort=worker()["reasoning_effort"],
+    ))))
+    runner.stop_reason = "CONDUCTOR_STOP_REQUESTED"
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    assert len([method for method, _ in native.sent if method == "turn/interrupt"]) == 1
+
+
+@pytest.mark.parametrize("status", ["PENDING", "LEASED"])
+def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, status):
+    runner, backend, native, journal, plans = setup
+    real_request, real_observe = native.request, backend.observe
+
+    def observe(run_id, request_id, body):
+        response = real_observe(run_id, request_id, body)
+        if body["outcome"] == "VERIFIED":
+            w = runner.current["worker"]
+            backend.state.update(
+                stop_requested=True, stop_reason="operator_stop", state="draining",
+                offer_children={request_id: body["child"]["child_id"]},
+                active_task_ids=[w["task_id"]] if status == "LEASED" else [],
+            )
+            backend.state["intents"][request_id].update(
+                state="CLAIMED", child=copy.deepcopy(body["child"]), host_epoch=1,
+                offer_hash=w["offer_hash"], claim_id="original-claim",
+                claimbinding_summary=dict(claim_id="original-claim", task_id=w["task_id"],
+                                          task_status=status, accepted=False, consumed=False),
+            )
+        elif body["outcome"] == "TERMINAL":
+            backend.state["intents"][request_id]["state"] = "TERMINAL"
+            backend.state.update(state="stopped", active_task_ids=[])
+        return response
+
+    def request(method, params):
+        rpc = real_request(method, params)
+        if method == "thread/read":
+            parent_done = native.queue.pop()
+            child_done = native.queue.pop()
+            native.queue.append(parent_done)
+
+            def terminal_later():
+                assert not native.closed
+                calls = [p for m, p in native.sent if m == "turn/interrupt"]
+                assert len(calls) == (1 if status == "PENDING" else 0)
+                assert not runner.children[params["threadId"]]["terminal"]
+                if status == "PENDING":
+                    child_done["params"]["turn"]["status"] = "interrupted"
+                else:
+                    backend.state["active_task_ids"] = []
+                native.queue.append(child_done)
+                native.after_empty = None
+
+            native.after_empty = terminal_later
+        elif method == "turn/interrupt":
+            native.queue.append(dict(id=rpc, result={}))
+        return rpc
+
+    backend.observe, native.request = observe, request
+    result = runner.run()
+    assert result["status"] == "CONDUCTOR_STOP_REQUESTED"
+    assert native.closed and native.turn_count == 1 and len(plans) == 1
+    assert backend.state["state"] == "stopped"
+    assert len([e for e in backend.events if e[0] == "TERMINAL"]) == 1
+    summary = next(iter(backend.state["intents"].values()))["claimbinding_summary"]
+    assert summary["task_status"] == status and summary["accepted"] is False
+    if status == "PENDING":
+        saved = json.loads(journal.path.read_text())
+        record = next(iter(next(iter(saved["intents"].values()))["interrupts"].values()))
+        assert record["child_id"] == "child_1" and record["turn_id"] == "turn_child_1"
+        assert record["state"] == "ACKNOWLEDGED"
+
+
+def test_matching_completion_before_ack_still_requires_real_terminal(interrupt_context):
+    runner, backend, native, _, _ = interrupt_context
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    rpc = next(iter(runner.interrupt_requests))
+    native.queue.extend([child_turn_event(status="interrupted"), dict(id=rpc, result={})])
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert len([e for e in backend.events if e[0] == "TERMINAL"]) == 1
+
+
+@pytest.mark.parametrize("invalid", ["missing-id", "empty-id", "old-id", "missing-status", "inProgress", "unknown-status"])
+def test_invalid_or_old_turn_completion_never_ends_active_child(interrupt_context, invalid):
+    runner, backend, native, _, _ = interrupt_context
+    message = child_turn_event(status="completed")
+    turn = message["params"]["turn"]
+    if invalid == "missing-id":
+        turn.pop("id")
+    elif invalid == "empty-id":
+        turn["id"] = ""
+    elif invalid == "old-id":
+        turn["id"] = "old-turn"
+    elif invalid == "missing-status":
+        turn.pop("status")
+    else:
+        turn["status"] = invalid
+    native.queue.append(message)
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert not any(e[0] == "TERMINAL" for e in backend.events)
+
+
+def test_child_turn_before_metadata_response_is_retained_until_verification(setup):
+    runner, backend, native, _, _ = setup
+    real_request = native.request
+
+    def request(method, params):
+        rpc = real_request(method, params)
+        if method == "thread/read":
+            messages = list(native.queue)
+            start = next(event for event in messages if event.get("method") == "turn/started")
+            native.queue.remove(start)
+            native.queue.appendleft(start)
+        return rpc
+
+    native.request = request
+    native.after_empty = lambda: finish(backend, runner)
+    result = runner.run()
+    assert result["status"] == "CONDUCTOR_CONTENT_TERMINAL"
+    assert runner.children["child_1"]["turn_id"] == "turn_child_1"
+    assert runner.children["child_1"]["terminal"]
+    kinds = [event[0] for event in backend.events]
+    assert kinds.index("VERIFIED") < kinds.index("TERMINAL")
+    assert not any(method == "turn/interrupt" for method, _ in native.sent)
 
 
 def test_stop_before_metadata_does_not_forge_terminal(setup):
