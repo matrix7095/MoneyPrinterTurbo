@@ -646,16 +646,36 @@ class Conductor:
             # A failed audit write never authorizes a request or closes a live child.
             return False
 
+    def _run_expiry(self, view):
+        try:
+            deadline = datetime.fromisoformat(view["expires_at"])
+            return deadline.timestamp() if deadline.utcoffset() is not None else None
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            return None
+
     def _interrupt_pending_child(self, view):
         if (
             view.get("stop_requested") is not True
-            or view.get("stop_reason") != "operator_stop"
             or view.get("state") != "draining"
-            or self.stop_reason != "CONDUCTOR_STOP_REQUESTED"
             or not self.current
             or not self.current.get("admitted")
             or not self.native.alive()
         ):
+            return
+        if self.stop_reason == "CONDUCTOR_STOP_REQUESTED" and view.get("stop_reason") == "operator_stop":
+            reason = "OPERATOR_STOP_LOST_LEASE"
+        elif (
+            view.get("stop_reason") == "expired"
+            and self.stop_reason in {"CONDUCTOR_STOP_REQUESTED", "CONDUCTOR_RUN_EXPIRED"}
+        ) or (
+            view.get("stop_reason") == "operator_stop"
+            and self.stop_reason == "CONDUCTOR_RUN_EXPIRED"
+        ):
+            expires, observed = self._run_expiry(view), self.clock()
+            if expires is None or not observed >= expires:
+                return
+            reason = "RUN_EXPIRED_LOST_LEASE"
+        else:
             return
         worker, child = self.current["worker"], self.current.get("child")
         if not child:
@@ -697,8 +717,10 @@ class Conductor:
             **binding, "request_id": worker["request_id"], "task_id": worker["task_id"],
             "claim_id": intent["claim_id"], "offer_hash": worker["offer_hash"],
             "child_id": child["child_id"], "turn_id": turn_id,
-            "reason": "OPERATOR_STOP_LOST_LEASE", "state": "SEND_INTENT",
+            "reason": reason, "state": "SEND_INTENT",
         }
+        if reason == "RUN_EXPIRED_LOST_LEASE":
+            record.update(run_expires_at=view["expires_at"], expiry_observed_at=observed)
         self.journal.state["intents"][worker["request_id"]].setdefault("interrupts", {})[turn_id] = record
         if not self._record_interrupt(record, "interrupt_send_intent"):
             return
@@ -1138,9 +1160,12 @@ class Conductor:
                 }:
                     self.stop_reason = self.stop_reason or "CONDUCTOR_STOP_REQUESTED"
                 self._interrupt_pending_child(view)
-                expires = datetime.fromisoformat(view["expires_at"]).timestamp()
-                if self.clock() >= expires and not self.stop_reason:
-                    self._stop("CONDUCTOR_RUN_EXPIRED")
+                expires = self._run_expiry(view)
+                if not self.stop_reason:
+                    if expires is None:
+                        raise ValueError("Invalid run deadline")
+                    if self.clock() >= expires:
+                        self._stop("CONDUCTOR_RUN_EXPIRED")
                 all_terminal = all(
                     child["terminal"] for child in self.children.values()
                 )

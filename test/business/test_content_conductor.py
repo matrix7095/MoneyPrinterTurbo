@@ -95,7 +95,7 @@ class FakeBackend:
             self.state.get(key) == value for key, value in expected_binding.items()
         )
         self.events.append(("stop", content_id, copy.deepcopy(expected_binding)))
-        self.state.update(state="draining", stop_requested=True)
+        self.state.update(state="draining", stop_requested=True, stop_reason="operator_stop")
         return {}
 
 
@@ -421,6 +421,76 @@ def test_operator_stop_interrupts_verified_pending_original_claim_once(interrupt
     assert "interrupt_send_intent" in journal.log_path.read_text()
 
 
+@pytest.mark.parametrize("origin", ["server-expired", "local-expired", "local-machine-stop"])
+def test_expired_run_interrupts_pending_bound_child_once(interrupt_context, origin):
+    runner, backend, native, journal, _ = interrupt_context
+    deadline = datetime.now(timezone.utc)
+    runner.clock = lambda: deadline.timestamp()
+    backend.state.update(expires_at=deadline.isoformat(), stop_reason="expired")
+    if origin != "server-expired":
+        runner.stop_reason = "CONDUCTOR_RUN_EXPIRED"
+    if origin == "local-machine-stop":
+        backend.state["stop_reason"] = "operator_stop"
+    for _ in range(2):
+        runner._interrupt_pending_child(backend.view(CONTENT))
+    # Changing the stop classification cannot buy another send for the same turn.
+    runner.stop_reason = "CONDUCTOR_STOP_REQUESTED"
+    backend.state["stop_reason"] = "operator_stop"
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    assert [p for method, p in native.sent if method == "turn/interrupt"] == [
+        dict(threadId="child", turnId="child_turn"),
+    ]
+    record = journal.state["intents"][worker()["request_id"]]["interrupts"]["child_turn"]
+    assert record["reason"] == "RUN_EXPIRED_LOST_LEASE"
+    assert record["run_expires_at"] == deadline.isoformat()
+    assert record["expiry_observed_at"] >= deadline.timestamp()
+    assert not runner.children["child"]["terminal"] and not native.closed
+
+
+@pytest.mark.parametrize("origin", ["server-expired", "local-machine-stop"])
+@pytest.mark.parametrize("weak", [
+    "future", "naive", "invalid", "missing", "null", "date-only", "leased",
+    "claim", "turn", "internal-stop", "unknown-local-stop", "unknown-server-stop",
+])
+def test_expiry_cancellation_requires_real_deadline_and_original_binding(
+    interrupt_context, origin, weak,
+):
+    runner, backend, native, journal, _ = interrupt_context
+    now = datetime.now(timezone.utc)
+    runner.clock = lambda: now.timestamp()
+    backend.state.update(expires_at=now.isoformat(), stop_reason="expired")
+    if origin == "local-machine-stop":
+        runner.stop_reason = "CONDUCTOR_RUN_EXPIRED"
+        backend.state["stop_reason"] = "operator_stop"
+    if weak == "future":
+        backend.state["expires_at"] = (now + timedelta(microseconds=1)).isoformat()
+    elif weak == "naive":
+        backend.state["expires_at"] = (now - timedelta(seconds=1)).replace(tzinfo=None).isoformat()
+    elif weak == "invalid":
+        backend.state["expires_at"] = "not-a-deadline"
+    elif weak == "missing":
+        backend.state.pop("expires_at")
+    elif weak == "null":
+        backend.state["expires_at"] = None
+    elif weak == "date-only":
+        backend.state["expires_at"] = now.date().isoformat()
+    elif weak in {"leased", "claim"}:
+        summary = backend.state["intents"][worker()["request_id"]]["claimbinding_summary"]
+        summary["task_status" if weak == "leased" else "claim_id"] = "LEASED" if weak == "leased" else "another-claim"
+    elif weak == "turn":
+        runner.children["child"].pop("turn_id")
+    elif weak == "internal-stop":
+        runner.stop_reason = "CONDUCTOR_CONTENT_TERMINAL"
+    elif weak == "unknown-local-stop":
+        runner.stop_reason = "UNKNOWN"
+    elif weak == "unknown-server-stop":
+        backend.state["stop_reason"] = "unknown"
+    runner._interrupt_pending_child(backend.view(CONTENT))
+    assert not any(method == "turn/interrupt" for method, _ in native.sent)
+    assert not native.closed and not runner.children["child"]["terminal"]
+    assert "interrupt_send_intent" not in journal.log_path.read_text()
+
+
 def test_old_child_turn_completion_does_not_finish_new_active_turn(interrupt_context):
     runner, backend, native, _, _ = interrupt_context
     native.queue.append(child_turn_event("new_child_turn"))
@@ -624,16 +694,23 @@ def test_child_turn_seen_before_metadata_does_not_authorize_interrupt(interrupt_
 
 
 @pytest.mark.parametrize("status", ["PENDING", "LEASED"])
-def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, status):
+@pytest.mark.parametrize("stop", [
+    "operator", "server-expired", "local-expired", "server-invalid-expiry", "server-naive-expiry",
+])
+def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, status, stop):
     runner, backend, native, journal, plans = setup
     real_request, real_observe = native.request, backend.observe
+    weak_expiry = stop in {"server-invalid-expiry", "server-naive-expiry"}
+    should_interrupt = status == "PENDING" and not weak_expiry
 
     def observe(run_id, request_id, body):
         response = real_observe(run_id, request_id, body)
         if body["outcome"] == "VERIFIED":
             w = runner.current["worker"]
             backend.state.update(
-                stop_requested=True, stop_reason="operator_stop", state="draining",
+                stop_requested=stop != "local-expired",
+                stop_reason="expired" if stop.startswith("server-") else "operator_stop",
+                state="running" if stop == "local-expired" else "draining",
                 offer_children={request_id: body["child"]["child_id"]},
                 active_task_ids=[w["task_id"]] if status == "LEASED" else [],
             )
@@ -643,9 +720,20 @@ def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, 
                 claimbinding_summary=dict(claim_id="original-claim", task_id=w["task_id"],
                                           task_status=status, accepted=False, consumed=False),
             )
+            if weak_expiry:
+                backend.state["expires_at"] = (
+                    "invalid-deadline" if stop == "server-invalid-expiry"
+                    else datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                )
+            elif stop != "operator":
+                deadline = datetime.fromisoformat(backend.state["expires_at"]).timestamp()
+                runner.clock = lambda: deadline + 1
         elif body["outcome"] == "TERMINAL":
             backend.state["intents"][request_id]["state"] = "TERMINAL"
-            backend.state.update(state="stopped", active_task_ids=[])
+            backend.state.update(
+                state="expired" if backend.state["stop_reason"] == "expired" else "stopped",
+                active_task_ids=[],
+            )
         return response
 
     def request(method, params):
@@ -658,12 +746,15 @@ def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, 
             def terminal_later():
                 assert not native.closed
                 calls = [p for m, p in native.sent if m == "turn/interrupt"]
-                assert len(calls) == (1 if status == "PENDING" else 0)
+                assert len(calls) == (1 if should_interrupt else 0)
                 assert not runner.children[params["threadId"]]["terminal"]
-                if status == "PENDING":
+                if should_interrupt:
                     child_done["params"]["turn"]["status"] = "interrupted"
-                else:
+                elif status == "LEASED":
                     backend.state["active_task_ids"] = []
+                    summary = next(iter(backend.state["intents"].values()))["claimbinding_summary"]
+                    summary.update(task_status="COMPLETED", accepted=True, consumed=True,
+                                   accepted_result_hash="a" * 64, consumed_result_hash="a" * 64)
                 native.queue.append(child_done)
                 native.after_empty = None
 
@@ -674,17 +765,19 @@ def test_run_loop_interrupts_pending_child_but_keeps_normal_leased_drain(setup, 
 
     backend.observe, native.request = observe, request
     result = runner.run()
-    assert result["status"] == "CONDUCTOR_STOP_REQUESTED"
+    assert result["status"] == ("CONDUCTOR_RUN_EXPIRED" if stop == "local-expired" else "CONDUCTOR_STOP_REQUESTED")
     assert native.closed and native.turn_count == 1 and len(plans) == 1
-    assert backend.state["state"] == "stopped"
+    assert backend.state["state"] == ("expired" if stop.startswith("server-") else "stopped")
     assert len([e for e in backend.events if e[0] == "TERMINAL"]) == 1
     summary = next(iter(backend.state["intents"].values()))["claimbinding_summary"]
-    assert summary["task_status"] == status and summary["accepted"] is False
-    if status == "PENDING":
+    assert summary["task_status"] == ("COMPLETED" if status == "LEASED" else "PENDING")
+    assert summary["accepted"] == (status == "LEASED")
+    if should_interrupt:
         saved = json.loads(journal.path.read_text())
         record = next(iter(next(iter(saved["intents"].values()))["interrupts"].values()))
         assert record["child_id"] == "child_1" and record["turn_id"] == "turn_child_1"
         assert record["state"] == "ACKNOWLEDGED"
+        assert record["reason"] == ("OPERATOR_STOP_LOST_LEASE" if stop == "operator" else "RUN_EXPIRED_LOST_LEASE")
 
 
 def test_matching_completion_before_ack_still_requires_real_terminal(interrupt_context):
