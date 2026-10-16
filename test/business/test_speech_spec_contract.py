@@ -18,6 +18,12 @@ script_review_contract = test_script_assist_gate.script_review_contract
 HISTORICAL_NOTE = (
     "旧 must_change：full_narration 必须原样使用1920×1080、60–80英寸，禁止中文连接词。"
 )
+HISTORICAL_AUDIO_NOTE = (
+    "旧自定义音频规则：ASR低置信、静音/削波或硬项判断不足不能通过；格式化符号低置信直接判错。"
+)
+ASR_FORMATTING_PRIORITY = (
+    "本节的ASR格式化/低置信判定仅在这类判定上优先于基础、自定义及历史提示中的冲突表述"
+)
 STAGES = [
     (TaskType.SHORT_SCRIPT, "1"),
     (TaskType.SCRIPT_QC, "1"),
@@ -71,6 +77,57 @@ def test_resolved_spec_policy_is_consistent_across_modes_and_legacy_overrides(
             assert "不得泛化忽略范围、乘号" not in text
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("handsfree", [False, True])
+@pytest.mark.parametrize("custom", [False, True])
+def test_content_qc_v3_distinguishes_asr_formatting_uncertainty_from_unresolved_semantics(
+    tmp_path, handsfree, custom
+):
+    runtime = make_runtime(tmp_path)
+    runtime.initialize()
+    try:
+        with Session(runtime.engine) as session:
+            if custom:
+                session.add(
+                    TaskPrompt(
+                        task_type=TaskType.CONTENT_QC.value,
+                        instructions=HISTORICAL_AUDIO_NOTE,
+                    )
+                )
+                session.commit()
+            text = resolve_instructions(
+                session,
+                TaskType.CONTENT_QC,
+                handsfree=handsfree,
+                schema_version="3",
+            )
+            if custom:
+                assert text.startswith(HISTORICAL_AUDIO_NOTE)
+                assert session.get(TaskPrompt, TaskType.CONTENT_QC.value).instructions == HISTORICAL_AUDIO_NOTE
+                assert text.index(HISTORICAL_AUDIO_NOTE) < text.index(ASR_FORMATTING_PRIORITY)
+    finally:
+        runtime.close()
+
+    assert "关键读音低置信且无法凭独立证据消歧" in text
+    assert "audio 必须 false 并定位缺口" in text
+    assert ASR_FORMATTING_PRIORITY in text
+    assert "其他硬项要求不变，九项硬项仍须逐项满足" in text
+    assert "ASR低置信只用于定位需核验的关键语义时段，不能直接判为错读" in text
+    assert "“×”“-”等格式化符号token的低置信不能单独代表实际读音错误" in text
+    assert "同系列Whisper相互一致可作为补充线索" in text
+    assert "本身不能证明相应连接词" in text
+    assert "已被听清或全部音频硬项通过" in text
+    assert "不得把" in text
+    assert "字幕或TTS原文当作实际读音证据或回填低置信ASR词" in text
+    assert "关键关系低置信且无法凭独立证据消歧时，audio必须false并定位时段" in text
+    assert "任何关键关系缺乏充分证据时也必须false" in text
+    assert "静音/削波、" in text
+    assert "其他音频硬项或任一九项硬项" in text
+    assert "证据不足/失败仍必须false" in text
+    assert "九硬项仍全部需要" in text
+    if not custom:
+        assert "ASR低置信、静音/削波或硬项判断不足不能通过。" not in text
 
 
 def test_rewrite_note_overrides_symbol_only_history_without_erasing_it():

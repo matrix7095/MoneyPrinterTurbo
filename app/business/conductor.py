@@ -1356,7 +1356,18 @@ class Conductor:
                     "model": PARENT_MODEL,
                     "cwd": str(self.native.workspace),
                     "ephemeral": True,
-                    "developerInstructions": "This parent is a spawn-only MPT Conductor. Only call native spawn once per issued turn with exact supplied parameters and fork_turns=none; do not inspect or execute business work, continue other goals, or create substitute chats.",
+                    "developerInstructions": (
+                        "This parent is the top-level MPT Conductor that receives "
+                        "spawn payloads. The spawn-only restriction applies only "
+                        "to this parent and does not apply to spawned worker "
+                        "children. This parent must call native spawn exactly once "
+                        "per issued turn with the exact supplied parameters and "
+                        "fork_turns=none; this parent must not inspect or execute "
+                        "business work, continue other goals, or create substitute "
+                        "chats. Spawned worker children must execute only the "
+                        "worker task in their assigned prompt, using tools already "
+                        "available and authorized for that child."
+                    ),
                 },
             )
             self.parent = result["thread"]["id"]

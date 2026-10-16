@@ -858,8 +858,18 @@ motion_continuous 只描述预期运动窗内的连续性，并在observation注
 subtitle_alignment[] 覆盖 manifest.subtitles.events 全部烧录 Default 字幕事件：
 event_index/word_indices/observed_sync/observation；word_indices 为 audio_evidence.segments
 顺序展平 words 后的0基索引，逐条引用同final独立ASR词，全部词按时间顺序覆盖一次。
+本节的ASR格式化/低置信判定仅在这类判定上优先于基础、自定义及历史提示中的冲突表述；
+其他硬项要求不变，九项硬项仍须逐项满足。
 核对内容、词时码、段内/跨段对齐及PCM信号，不能把TTS原文当独立识别，普通同音识别差异
-需按来源/实际证据消歧。ASR低置信、静音/削波或硬项判断不足不能通过。
+需按来源/实际证据消歧。ASR低置信只用于定位需核验的关键语义时段，不能直接判为错读。
+特别是“×”“-”等格式化符号token的低置信不能单独代表实际读音错误；符号转写、
+token概率升高或同系列Whisper相互一致可作为补充线索，但本身不能证明相应连接词
+已被听清或全部音频硬项通过。应结合实际成片音轨证据核验数字、单位及关系，不得把
+字幕或TTS原文当作实际读音证据或回填低置信ASR词。
+关键关系低置信且无法凭独立证据消歧时，audio必须false并定位时段；
+任何关键关系缺乏充分证据时也必须false。静音/削波、
+其他音频硬项或任一九项硬项
+证据不足/失败仍必须false；不得降低或跳过任何硬项。
 
 本方法仅覆盖服务端冻结并已离线验证的 pan_left/pan_right/ken_burns_in/ken_burns_out/
 focus_product 和 short_fade/hard_cut，

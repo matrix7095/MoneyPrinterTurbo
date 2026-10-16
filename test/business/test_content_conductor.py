@@ -294,6 +294,19 @@ def test_real_event_binding_precedes_verified_and_exact_dispatch(setup):
     result = runner.run()
     assert result["status"] == "CONDUCTOR_CONTENT_TERMINAL"
     assert native.closed and native.turn_count == 1
+    parent_start = next(
+        params for method, params in native.sent if method == "thread/start"
+    )
+    assert parent_start["developerInstructions"] == (
+        "This parent is the top-level MPT Conductor that receives spawn payloads. "
+        "The spawn-only restriction applies only to this parent and does not apply "
+        "to spawned worker children. This parent must call native spawn exactly "
+        "once per issued turn with the exact supplied parameters and "
+        "fork_turns=none; this parent must not inspect or execute business work, "
+        "continue other goals, or create substitute chats. Spawned worker children "
+        "must execute only the worker task in their assigned prompt, using tools "
+        "already available and authorized for that child."
+    )
     verified = next(e for e in backend.events if e[0] == "VERIFIED")
     child = verified[2]["child"]
     assert child["started"]["agent_path"] == "/root/mpt_task_0"
