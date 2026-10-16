@@ -26,7 +26,7 @@ from app.business.quarantine import assert_allowed
 
 RUN_KEY = "mpt_content_run_v1"
 OFFER_ACTION = "mpt_content_run_offer"
-TTL = timedelta(minutes=45)
+TTL = timedelta(minutes=120)
 FROZEN_FIELDS = (
     "request_id",
     "task_id",

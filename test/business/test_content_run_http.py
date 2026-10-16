@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from threading import Event
 
 import pytest
@@ -260,6 +260,111 @@ def test_admin_unique_idempotent_run_and_unchanged_private_config(system):
         ).status_code
         == 401
     )
+
+
+def test_new_run_has_two_hour_deadline_and_enforces_exact_expiry(system, monkeypatch):
+    from app.business import content_run
+    from glance_core.task_service import TaskConflictError
+
+    runtime, http = system
+    content_id, _ = selected(http, runtime, "two-hour-boundary")
+    run = start(http, content_id, attach=False)
+    created, expires = (datetime.fromisoformat(run[key]) for key in ("created_at", "expires_at"))
+    assert expires - created == timedelta(minutes=120)
+    with Session(runtime.engine) as session:
+        original = session.get(RuntimeSetting, RUN_KEY).value
+    monkeypatch.setattr(content_run, "utc_now", lambda: expires - timedelta(microseconds=1))
+    with Session(runtime.engine) as session:
+        assert content_run.require_run(session, run["run_id"]).expires_at == run["expires_at"]
+        assert session.get(RuntimeSetting, RUN_KEY).value == original
+    monkeypatch.setattr(content_run, "utc_now", lambda: expires)
+    with Session(runtime.engine) as session:
+        with pytest.raises(TaskConflictError, match="CONTENT_RUN_NOT_ACTIVE"):
+            content_run.require_run(session, run["run_id"])
+        assert session.get(RuntimeSetting, RUN_KEY).value == original
+    expired = http.get(f"/api/v1/contents/{content_id}/run", headers=ADMIN).json()
+    assert expired["state"] == "expired" and expired["stop_reason"] == "expired"
+    assert expired["run_id"] == run["run_id"] and expired["expires_at"] == run["expires_at"]
+
+
+@pytest.mark.parametrize("lifetime,valid", [
+    (timedelta(minutes=45), True), (timedelta(minutes=120), True),
+    (timedelta(minutes=120, microseconds=1), False), (timedelta(0), False), (timedelta(seconds=-1), False),
+], ids=["legacy-45-minutes", "bounded-120-minutes", "over-120-minutes", "zero", "negative"])
+def test_persisted_run_lifetime_is_bounded_without_rewriting_legacy(system, lifetime, valid):
+    from glance_core.task_service import TaskConflictError
+
+    runtime, http = system
+    content_id, _ = selected(http, runtime, "persisted-lifetime")
+    run = start(http, content_id, attach=False)
+    with Session(runtime.engine) as session:
+        row = session.get(RuntimeSetting, RUN_KEY)
+        data = json.loads(row.value)
+        data["expires_at"] = (datetime.fromisoformat(run["created_at"]) + lifetime).isoformat()
+        original = row.value = json.dumps(data)
+        session.add(row)
+        session.commit()
+        if valid:
+            loaded = load_run(session)
+            assert loaded.run_id == run["run_id"] and loaded.expires_at == data["expires_at"]
+        else:
+            with pytest.raises(TaskConflictError, match="CONTENT_RUN_RECORD_INVALID"):
+                load_run(session)
+        assert session.get(RuntimeSetting, RUN_KEY).value == original
+
+
+def test_repeat_execute_preserves_persisted_45_minute_run_deadline(system, monkeypatch):
+    import sys
+
+    from app.business import conductor_launch as launch, content_run
+    from app.controllers.v1.content_execution import router
+    from test.business.test_content_execution_http import Process
+
+    runtime, http = system
+    http.app.include_router(router)
+    content_id, task_id = selected(http, runtime, "legacy-execute-deadline")
+    run = start(http, content_id, attach=False)
+    with Session(runtime.engine) as session:
+        row = session.get(RuntimeSetting, RUN_KEY)
+        data = json.loads(row.value)
+        created = datetime.fromisoformat(data["created_at"])
+        data["expires_at"] = (created + timedelta(minutes=45)).isoformat()
+        original = row.value = json.dumps(data)
+        session.add(row)
+        session.commit()
+        before_task = session.get(AgentTask, task_id).model_dump(mode="json")
+    monkeypatch.setattr(content_run, "utc_now", lambda: created + timedelta(minutes=10))
+    process, launches = Process(), []
+    monkeypatch.setattr(launch, "launch_command", lambda *args: [sys.executable])
+    monkeypatch.setattr(launch, "process_creation_time", lambda _: created.isoformat())
+
+    def popen(*args, **kwargs):
+        launches.append(process)
+        return process
+
+    monkeypatch.setattr(launch.subprocess, "Popen", popen)
+    endpoint = f"/api/v1/contents/{content_id}/run/execute"
+    try:
+        first = http.post(endpoint, headers=ADMIN)
+        assert first.status_code == 200, first.text
+        monkeypatch.setattr(content_run, "utc_now", lambda: created + timedelta(minutes=20))
+        repeated = http.post(endpoint, headers=ADMIN)
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["launch_id"] == first.json()["launch_id"]
+        assert repeated.json()["run_id"] == run["run_id"] and launches == [process]
+        permit = start(http, content_id, attach=False)
+        assert permit["created_at"] == run["created_at"] and permit["expires_at"] == data["expires_at"]
+        assert permit["generation"] == run["generation"] and permit["ready_rounds"] == 0
+        with Session(runtime.engine) as session:
+            assert load_run(session).expires_at == data["expires_at"]
+            assert session.get(RuntimeSetting, RUN_KEY).value == original
+            assert session.get(AgentTask, task_id).model_dump(mode="json") == before_task
+    finally:
+        process.done.set()
+        deadline = time.monotonic() + 5
+        while any(handle is process for handle in launch._handles.values()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not any(handle is process for handle in launch._handles.values())
 
 
 def test_disabled_global_scope_selects_only_target_and_never_global_maintenance(
@@ -910,7 +1015,8 @@ def test_image_permission_reaches_only_scoped_image_or_readonly_recovery_offer(s
         assert not any(handle is process for handle in launch._handles.values())
 
 
-def test_expired_run_with_live_lease_drains_without_extending_ttl(system):
+@pytest.mark.parametrize("lifetime_minutes", [45, 120])
+def test_expired_run_with_live_lease_drains_without_extending_ttl(system, lifetime_minutes):
     runtime, http = system
     target, task_id = selected(http, runtime, "expired-drain")
     run = start(http, target)
@@ -919,16 +1025,26 @@ def test_expired_run_with_live_lease_drains_without_extending_ttl(system):
     ][0]
     claim = scoped_dispatch(http, worker).json()
     with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        before_task = {field: getattr(task, field) for field in ("attempt", "max_attempts", "input_hash", "assigned_agent_id")}
         row = session.get(RuntimeSetting, RUN_KEY)
         value = json.loads(row.value)
-        value["created_at"] = (utc_now() - timedelta(minutes=46)).isoformat()
-        value["expires_at"] = (utc_now() - timedelta(minutes=1)).isoformat()
+        now = utc_now()
+        value["created_at"] = (now - timedelta(minutes=lifetime_minutes + 1)).isoformat()
+        value["expires_at"] = (now - timedelta(minutes=1)).isoformat()
         row.value = json.dumps(value)
         session.add(row)
         session.commit()
     draining = start(http, target)
     assert draining["state"] == "draining" and draining["run_id"] == run["run_id"]
     assert draining["expires_at"] == value["expires_at"]
+    planned = http.get("/api/v1/agent/scheduler/plan", headers=scheduler(http)._headers(), params={
+        "scheduler_id": "mpt-codex", "contract_version": 2, "run_id": run["run_id"],
+    })
+    assert planned.status_code == 409 and planned.json()["detail"] == "CONTENT_RUN_NOT_ACTIVE"
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, task_id)
+        assert {field: getattr(task, field) for field in before_task} == before_task
     agent = client_for(http, "research")
     agent.settings.agent_id = worker["agent_id"]
     agent.confirm_claim(task_id, claim["lease_token"], worker["agent_id"])
