@@ -1,8 +1,10 @@
 # MoneyPrinterTurbo 稳定生产与运维记录
 
-更新日期：2026-10-15。本文记录当前验收状态；历史检查点另存独立文件，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
+更新日期：2026-10-16。本文记录当前验收状态；历史检查点另存独立文件，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
 
-当前结论：尚未完成稳定生产验收。修复组合 `40227d4` 已部署到主目录并推送main，1455项组合回归通过，API、界面与七个角色已重新验证。Aurzen已真实完成8张新图片、独立素材质检和首次新成片；其正式CONTENT_QC因时轴漂移未能执行。时轴和恢复事务的修复已部署，旧Recovery已正常消费，内容现为FAILED/recovery_blocked，可从正常渲染入口重制；当前磁盘容量不足，尚未重制并完成正式QC、真实发布。第7版旧成片及隔离研究成功均不能代替本轮生产结果。
+当前结论：尚未完成稳定生产验收。修复组合 `40227d4` 已部署到主目录并推送main，1455项组合回归通过，API、界面与七个角色已重新验证。Aurzen已真实完成8张新图片、独立素材质检；首次成片的正式CONTENT_QC因时轴漂移未能执行。修复部署后旧Recovery已正常消费，2026-10-15 19:53正常render返回200并生成新成片，现为WAITING_AGENT/content_qc。2026-10-16 22:03已启动新按需运行，等待正式审核及真实发布结果；不能用隔离验证或运行启动代替生产验收。
+
+10月16日独立重渲染技术验收18项PASS：真实新视频为 `asset_d8ece8e213614f2b9c43fa66bd3cdd4c`（`asset_8d57c284b88942b7a19a1b9901774c6d` 是验收输入凭据），SHA256 `75a83899a2e1e66d38baa5a857897fa292393653365b4dd7274e66cf1a3f579b`。新鲜ffprobe核实1080帧、36秒、1080×1920、30fps、首PTS0；1080连续帧及270页原校验通过，脚本、研究、8图片和完整原旁白链保持，新音频35.976秒。旧final仍保留。安全证据 `release-render-20261016-independent.json`，SHA256 `bf6a8d3d9a42093c1a816fd107f6723a79523532518fe8a4edb8072f5b4b4e4d`；正式CONTENT_QC和发布仍须分别取得结果。
 
 ## 当前操作方式与部署证据
 
@@ -32,23 +34,35 @@
 
 恢复修复的独立审查发现并关闭两处问题：消费前必须重验实际成片、权益和来源上下文；reconciled恢复动作与消费标记必须原子提交。最终独立49项测试通过，包含两类故障完全回滚、重试成功且恰一次消费。四文件冻结及独立证据为 `bundle-failure-recovery-freeze.json`、`bundle-failure-recovery-v4-independent-review-evidence.json`。
 
-存储前提：本次完整审核需要生成连续帧包，还会产生审核Worker的下载副本。16:00核验C盘可用约0.57GB，不足以安全生成下一份完整生产审核包。此前4个已终态隔离诊断的frames/pages目录约2.43GiB，其清理遭自动审批拒绝，未执行，正等待具体确认；原生产素材、旧成片、清单、日志和最终v3验证包均保留。磁盘容量未恢复前，不启动大体积重渲染和审核包复制。
+存储前提：完整审核需要连续帧包及Worker下载副本。2026-10-15 16:00 C盘仅约0.57GB；随后原生Windows磁盘清理移除了约4.18GB的MEMORY.DMP，归档会话NTFS无损压缩另省179,596,538字节。压缩前后6677文件名称、长度及mtime一致，3个稳定样本SHA一致，未删除聊天记录。2026-10-16 22:02 C盘可用27,865,042,944字节，已满足本轮继续审核；较昨晚新增空间的来源仍在核实，不能都计为本代理清理成果。
 
-待确认清理范围仅限实施工作树 `C:\Users\Administrator\.codex\worktrees\mpt-stable-production\MoneyPrinterTurbo` 下这4个目录：
+已授权、但执行仍受策略限制的诊断清理范围为实施工作树 `C:\Users\Administrator\.codex\worktrees\mpt-stable-production\MoneyPrinterTurbo` 下这4个目录：
 
 - `.artifacts/render-timeline-native-probe-final/content/render/joint-proof/frames`
 - `.artifacts/render-timeline-native-probe-final/content/render/joint-proof/pages`
 - `.artifacts/render-timeline-native-probe-final-v2/content/render/joint-proof/frames`
 - `.artifacts/render-timeline-native-probe-final-v2/content/render/joint-proof/pages`
 
-只读复核合计2,612,023,510字节；对应旧探针已终态。保留两探针的原视频、manifest、joint-manifest、字幕与日志，并保留整个最终 `render-timeline-native-probe-final-v3` 包及全部生产材料。未获本次具体确认前不删除。
+只读复核合计2,612,023,510字节；对应旧探针已终态。用户已明确授权清理旧版本及无用数据，删除命令仍在进程创建前被自动审批以“blocked by policy”拒绝，未执行；这不是缺少用户授权。两个旧托管工作树的原生归档另被固定任务保护拒绝，未绕过保护删除。保留两探针的原视频、manifest、joint-manifest、字幕与日志，以及整个最终 `render-timeline-native-probe-final-v3` 包及全部生产材料。
+
+全盘元数据盘点覆盖本地C盘可访问用户目录、AppData、ProgramData、Program Files和Windows；E/F/G/U为网络存储，个人影音和NAS备份不按垃圾处理。旧工作树、旧Glance环境和历史诊断合计超过50GB逻辑体积，逐项核实运行依赖及清理结果；受硬链接、压缩影响，逻辑体积不能当作可释放物理空间。盘点证据为 `whole-machine-user-data-size-inventory-20261015.json`、`whole-machine-app-system-size-inventory-20261015.json`、`whole-machine-other-local-size-inventory-20261015.json`，压缩证据为 `archived-session-lossless-compression-20261015.json`。活跃数据库、当前会话、主目录素材、运行环境及模型不因体积大而删除。
+
+10月16日复核发现旧CosyVoice目录（昨日约14.55GB）及三份旧安装/诊断文件（合计2,527,044,557字节）已不在原路径，无法归因于本轮代理操作。两个旧工作树约10.05GB及3.61GB、旧Glance目录约5.91GB仍在，其中旧data为5,202,822,283字节。当前145条Main内容路径全部指向主目录，旧data引用为0；进程、服务、任务也无旧Glance路径引用。用户再次明确要求删除整批旧数据后，七月MSIX单文件删除和旧Glance/data目录删除仍均被自动审批在进程创建前拒绝，未执行，不能写作已清理。没有换工具重试这些被拒绝目标。
+
+Windows原生清理程序已不在运行；MEMORY.DMP及2.01GB的旧WATCHDOG转储均已不在原路径，但原wrapper退出码未恢复，不能宣称完整清理流程成功退出。仅本轮创建的两项 `StateFlags8763` 临时清理配置已移除并复核，安全证据 `windows-native-dump-cleanup-recheck-20261016.json`。
+
+后续只读核对另一任务“检查电脑运行状态和磁盘占用”（`01a13f9f-a944-77c0-9c00-bf8f74b88d45`）的已完成记录，找到额外释放来源：该任务报告清理uv缓存、旧CosyVoice环境、Codex安装/诊断文件、NVIDIA安装缓存及少量工作树缓存，净释放23.37GiB，清理后可用26.01GiB。其记录与本轮观察到的文件消失及容量相符；净释放量来自该任务的前后取样，未在此逐文件重算，不与逻辑体积相加。本线程没有向该任务发送指令，也没有委托它重试本线程被拒绝的删除。对账证据 `cleanup-cross-task-reconciliation-20261016.json`；此前“无法归因”的描述指独立复核当时，现已有来源记录。
+
+另已定位终态维护误报：旧Recovery为CONTEXT_MISSING/repair_task_context且恰一次消费，维护扫描却把所有非mark_recovery_blocked方案都送入专属QC目标拒绝回执校验。该日志最后写入早于新QC创建，并非当前审核任务的新失败。最小修复 `93ecb3d` 仅在策略确实适用时调用原严格校验，普通上下文链跳过该策略，真正QC拒绝的回执缺失/篡改仍拒绝。回归先复现RED，作者及独立审查三模块各189项通过；独立证据 `terminal-context-policy-independent-review-evidence.json`，SHA256 `76ca809730c4e3971566fd92b34b6aea2edbebcca86e84d5136b877e2882b3d9`。已推送实施分支并合入主目录源码；后台仍是原PID28492，等待当前活动运行安全结束后重启加载此维护修复，不把磁盘源码更新当作进程已加载。
+
+界面全局刷新也已复现缺陷：点击“刷新业务状态”会在内容选择控件渲染前额外rerun，清除所选内容并跳回首条。修复 `b22c800` 移除这次多余rerun，按钮点击本身仍触发正常刷新。真实Streamlit AppTest先在旧代码复现失败；修复后验证保留选题、展示服务端新状态及全程GET请求，作者与Root独立两模块各10项通过。2026-10-16 22:36已在主目录独立重启界面并复测：8510新PID24868、launcher2796，界面健康200；选择Aurzen后全局刷新仍保留该选题，显示WAITING_AGENT/content_qc和正在执行。8000仍为原PID28492，原生审核运行及心跳保持；守护已恢复Enabled。证据 `webui-deployed-b22c800-20261016.json`、`webui-refresh-fixed-production-20261016.png`。
 
 验证范围：`40227d4` 组合版本已执行 `python -m pytest test/business test/services/test_video_project.py -q --tb=short`，1455 passed/905.02秒，进程exit0；354个纳入快照的Python、Skill及role文件前后不变。安全证明为 `root-post-fixes-full-regression-result.json`、`root-post-fixes-source-freeze.json`、`root-post-fixes-full-regression.log`。8059条警告主要为现有依赖弃用提示，不等于测试失败。此前中断运行不计为通过；隔离研究、时轴验证和测试不代表本轮正式内容QC或真实发布成功。
 
 ## 本轮剩余验收
 
-1. 在前述具体清理确认后恢复磁盘容量，保留旧诊断清单、日志、视频及最终v3验证包，重新核算渲染与审核副本的空间。
-2. 通过正常render入口生成新revision，保留旧成片；核对实际1080帧/36秒及冻结输入，通过按需宿主执行新的正式CONTENT_QC。不能用隔离时轴证明代替该项。
+1. 核实全盘清理最终结果及容量变化来源，保留生产和最终验证证据；不重复请求已给出的清理授权。
+2. 核对新revision实际1080帧/36秒及冻结输入，通过已启动的按需宿主执行新正式CONTENT_QC（task `agt_a8b81f02da8b4b028cd4b27afe6dd2e1`，run `run_206c5da4b85850e89712b625f17df73f`）。不能用隔离时轴证明代替该项。
 3. 通过后续独立审核与正常发布流程，核实本轮新作品的PUBLISHED记录、真实平台ID/URL和截图，再完成总体稳定生产验收并更新本文。
 
 ## 历史证据
