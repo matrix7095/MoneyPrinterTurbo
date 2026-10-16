@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from glance_core.models import AuditEvent, TaskPrompt, TaskType, utc_now
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import Settings
+from glance_core.task_instructions import _SCRIPT_FACT_FIDELITY_RULE
 from glance_core.task_schemas import IMAGE_BASE_FORBIDDEN_ELEMENTS, declared_field_names
 
 
@@ -452,6 +453,15 @@ audio 必须 false 并定位缺口，不把普通同音转写差异直接当成�
         if use_handsfree:
             template += _HANDSFREE_STAGE_FACT_RULE
         template += _PRONUNCIATION_IDENTITY_RULE
+    if task_type in (
+        TaskType.SHORT_SCRIPT,
+        TaskType.SCRIPT_QC,
+        TaskType.SCRIPT_REVIEW_ASSIST,
+        TaskType.CONTENT_QC,
+        TaskType.FINAL_REVIEW_ASSIST,
+        TaskType.RECOVERY,
+    ) and _SCRIPT_FACT_FIDELITY_RULE.strip() not in template:
+        template += "\n" + _SCRIPT_FACT_FIDELITY_RULE
     if use_handsfree and task_type in (
         TaskType.SHORT_SCRIPT,
         TaskType.SCRIPT_QC,
@@ -493,10 +503,11 @@ ASSET_QC 沿现有素材修复白名单，不借本约定扩展角色权限。�
     ):
         template += """
 ## Handsfree 脚本保真与完整自检（覆盖基础/自定义的逐字符原样及历史漏检要求）
-数值、单位、量级、精度限定、大小写、型号、符号及兼容事实边界必须保真。
+遵守上述已验证事实保真规则，包括口播乘号/范围连接词的有限例外；其余数值、单位、量级、
+精度限定、大小写、型号、符号及兼容事实边界必须保真。
 仅数量限定词后、数值与单位间不改变含义的排版空格可不同：研究“约 93 克”与脚本“约93克”
 等价，不是事实 error，也不得仅为该空格触发返工；这不是通用去空格或事实归一化规则。
-不得合并数字内部间隔（“1 2”不能变“12”），不得泛化忽略范围、乘号、正负、小数、
+不得合并数字内部间隔（“1 2”不能变“12”），不得改变范围/乘积关系，或忽略正负、小数、
 单位大小写或正式型号词间空格；48MP 必须保留 48MP，技术单位不得口语改写，
 “约”不可丢，“三块或更多”不可变成“三块”；任何数值、精度或边界变化仍是硬错误。
 SHORT_SCRIPT 提交前按当前有效规则完整自检：已核验主体及兼容/阶段边界、真实开场场景、

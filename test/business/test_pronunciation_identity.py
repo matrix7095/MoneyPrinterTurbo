@@ -18,6 +18,7 @@ from glance_core.prompts import (
 )
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import Settings
+from glance_core.task_instructions import _SCRIPT_FACT_FIDELITY_RULE
 from glance_core.task_schemas import ShortScriptResult
 from glance_core.task_service import stable_hash
 from pydantic import ValidationError
@@ -123,7 +124,9 @@ def test_unrelated_stages_do_not_receive_identity_rule(tmp_path, task_type, hand
             session.commit()
             text = resolve_instructions(session, task_type, handsfree=handsfree)
             assert RULE_HEADING not in text
-            if not handsfree and task_type not in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE}:
+            if not handsfree and task_type == TaskType.RECOVERY:
+                assert text == "保留本角色授权边界。\n" + _SCRIPT_FACT_FIDELITY_RULE
+            elif not handsfree and task_type not in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE}:
                 assert text == "保留本角色授权边界。"
     finally:
         runtime.close()
