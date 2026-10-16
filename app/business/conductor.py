@@ -35,6 +35,7 @@ PARENT_EFFORT = "high"
 POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 30
 MAX_ROUNDS = 16
+MAX_EARLY_CHILD_EVENTS = 64
 REQUEST_ERROR_CLASSES = {
     "ConnectError",
     "ConnectTimeout",
@@ -798,15 +799,9 @@ class Conductor:
         if method == "turn/started" and params.get("threadId") == self.parent:
             self.parent_turn = params["turn"]["id"]
             self.parent_idle = False
-        elif method == "turn/started" and params.get("threadId") in self.children:
-            state = self.children[params["threadId"]]
-            turn = params.get("turn") or {}
-            turn_id = turn.get("id")
-            if isinstance(turn_id, str) and turn_id and turn.get("status") == "inProgress":
-                turns = state.setdefault("turns", {})
-                if turn_id not in turns:
-                    turns[turn_id] = "inProgress"
-                    state.update(turn_id=turn_id, terminal=False)
+        elif method in {"turn/started", "turn/completed"} and params.get("threadId") != self.parent:
+            if not self._buffer_child_turn(method, params):
+                self._child_turn(method, params)
         if method in {"item/started", "item/completed"}:
             item = params.get("item") or {}
             if (
@@ -822,28 +817,64 @@ class Conductor:
                 if self.current and not self.current.get("started"):
                     self._observe("UNKNOWN", self.current["worker"]["request_id"])
                     self._stop("CONDUCTOR_SPAWN_NOT_OBSERVED")
-            elif thread_id in self.children:
-                state = self.children[thread_id]
-                turn = params.get("turn") or {}
-                if (
-                    not state.get("turn_id")
-                    or turn.get("id") != state["turn_id"]
-                    or state.get("turns", {}).get(turn.get("id")) != "inProgress"
-                    or turn.get("status") not in {"completed", "interrupted", "failed"}
-                    or state["terminal"]
-                ):
-                    return
-                state["terminal"] = True
-                state["turns"][turn["id"]] = turn["status"]
-                if (
-                    self.current
-                    and self.current.get("child", {}).get("child_id") == thread_id
-                ):
-                    self._observe(
-                        "TERMINAL",
-                        self.current["worker"]["request_id"],
-                        self.current["child"],
-                    )
+
+    def _early_turn_scope(self):
+        worker = self.current["worker"]
+        return (self.run_id, self.generation, self.epoch, self.parent,
+                self.parent_turn, worker["request_id"], worker["offer_hash"])
+
+    def _buffer_child_turn(self, method, params):
+        thread_id = params.get("threadId")
+        turn = params.get("turn") or {}
+        if (
+            not self.current or self.current.get("child") or not self.parent_turn
+            or not isinstance(thread_id, str) or not thread_id or thread_id == self.parent
+            or not isinstance(turn.get("id"), str) or not turn["id"]
+            or turn.get("status") not in (
+                {"inProgress"} if method == "turn/started" else {"completed", "interrupted", "failed"}
+            )
+        ):
+            return False
+        started = self.current.get("started")
+        if started and (thread_id != started["child_id"] or not self.metadata):
+            return False
+        if thread_id in self.children and not started:
+            return False
+        scope = self._early_turn_scope()
+        if self.current.get("early_turn_scope") != scope:
+            self.current.update(early_turn_scope=scope, early_turn_events=[])
+        events = self.current["early_turn_events"]
+        if len(events) >= MAX_EARLY_CHILD_EVENTS:
+            raise ConductorError("CONDUCTOR_EARLY_CHILD_EVENT_LIMIT")
+        # The native child can start before its parent's spawn notification arrives.
+        events.append((method, thread_id, turn["id"], turn["status"]))
+        return True
+
+    def _child_turn(self, method, params, *, notify=True):
+        thread_id = params.get("threadId")
+        if thread_id not in self.children:
+            return
+        state = self.children[thread_id]
+        turn = params.get("turn") or {}
+        turn_id = turn.get("id")
+        if method == "turn/started":
+            if isinstance(turn_id, str) and turn_id and turn.get("status") == "inProgress":
+                turns = state.setdefault("turns", {})
+                if turn_id not in turns:
+                    turns[turn_id] = "inProgress"
+                    state.update(turn_id=turn_id, terminal=False)
+            return
+        if (
+            not state.get("turn_id") or turn_id != state["turn_id"]
+            or state.get("turns", {}).get(turn_id) != "inProgress"
+            or turn.get("status") not in {"completed", "interrupted", "failed"}
+            or state["terminal"]
+        ):
+            return
+        state["terminal"] = True
+        state["turns"][turn_id] = turn["status"]
+        if notify and self.current and self.current.get("child", {}).get("child_id") == thread_id:
+            self._observe("TERMINAL", self.current["worker"]["request_id"], self.current["child"])
 
     def _child_started(self, params, item):
         child_id = item.get("agentThreadId")
@@ -896,6 +927,8 @@ class Conductor:
         if "error" in response or any(
             thread.get(key) != value for key, value in expected.items()
         ):
+            self.current.pop("early_turn_events", None)
+            self.current.pop("early_turn_scope", None)
             self._observe("REJECTED", worker["request_id"])
             self._stop("CONDUCTOR_CHILD_METADATA_MISMATCH")
             return
@@ -918,6 +951,18 @@ class Conductor:
         else:
             self._observe("VERIFIED", worker["request_id"], child)
             self.current["admitted"] = True
+        events = self.current.pop("early_turn_events", [])
+        scope = self.current.pop("early_turn_scope", None)
+        if (
+            scope == self._early_turn_scope()
+            and started == self.current.get("started")
+            and started["parent_turn_id"] == self.parent_turn
+        ):
+            for method, thread_id, turn_id, status in events:
+                if thread_id == child["child_id"]:
+                    self._child_turn(method, {
+                        "threadId": thread_id, "turn": {"id": turn_id, "status": status},
+                    }, notify=False)
         if self.children[child["child_id"]]["terminal"]:
             self._observe("TERMINAL", worker["request_id"], child)
 
@@ -977,6 +1022,7 @@ class Conductor:
             + json.dumps(values, ensure_ascii=False)
         )
         self.parent_idle = False
+        self.parent_turn = None
         result = self._rpc(
             "turn/start",
             {

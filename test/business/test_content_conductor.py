@@ -837,6 +837,278 @@ def test_child_turn_before_metadata_response_is_retained_until_verification(setu
     assert not any(method == "turn/interrupt" for method, _ in native.sent)
 
 
+
+@pytest.mark.parametrize("completed_early", [False, True])
+def test_child_turn_before_parent_spawn_is_retained_after_metadata(setup, completed_early):
+    runner, backend, native, journal, _ = setup
+    w = bind_fixture(runner, journal)
+    native.values = dict(model=w["model"], reasoning_effort=w["reasoning_effort"])
+    native.queue.append(child_turn_event())
+    if completed_early:
+        native.queue.append(child_turn_event(status="completed"))
+    while native.queue:
+        runner._pump()
+    assert "child" not in runner.children
+    assert not any(e[0] in {"VERIFIED", "TERMINAL"} for e in backend.events)
+    runner._child_started(
+        dict(threadId="parent", turnId="turn_1"),
+        dict(id="spawn", agentThreadId="child", agentPath="/root/" + w["title"]),
+    )
+    # Use only the original live start, not the fixture transport's extra start.
+    metadata_response = native.queue[0]
+    native.queue.clear()
+    native.queue.append(metadata_response)
+    runner._pump()
+    assert runner.children["child"].get("turn_id") == "child_turn"
+    assert runner.children["child"]["terminal"] is completed_early
+    if not completed_early:
+        native.queue.append(child_turn_event(status="completed"))
+        runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert [e[0] for e in backend.events] == ["VERIFIED", "TERMINAL"]
+
+
+@pytest.fixture
+def early_turn_context(setup):
+    runner, backend, native, journal, plans = setup
+    w = bind_fixture(runner, journal)
+    native.values = dict(model=w["model"], reasoning_effort=w["reasoning_effort"])
+    return runner, backend, native, journal, plans
+
+
+def queue_child_registration(runner, native, *, parent="parent", turn="turn_1", title=None):
+    native.queue.append(dict(method="item/started", params=dict(
+        threadId=parent, turnId=turn, item=dict(
+            id="spawn", type="subAgentActivity", kind="started", agentThreadId="child",
+            agentPath="/root/" + (title or runner.current["worker"]["title"]),
+        ),
+    )))
+    runner._pump()
+    if native.queue:
+        metadata = native.queue[0]
+        native.queue.clear()
+        native.queue.append(metadata)
+
+
+def test_early_start_and_completion_before_metadata_use_real_order(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.append(child_turn_event())
+    runner._pump()
+    queue_child_registration(runner, native)
+    native.queue.appendleft(child_turn_event(status="completed"))
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert not backend.events
+    runner._pump()
+    assert runner.children["child"]["terminal"]
+    assert [e[0] for e in backend.events] == ["VERIFIED", "TERMINAL"]
+
+
+@pytest.mark.parametrize("method", ["turn/started", "turn/completed"])
+def test_unknown_turn_without_current_offer_is_not_retained(setup, method):
+    runner, backend, native, _, _ = setup
+    runner.parent, runner.parent_turn = "parent", "turn_1"
+    event = child_turn_event(status="inProgress" if method == "turn/started" else "completed")
+    native.queue.append(event)
+    runner._pump()
+    assert not runner.children and runner.current is None and not backend.events
+
+
+
+def test_early_child_events_require_observed_current_parent_turn(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    runner.parent_turn = None
+    native.queue.extend([child_turn_event(), child_turn_event(status="completed")])
+    while native.queue:
+        runner._pump()
+    assert not runner.current.get("early_turn_events")
+    assert not runner.children and not backend.events
+
+
+def test_early_other_child_cannot_supply_matching_child_turn(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([
+        child_turn_event(child_id="other-child"),
+        child_turn_event(status="completed", child_id="other-child"),
+        child_turn_event(status="completed"),
+    ])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native)
+    runner._pump()
+    assert set(runner.children) == {"child"}
+    assert not runner.children["child"]["terminal"]
+    assert "turn_id" not in runner.children["child"]
+    assert [e[0] for e in backend.events] == ["VERIFIED"]
+    assert "early_turn_events" not in runner.current
+
+
+def test_early_completion_before_start_does_not_complete_later_start(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([child_turn_event(status="completed"), child_turn_event()])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native)
+    runner._pump()
+    assert runner.children["child"]["turns"] == {"child_turn": "inProgress"}
+    assert not runner.children["child"]["terminal"]
+    assert [e[0] for e in backend.events] == ["VERIFIED"]
+    native.queue.append(child_turn_event(status="completed"))
+    runner._pump()
+    assert [e[0] for e in backend.events] == ["VERIFIED", "TERMINAL"]
+
+
+def test_early_duplicates_and_old_completion_do_not_finish_new_turn(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([
+        child_turn_event(), child_turn_event(), child_turn_event(status="completed"),
+        child_turn_event(status="completed"), child_turn_event("new-turn"),
+        child_turn_event(status="completed"), child_turn_event(),
+    ])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native)
+    runner._pump()
+    state = runner.children["child"]
+    assert state["turn_id"] == "new-turn" and not state["terminal"]
+    assert state["turns"] == {"child_turn": "completed", "new-turn": "inProgress"}
+    assert [e[0] for e in backend.events] == ["VERIFIED"]
+    native.queue.extend([child_turn_event("new-turn", "completed")] * 2)
+    runner._pump()
+    runner._pump()
+    assert [e[0] for e in backend.events] == ["VERIFIED", "TERMINAL"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("id", "wrong-child"), ("parentThreadId", "wrong-parent"), ("agentRole", "wrong"),
+    ("model", "wrong"), ("reasoningEffort", "wrong"), ("ephemeral", False),
+])
+def test_early_terminal_requires_exact_child_metadata(early_turn_context, field, value):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([child_turn_event(), child_turn_event(status="completed")])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native)
+    native.queue[0]["result"]["thread"][field] = value
+    runner._pump()
+    assert runner.stop_reason == "CONDUCTOR_CHILD_METADATA_MISMATCH"
+    assert not runner.children["child"]["terminal"]
+    assert not runner.current.get("child")
+    assert not any(e[0] in {"VERIFIED", "TERMINAL"} for e in backend.events)
+    assert "early_turn_events" not in runner.current
+
+
+@pytest.mark.parametrize("mismatch", ["parent", "turn", "title"])
+def test_early_terminal_cannot_bypass_parent_spawn_binding(early_turn_context, mismatch):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([child_turn_event(), child_turn_event(status="completed")])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native, **{mismatch: "wrong"})
+    assert runner.stop_reason == "CONDUCTOR_UNEXPECTED_CHILD"
+    assert not runner.metadata
+    assert not runner.children["child"]["terminal"]
+    assert not any(e[0] in {"VERIFIED", "TERMINAL"} for e in backend.events)
+
+
+@pytest.mark.parametrize("scope_field", ["run", "generation", "epoch", "parent", "parent_turn", "request_id", "offer_hash"])
+def test_early_turn_buffer_cannot_cross_current_scope(early_turn_context, scope_field):
+    runner, backend, native, _, _ = early_turn_context
+    native.queue.extend([child_turn_event(), child_turn_event(status="completed")])
+    while native.queue:
+        runner._pump()
+    queue_child_registration(runner, native)
+    if scope_field in {"request_id", "offer_hash"}:
+        runner.current["worker"][scope_field] = "changed"
+        if scope_field == "request_id":
+            runner.journal.state["intents"]["changed"] = {}
+    else:
+        attr = "run_id" if scope_field == "run" else scope_field
+        setattr(runner, attr, getattr(runner, attr) + (1 if scope_field in {"generation", "epoch"} else "-changed"))
+        if scope_field == "parent":
+            native.queue[0]["result"]["thread"]["parentThreadId"] = runner.parent
+    # These isolated mutations exercise the replay guard, not backend admission validation.
+    runner.backend.observe = lambda *args: backend.events.append((args[2]["outcome"],))
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert "turn_id" not in runner.children["child"]
+    assert not any(e[0] == "TERMINAL" for e in backend.events)
+    assert "early_turn_events" not in runner.current
+
+
+def test_early_turn_buffer_is_owned_by_current_offer(early_turn_context):
+    runner, backend, native, journal, _ = early_turn_context
+    native.queue.extend([child_turn_event(), child_turn_event(status="completed")])
+    while native.queue:
+        runner._pump()
+    runner.current = dict(worker=worker(1))
+    journal.state["intents"][worker(1)["request_id"]] = {}
+    queue_child_registration(runner, native)
+    runner._pump()
+    assert not runner.children["child"]["terminal"]
+    assert "turn_id" not in runner.children["child"]
+    assert not any(e[0] == "TERMINAL" for e in backend.events)
+
+
+def test_early_turn_buffer_is_bounded_and_overflow_fails_closed(early_turn_context):
+    runner, backend, native, _, _ = early_turn_context
+    for index in range(c.MAX_EARLY_CHILD_EVENTS):
+        native.queue.append(child_turn_event(str(index), child_id="unknown-" + str(index)))
+        runner._pump()
+    assert len(runner.current["early_turn_events"]) == c.MAX_EARLY_CHILD_EVENTS
+    assert not runner.children and not backend.events
+    native.queue.append(child_turn_event("overflow"))
+    with pytest.raises(c.ConductorError, match="CONDUCTOR_EARLY_CHILD_EVENT_LIMIT"):
+        runner._pump()
+    assert len(runner.current["early_turn_events"]) == c.MAX_EARLY_CHILD_EVENTS
+    assert not runner.children and not native.closed and not backend.events
+
+
+@pytest.mark.parametrize("invalid", ["missing-id", "empty-id", "wrong-status"])
+def test_invalid_early_turn_is_not_buffered(early_turn_context, invalid):
+    runner, _, native, _, _ = early_turn_context
+    event = child_turn_event()
+    if invalid == "missing-id":
+        event["params"]["turn"].pop("id")
+    elif invalid == "empty-id":
+        event["params"]["turn"]["id"] = ""
+    else:
+        event["params"]["turn"]["status"] = "completed"
+    native.queue.append(event)
+    runner._pump()
+    assert not runner.current.get("early_turn_events")
+
+
+@pytest.mark.parametrize("fast_child", [False, True])
+def test_run_loop_handles_child_start_before_parent_spawn(setup, fast_child):
+    runner, backend, native, _, _ = setup
+    real_request = native.request
+
+    def request(method, params):
+        rpc = real_request(method, params)
+        if method == "turn/start":
+            spawn = native.queue[-1]
+            native.queue.pop()
+            native.queue.append(child_turn_event("turn_child_1", child_id="child_1"))
+            if fast_child:
+                native.queue.append(child_turn_event("turn_child_1", "completed", "child_1"))
+            native.queue.append(spawn)
+        elif method == "thread/read":
+            events = list(native.queue)
+            native.queue.clear()
+            native.queue.extend(event for event in events if not (
+                event.get("params", {}).get("threadId") == "child_1"
+                and (fast_child or event.get("method") == "turn/started")
+            ))
+        return rpc
+
+    native.request = request
+    native.after_empty = lambda: finish(backend, runner)
+    assert runner.run()["status"] == "CONDUCTOR_CONTENT_TERMINAL"
+    assert native.closed and native.turn_count == 1
+    assert [e[0] for e in backend.events].count("VERIFIED") == 1
+    assert [e[0] for e in backend.events].count("TERMINAL") == 1
+
 def test_stop_before_metadata_does_not_forge_terminal(setup):
     runner, backend, native, journal, _ = setup
     w = bind_fixture(runner, journal)
