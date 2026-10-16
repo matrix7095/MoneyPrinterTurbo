@@ -1,10 +1,10 @@
 # MoneyPrinterTurbo 按需生产运行手册
 
-更新：2026-10-17 05:50（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
+更新：2026-10-17 06:12（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
 
 ## 当前验收状态
 
-**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署；第八轮通过正常入口接续，同一脚本 QC 已被新原生 Worker 实际领取，正在等待正式审核结果。该补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次成功领取不能证明此前提前返回的根因已解决。下表为 05:50（+08）快照。
+**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署。第八轮正常接续后，脚本 QC、脚本审核、视觉计划、视觉计划 QC、新图片与素材 QC 均已完成并被服务端消费。新配音和新成片已生成，独立技术与封存清单核验 18 项通过；完整成片 QC Worker 已实际领取，尚未提交正式结果。诊断补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次正常推进不能证明此前提前返回的根因已解决。下表为 06:12（+08）快照。
 
 | 项目 | 已核实状态 |
 | --- | --- |
@@ -12,12 +12,16 @@
 | 生产触发 | 按需从工作台点击“运行一次”。业务定时调度、自动选题关闭；不需要 Gemini 或周期生产任务。 |
 | 代码 | 配音修复 `db64dfb85bf1b0a5603aeca38b669b3ccbf4e93e`、规格口播合同修复 `05c43348e31e3bcfb29213535dab00463edc31ec`、诊断补丁 `0915005562b6387e889f554cd9c6f07aba7382a3` 均已推送 Main 与实施分支。本次 SQLite 备份 `pre-preclaim-diagnostics-20261017.db` 为 115,744,768 字节，quick_check=ok。部署前后 30 个任务的状态、attempt、instructions/input/result 哈希一致。 |
 | 自动化回归 | 最新诊断补丁：作者 456 项、独立审查 235 项、完整组合回归 **1737 passed**（8513 warnings，exit 0，941.79 秒；运行器 947.188 秒）；359 个源码/依赖文件前后一致。此前合同修复 1686 passed、配音修复 1651 passed 的证据保留。 |
-| 当前内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`。第八轮 `run_847ee6ec4e57016c589e5356c340e51f` 正在运行，原生 PID `11436`、包装进程 `10448`。新脚本 `agt_723466ed4dbb4c27a60c13aa3ae70f4e` 已完成；同一脚本 QC `agt_bce2ee7f682a43c8980e92edad0453c1` 已正常 LEASED、attempt 1，child `01a146b0-db5c-7e92-9de1-abda6f7a210a`，尚无正式通过结果。 |
+| 当前内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`。第八轮 `run_847ee6ec4e57016c589e5356c340e51f` 正在 `content_qc`，原生 PID `11436`、包装进程 `10448`。新脚本 `agt_723466ed4dbb4c27a60c13aa3ae70f4e` 的脚本 QC `agt_bce2ee7f682a43c8980e92edad0453c1` 已通过；脚本审核 `agt_673ffed96d8a4596a65a693e7d737f7c`、视觉计划 `agt_8cbc3754e6ad4b289e6b37926f40d91c` 和视觉计划 QC `agt_916204acacf642b6aaab1af6e9a54d7f` 均已完成并被接受、消费。 |
+| 第八轮新配音 | asset `asset_48df80306acf44688d27fa7b6f245c10`，`audio/voice-wy1nvt3i/narration.mp3`，SHA-256 `9e83e9d4ec9aea2dede7510fb5aec55de653249c1e3fa4fabe6de4cbebb73ac9`，217,440 字节、36.24 秒，完整解码无错误。12 条 TTS 句子边界包含 `1920乘以1080`、`60到80英寸`；这不是可听读音或正式成片 QC 通过证明。 |
+| 第八轮新图片 | 图片任务 `agt_6eba426d344149eb9bdee5656f4cfbec` 已完成；8 张实际 PNG 均为 1080×1920、哈希和字节数匹配，原图处理证据保留。独立素材 QC `agt_0030940e76384b8ca784228bbed1a093` 正式 `passed=true`，已被接受、消费，结果哈希 `b0044f8e7959a8125f430317f060b0d8fc93f137885829c565a73f7da96d0f43`。 |
+| 第八轮新成片 | asset `asset_5d484c4d91314fbe9bec9b12a316e51e`，`render/revisions/83ee694daa4c4b1fb9220598d99e74cc/final.mp4`，4,201,438 字节，SHA-256 `cba7e2b291a510e3a3e51a717de224c8aaa2981b27ae2bc57130151c4716196a`。独立技术与封存清单核验合计 18 项 PASS：1088 帧、30 fps、1080×1920、首帧 PTS 0、CFR 连续、完整 AV 解码无错误；36.266667 秒视频对应 36.24 秒新配音，PCM lag 0、相关系数 0.9999788584。1088 帧图＋272 帧页共 1360 个文件哈希匹配，清单绑定本轮脚本、新配音、8 张新图和对应素材 QC；冻结 render spec 的 `bgm=null`。这些核验不证明发音、事实或正式内容 QC 通过。 |
+| 第八轮完整内容 QC | `agt_64cf821d62ad4f1294ea865e68ac8e40` 已正常 LEASED、attempt 1，child `01a146c4-78c5-7d41-b7d6-566a4e027ead`；正在审核本轮新成片，尚未提交正式结果。 |
 | 合同实际下发 | 待领取任务 `agt_d7ed0867eeb44c619c41412a80900c69` 的下载 instructions 与 `bundle_served.served_prompt_hash=eecd5131501f98d40a4b11a4ad6352ee80a8f82ab7456b2ef8f3c3daa64a4b6e` 一致；包含新规则，旧全字段原样条款已移除。存档 instructions/input/result 不被改写，领取时正常解析 live 合同。 |
 | 第五轮配音 | asset `asset_a58d0eb08bdc495eb35434a25ac3180b`，SHA-256 `8d67bcf0ef6ba9c727a4b6695a3b0e50f02c11c8e9059961ff6da20c96d045e8`，36.504 秒。 |
 | 第五轮图片与成片 | 8 张新图通过独立素材 QC；原生 941×1672 图片按本轮已授权流程保留原件并适配为 1080×1920。新 final `asset_f1542174fde9466f93d9abb8a7c014de`，SHA-256 `6b002e005be033b132586865e828b69e6cdd1d5bde73bbf61e0756894fc38122`，3,754,404 字节。 |
 | 成片技术核验 | 独立技术核验 **14/14 PASS**：视频 1096 帧、30 fps、1080×1920、首帧 PTS 0；音频 36.504 秒，视频 36.533 秒，与音频时长向上取整到帧边界一致；完整音视频解码、音频相关性，以及 1096 帧图和 274 帧页共 1370 个文件的哈希核对通过。 |
-| 正式内容 QC | `agt_9d76f7b9bcc64887a251b4b66cc18d74` 已 `COMPLETED`、attempt 1，正式结果 `passed=false`，已接受并消费。9 个检查中 7 个通过，音频与字幕同步证据未通过：×及范围连接词仍缺充分读音证据，结果未认定已证实错读。正常恢复任务 `agt_6f12269dcc6b4e75bb9478196ee21814` 已创建，不能跳过门禁发布。 |
+| 第五轮正式内容 QC | `agt_9d76f7b9bcc64887a251b4b66cc18d74` 已 `COMPLETED`、attempt 1，正式结果 `passed=false`，已接受并消费。9 个检查中 7 个通过，音频与字幕同步证据未通过：×及范围连接词仍缺充分读音证据，结果未认定已证实错读。该旧结果保留作历史记录，不能跳过门禁发布。 |
 | 第六轮脚本 QC | 旧规则生成的 script822 把技术数字写成全中文，新合同下的脚本 QC `agt_d7ed0867eeb44c619c41412a80900c69` 已正常判定不通过，并创建正常恢复 `agt_110f4119f0964101b9215800dcc7522b`。不为该旧样例放宽数值保真要求。 |
 | 第六轮交接停止 | `CONDUCTOR_HANDOFF_NOT_CLAIMED`：恢复子代理无工具调用、未 consume offer、未 claim 即回合终止；Conductor 按门禁机器停止，FINISHED/exit 0 不代表业务完成。正常新交接随后成功，尚无证据证明源码或权限拒绝。 |
 | 第七轮交接停止 | 同类未领取终止在新脚本 QC 再次出现；相同初始合同与 Skill 此前成功过，未确认是 API 或权限拒绝。现有隐私日志不留任意消息正文，真实提前返回原因尚未知。停止盲目重启，先补固定枚举诊断，不改变领取、停止、预算和质检逻辑。 |
@@ -60,6 +64,9 @@
 - [诊断补丁完整回归 manifest](../storage/smoke/stable-production-20261013/preclaim-diagnostics-v3-full-regression-manifest-20261017.json)，SHA-256 `356de5751f92e7ae8d52a72e241bd64e6c2b10f6d6eabfb10a3080ae6d6e1558`。
 - [诊断补丁部署核验](../storage/smoke/stable-production-20261013/preclaim-diagnostics-deployed-verification-20261017.json)、[任务字段前后保持核验](../storage/smoke/stable-production-20261013/preclaim-post-deploy-state-20261017.json)、[部署前 SQLite 备份](../storage/smoke/stable-production-20261013/pre-preclaim-diagnostics-backup-20261017.json)。
 - [第八轮启动](../storage/smoke/stable-production-20261013/aurzen-run8-start-20261017.json)、[同一脚本 QC 正常领取](../storage/smoke/stable-production-20261013/run8-normal-qc-claimed-20261017.json)。
+- [第八轮正式脚本 QC 通过](../storage/smoke/stable-production-20261013/run8-formal-script-qc-pass-20261017.json)、[视觉计划 QC 通过](../storage/smoke/stable-production-20261013/run8-formal-visual-plan-qc-pass-20261017.json)、[新配音技术核验](../storage/smoke/stable-production-20261013/run8-new-voice-technical-20261017.json)。
+- [8 张新图完整性核验](../storage/smoke/stable-production-20261013/run8-image-integrity-20261017.json)、[正式素材 QC 通过](../storage/smoke/stable-production-20261013/run8-formal-asset-qc-pass-20261017.json)、[新成片独立技术核验](../storage/smoke/stable-production-20261013/run8-render-independent-20261017.json)、[正式完整内容 QC 已领取](../storage/smoke/stable-production-20261013/run8-formal-content-qc-start-20261017.json)。
+- [新成片封存清单独立核验](../storage/smoke/stable-production-20261013/run8-render-manifest-independent-20261017.json)，SHA-256 `b224f51b7796a81b3d9bcfd47c8438f9f9c2d5f974bfaca6a7824d17495d6b93`；初始技术证据 SHA-256 `f80f544deeb8d9427c608c9325937a4db001f09b9920854cc14dbbf6f7d2fa73` 保持不变。
 
 - [第五轮启动记录](../storage/smoke/stable-production-20261013/aurzen-run5-start-20261017.json)
 - [第五轮成片独立技术核验（14/14 PASS）](../storage/smoke/stable-production-20261013/release-render-run5-20261017-independent.json)，SHA-256 `a8fc9980d9f404b0f72e57930d949216a0ee06b55cfbd33a7e8b48230bd2f551`
@@ -74,7 +81,7 @@
 
 ## 仍需完成
 
-1. 继续观察第八轮同一原生 Worker 和正常任务门禁，不重复派发或重放旧 offer。新脚本仍须正常审核、新配音、视觉计划、素材与完整成片 QC；再次出现未领取终止时先读取新的固定枚举诊断，不能把 Worker 自述当作平台故障事实。
+1. 继续观察第八轮同一原生 Worker 和正常任务门禁，不重复派发或重放旧 offer。等待本轮完整成片 QC 的正式结论；再次出现未领取终止时先读取新的固定枚举诊断，不能把 Worker 自述当作平台故障事实。
 2. 完成发布审核并从正常发布流程取得这版成片对应的真实 `PUBLISHED` 状态、抖音作品 ID、URL 和截图证据。
 3. 用户授权的全机旧数据清理尚未完成。此前剩余候选的逻辑体积为 **25,936,296,584 字节**，不是当前重新汇总值或可释放物理空间。10 月 17 日 03:34 再核实：旧 Glance 为 5,906,578,968 字节、bootstrap 工作树为 9,504,598,141 字节、upstream rehearsal 工作树为 3,605,444,075 字节，未发现对应进程引用。重新授权后的旧数据库备份删除仍被自动审批以 `blocked by policy` 在进程创建前拒绝，upstream 工作树的正常归档也被固定任务保护拒绝；本轮新增删除量为 0。记录见 [本次清理复核](../storage/smoke/stable-production-20261013/cleanup-renewed-authorization-rejection-20261017.json)。
 4. 上述门禁通过并核实发布后，再更新本页验收结论；目前不可称为稳定端到端生产已验收。
