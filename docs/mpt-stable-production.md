@@ -2,9 +2,9 @@
 
 更新日期：2026-10-17。本文记录当前验收状态；历史检查点另存独立文件，旧调度恢复要求不再适用于按需生产。定时任务不是生产前提；内部按序派发和故障守护不承担周期选题或周期生产触发。
 
-当前结论：尚未完成稳定生产验收。2f7be13组合修复已在10月17日00:18加载到主目录后台，新API监听PID12376、launcher22512；界面仍为主目录PID24868。授权API200、匿名401、界面健康200；七角色启动器/清单/Skill哈希一致，业务调度与自动选题仍关闭。升级前后3015个历史任务的输入、结果、指令及尝试预算哈希全部一致。新成片技术验收通过，但正式CONTENT_QC及真实发布仍未完成。
+当前结论：尚未完成稳定生产验收。2f7be13组合修复已在10月17日00:18加载到主目录后台，新API监听PID12376、launcher22512；界面仍为主目录PID24868。授权API200、匿名401、界面健康200；七角色启动器/清单/Skill哈希一致，业务调度与自动选题仍关闭。升级前后3015个历史任务的输入、结果、指令及尝试预算哈希全部一致。新成片技术验收通过；正式CONTENT_QC已完成并判音频项未通过，真实发布尚未完成。
 
-当前按需运行：10月17日00:19通过正常execute入口仅启动一次run_5676c3e0d4b33935b790d0f78c0131be，generation3，有效期至02:19，实测窗口120分钟。原生父线程01a14582-9a0b-7ec2-a603-cae7f592baf1，正式QC子线程01a14582-f230-7143-ae8d-8debc315ab24，Sol/high/default/ephemeral；同一QC任务正常确认第2次尝试（2/3），原第1次未重置。新强确认回执及连续三次宿主业务续租已真实核对，绑定当前claim/lease/输入/attempt，审计主体明确为mpt-content-host，非伪造Worker心跳；仍无语义审核结果。证据deployed-native-liveness-20261017.json、aurzen-run3-start-20261017.json、run3-host-business-lease-renewal-20261017.json。
+当前按需运行：10月17日00:19通过正常execute入口仅启动一次run_5676c3e0d4b33935b790d0f78c0131be，generation3，有效期至02:19，实测窗口120分钟。原生父线程01a14582-9a0b-7ec2-a603-cae7f592baf1，正式QC子线程01a14582-f230-7143-ae8d-8debc315ab24，Sol/high/default/ephemeral；同一QC任务正常确认第2次尝试（2/3），原第1次未重置。新强确认回执及连续三次宿主业务续租已真实核对，绑定当前claim/lease/输入/attempt，审计主体明确为mpt-content-host，非伪造Worker心跳；01:29正式QC结果已正常ACCEPTED并消费，result_hash均为 `2a0a944892c662837b07e46fa8ae657ea1374327591ab2e2ec9aa3787fbaffab`，passed=false：报告中事实、权益、核心演示、画面对应、字幕、节奏、身份价值及技术8项通过，音频未通过。具体是12.06–12.42秒“支撑”与16.10–16.40秒、28.52–28.70秒规格连接词的独立ASR置信缺口，不据近音转写断言物理错读。正常Recovery `agt_74a1640034cd48b4b965a17e72608836` 已签发，BUSINESS_QC/CONTENT_QC_FAILED、round1/max3、目标short_script；01:32仍PENDING/attempt0，原QC子线程尚未真实终态，宿主继续监督，不重复领取。完整结果快照 `run3-formal-content-qc-result-20261017.json`，SHA256 `20e44464aa06dd541f1a5eabbc8dc6f1332985df6c10de181ed8c3e491ecad2a`。此前部署及续租证据deployed-native-liveness-20261017.json、aurzen-run3-start-20261017.json、run3-host-business-lease-renewal-20261017.json保持。
 
 10月17日00:44独立只读生产验收22项全部通过：新后台与界面监听归属、模块解析到Main、API鉴权及健康、业务调度/自动选题关闭、守护状态、第三轮真实120分钟窗口、旧运行FINISHED/exit0且未复活、强确认及47条真实未过期续租、3015历史任务输入/结果/预算保持、七角色stage和新成片SHA均通过。证据 `native-liveness-run3-independent-verification-20261017-v2.json`，SHA256 `1ffaebbf637fd6f6e9e47c1ec723cb9fef634cb9e84d6a78efb0f44b53e67a77`。首版核验脚本误将旧journal停止原因要求为FINISHED，首版REVIEW_REQUIRED证据保留；v2仅修正验收分类，生产记录未改。Main与实施分支已推送并在34fb115对齐；Root另核对354文件，349字节一致、5个仅LF/CRLF差异，未改写行尾。此项为部署与租约验收，不代表语义QC或发布完成。
 
@@ -80,7 +80,7 @@ Windows原生清理程序已不在运行；MEMORY.DMP及2.01GB的旧WATCHDOG转�
 ## 本轮剩余验收
 
 1. 核实全盘清理最终结果及容量变化来源，保留生产和最终验证证据；不重复请求已给出的清理授权。
-2. 新revision已独立通过18项技术检查，实际1080帧/36秒，final SHA256为 `75a83899a2e1e66d38baa5a857897fa292393653365b4dd7274e66cf1a3f579b`。正式CONTENT_QC尚未通过：第二轮曾因业务租约过期回到PENDING/attempt1，原宿主已自然收尾。安全部署后，第三轮已从正常入口确认同一任务的第2次尝试（2/3），现为LEASED且有真实宿主续租审计，等待实际结果。没有复活旧租约或重置预算；技术检查不能代替正式审核。
+2. 新revision已独立通过18项技术检查，实际1080帧/36秒，final SHA256为 `75a83899a2e1e66d38baa5a857897fa292393653365b4dd7274e66cf1a3f579b`。正式CONTENT_QC尚未通过：第二轮曾因业务租约过期回到PENDING/attempt1，原宿主已自然收尾。安全部署后，第三轮已从正常入口确认同一任务的第2次尝试（2/3），现已COMPLETED并正常消费音频未通过的正式结果；正常Recovery已签发，继续既有有限修复路径。没有复活旧租约、改写审核结论或重置预算；技术检查不能代替正式审核。
 3. 通过后续独立审核与正常发布流程，核实本轮新作品的PUBLISHED记录、真实平台ID/URL和截图，再完成总体稳定生产验收并更新本文。
 
 ## 历史证据
