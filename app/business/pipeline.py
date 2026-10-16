@@ -34,6 +34,7 @@ from glance_core.models import (
     ContentStatus,
     ProductionMode,
     RightsStatus,
+    StageRun,
     TaskStatus,
     TaskType,
     as_utc,
@@ -86,6 +87,34 @@ SUPPORTED_TASK_TYPES = frozenset(
         TaskType.RECOVERY,
     }
 )
+
+
+class VoiceRetryExhausted(NonRetryableMediaError):
+    """The approved review is still pending; no automatic voice IO is permitted."""
+
+
+def _voice_retry_scope(session: Session, content_id: str) -> dict:
+    from app.business.content_run import ContentRun, load_run
+
+    run = load_run(session)
+    if run is not None and run.content_id == content_id:
+        return {"run_id": run.run_id, "generation": run.generation}
+    # The single current-run slot may now belong to another content. Its absence,
+    # expiry or replacement must not reset this content's persisted allowance.
+    receipt = session.exec(select(AuditEvent).where(
+        AuditEvent.action == "mpt_content_run_started",
+        AuditEvent.entity_type == "content_run",
+        AuditEvent.actor_type == "admin",
+        AuditEvent.actor_id == "mpt-admin-api",
+        AuditEvent.metadata_json["content_id"].as_string() == content_id,
+    ).order_by(AuditEvent.metadata_json["generation"].as_integer().desc(),
+               AuditEvent.created_at.desc(), AuditEvent.id.desc())).first()
+    if receipt is None:
+        return {"run_id": None, "generation": 0}
+    run = ContentRun.model_validate(receipt.metadata_json)
+    if run.run_id != receipt.entity_id or run.content_id != content_id:
+        raise NonRetryableMediaError("Voice retry originating run proof changed")
+    return {"run_id": run.run_id, "generation": run.generation}
 
 
 def _require_current_qc(session: Session, content_id: str, kind: TaskType, targets: dict) -> AgentTask:
@@ -1571,7 +1600,10 @@ def _advance_after_agent(
                 return
             if content is None or script_task is None or qc_task is None or research_task is None:
                 return
-            if content.business_status == ContentStatus.SCRIPT_REVIEW and content.current_stage == "script_review":
+            if content.business_status == ContentStatus.SCRIPT_REVIEW and (
+                content.current_stage == "script_review"
+                or (content.current_stage == "voice_gate" and content.error_code == "VOICE_FAILED")
+            ):
                 try:
                     current_review = _require_script_assist(session, settings, content_id, require_approval=False)
                 except NonRetryableMediaError as exc:
@@ -1590,7 +1622,10 @@ def _advance_after_agent(
                         if flow.auto_revise_script_from_assist(content_id, current_review) is None:
                             flow.set_error(content_id, "SCRIPT_ASSIST_REVISION_LIMIT", "脚本辅助审核自动修订预算已耗尽")
                         return
-                    flow.set_error(content_id, None, None)
+                    # A retry must retain its pending marker through a crash
+                    # before/during voice IO; only successful advancement clears it.
+                    if content.error_code != "VOICE_FAILED":
+                        flow.set_error(content_id, None, None)
                     return "voice"
             # Manual review suggestions remain persisted for explicit human approval.
             session.add(
@@ -2581,18 +2616,59 @@ def approve_script(
             "provider_endpoint": settings.tts_provider_endpoint,
             "target_duration_sec": float(script.get("estimated_duration_sec") or 0) or None,
         }
+        voice_input_hash = stable_hash({
+            "version": 1, "script": script_proof, "approval": snapshot,
+            "voice_options": {**voice_options, "provider_endpoint": stable_hash(settings.tts_provider_endpoint)},
+            "automatic_scope": _voice_retry_scope(session, content_id) if automatic else None,
+        })
+
+        def voice_attempts():
+            # Count every persisted start, including orphaned RUNNING work after
+            # a crash. The caller's content OS lock excludes another live writer.
+            return len(session.exec(select(StageRun.id).where(
+                StageRun.content_id == content_id, StageRun.stage == "voice",
+                StageRun.input_hash == voice_input_hash,
+            )).all())
+
+        def voice_failed(attempts):
+            if snapshot is not None:
+                _revalidate_script_approval(session, content_id, snapshot)
+            _require_script_assist(session, settings, content_id, automatic=True)
+            content.error_code = "VOICE_FAILED"
+            content.error_message = (
+                f"自动配音未完成，当前运行已尝试 {attempts}/3 次；"
+                "达到上限后停止自动请求。修复配音服务后，可结束旧运行并重新执行继续，保留原脚本审核。"
+            )
+            content.business_status = ContentStatus.SCRIPT_REVIEW
+            content.current_stage = "voice_gate"
+            content.updated_at = utc_now()
+            session.add(content)
+            session.commit()
+
+        if automatic and voice_attempts() >= 3:
+            voice_failed(voice_attempts())
+            raise VoiceRetryExhausted("VOICE_RETRY_EXHAUSTED")
         provider_token = settings.cosyvoice_token.get_secret_value()
         if provider_token:
             voice_options["provider_token"] = provider_token
-        tts_result = log_stage(
-            session,
-            content.id,
-            "voice",
-            lambda: executor.synthesize_voice(
-                script["full_narration"],
-                **voice_options,
-            ),
-        )
+        try:
+            tts_result = log_stage(
+                session,
+                content.id,
+                "voice",
+                lambda: executor.synthesize_voice(
+                    script["full_narration"],
+                    **voice_options,
+                ),
+                input_hash=voice_input_hash,
+            )
+        except Exception as exc:
+            if automatic:
+                attempts = voice_attempts()
+                voice_failed(attempts)
+                if attempts >= 3:
+                    raise VoiceRetryExhausted("VOICE_RETRY_EXHAUSTED") from exc
+            raise
         voice_path = tts_result.audio_path
         voice_duration = tts_result.duration_sec
         timing_evidence = executor.visual_timing_evidence(voice_path, voice_duration)
@@ -2640,7 +2716,6 @@ def approve_script(
                 raise NonRetryableMediaError("Script approval subject changed during voice generation") from exc
         if automatic:
             _require_script_assist(session, settings, content_id, automatic=True)
-        flow.set_error(content_id, None, None)
         # 重新配音后旧画面计划按新时长作废重建。
         if script_task is None:
             raise ValueError("Script task reference is required")
@@ -2691,6 +2766,9 @@ def approve_script(
             flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, plan_input, priority=50)
             if manual_approval:
                 _record_manual_script_approval(session, settings, content_id, snapshot, voice_binding)
+            # Commit the clear with the successful transition, never before it.
+            content.error_code = content.error_message = None
+            session.add(content)
             return flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
         scene_data = json.loads((root / "scenes" / "scenes.json").read_text(encoding="utf-8"))
         scene_tasks = flow.scene_analysis_tasks(content_id)
@@ -2732,6 +2810,8 @@ def approve_script(
         )
         if manual_approval:
             _record_manual_script_approval(session, settings, content_id, snapshot, voice_binding)
+        content.error_code = content.error_message = None
+        session.add(content)
         return flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
 
 

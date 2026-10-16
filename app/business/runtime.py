@@ -1061,6 +1061,8 @@ class BusinessRuntime:
             return True
 
     def recover_agent_results(self, *, lock_timeout_seconds: float = 30, content_id: str | None = None):
+        from app.business.pipeline import VoiceRetryExhausted
+
         with Session(self.engine) as session:
             tasks = session.exec(
                 select(AgentTask.id).where(
@@ -1081,6 +1083,10 @@ class BusinessRuntime:
         for task_id in tasks:
             try:
                 self.consume_agent(task_id, lock_timeout_seconds=lock_timeout_seconds)
+            except VoiceRetryExhausted:
+                # The immutable approved result stays pending until a new
+                # authorized media run. Repeated maintenance performs no IO.
+                pass
             except Exception:
                 logger.exception("Agent consumption pending for %s", task_id)
 
