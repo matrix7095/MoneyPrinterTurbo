@@ -1,22 +1,24 @@
 # MoneyPrinterTurbo 按需生产运行手册
 
-更新：2026-10-17 04:26（Asia/Shanghai）。本页是生产操作入口；按时间排列的排查经过与改写前全文见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先在工作台刷新。
+更新：2026-10-17 04:58（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
 
 ## 当前验收状态
 
-**端到端稳定生产尚未验收。** 已部署的配音修复已通过独立审查、完整业务回归和生产部署核验；第五轮 Aurzen 修复已生成新配音、新视觉计划、8 张新图及一版新成片。下表的业务进度为 04:26（+08）快照；部署与技术核验时间见各证据文件，不代表之后的实时状态。
+**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第五轮新成片正式 QC 未通过，原 run 已正常停止；第六轮已续接，并实证 Worker 收到新合同。下表业务进度为 04:58（+08）快照，部署和技术检查时间见各证据文件。
 
 | 项目 | 已核实状态 |
 | --- | --- |
-| 生产服务 | API `8000`，工作台 `http://127.0.0.1:8510/`；核验时 API worker PID `25328`、启动器 PID `27672`、UI PID `24868`。MPT Runtime Watchdog 启用；旧 Glance Watchdog 停用。 |
+| 生产服务 | API `8000` worker PID `27892`、启动器 PID `17280`；工作台 `http://127.0.0.1:8510/` PID `24868`。认证接口 200、匿名 401、UI health 200；MPT Runtime Watchdog 已恢复启用，旧 Glance Watchdog 停用。 |
 | 生产触发 | 按需从工作台点击“运行一次”。业务定时调度、自动选题关闭；不需要 Gemini 或周期生产任务。 |
-| 代码 | 修复提交 `db64dfb85bf1b0a5603aeca38b669b3ccbf4e93e` 已推送 Main 与实施分支。 |
-| 自动化回归 | 作者 278 项、独立审查 136 项、完整组合回归 **1651 passed**（8513 warnings，进程 exit 0）。 |
-| 当前内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`，run `run_d99827dd187c96ffd8737591677553be`，generation 5；核验时原生 PID `27988`、到期 `04:59:29`（+08），第五轮正式内容 QC 首次结果未通过，当前进入正常恢复。 |
-| 新配音 | asset `asset_a58d0eb08bdc495eb35434a25ac3180b`，SHA-256 `8d67bcf0ef6ba9c727a4b6695a3b0e50f02c11c8e9059961ff6da20c96d045e8`，36.504 秒。 |
-| 新图片与成片 | 8 张新图通过独立素材 QC；原生 941×1672 图片按本轮已授权流程保留原件并适配为 1080×1920。新 final `asset_f1542174fde9466f93d9abb8a7c014de`，SHA-256 `6b002e005be033b132586865e828b69e6cdd1d5bde73bbf61e0756894fc38122`，3,754,404 字节。 |
+| 代码 | 配音修复 `db64dfb85bf1b0a5603aeca38b669b3ccbf4e93e`；规格口播合同修复 `05c43348e31e3bcfb29213535dab00463edc31ec`。两者均已推送 Main 与实施分支；本次部署前 SQLite 备份 quick_check=ok。 |
+| 自动化回归 | 最新合同修复：作者 365 项、独立审查 156 项、完整组合回归 **1686 passed**（8513 warnings，exit 0，957.53 秒）；359 个源码/依赖文件前后一致。此前配音修复完整回归 1651 passed 的证据保留。 |
+| 当前内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`，第六轮 `run_5d5d8e17234d06817c614d4ac4578255`、generation 6、原生 PID `28360`、启动 `04:55:27`、到期 `06:55:27`（+08）。第五轮已 FINISHED/exit 0，无遗留进程或领取。 |
+| 合同实际下发 | 待领取任务 `agt_d7ed0867eeb44c619c41412a80900c69` 的下载 instructions 与 `bundle_served.served_prompt_hash=eecd5131501f98d40a4b11a4ad6352ee80a8f82ab7456b2ef8f3c3daa64a4b6e` 一致；包含新规则，旧全字段原样条款已移除。存档 instructions/input/result 不被改写，领取时正常解析 live 合同。 |
+| 第五轮配音 | asset `asset_a58d0eb08bdc495eb35434a25ac3180b`，SHA-256 `8d67bcf0ef6ba9c727a4b6695a3b0e50f02c11c8e9059961ff6da20c96d045e8`，36.504 秒。 |
+| 第五轮图片与成片 | 8 张新图通过独立素材 QC；原生 941×1672 图片按本轮已授权流程保留原件并适配为 1080×1920。新 final `asset_f1542174fde9466f93d9abb8a7c014de`，SHA-256 `6b002e005be033b132586865e828b69e6cdd1d5bde73bbf61e0756894fc38122`，3,754,404 字节。 |
 | 成片技术核验 | 独立技术核验 **14/14 PASS**：视频 1096 帧、30 fps、1080×1920、首帧 PTS 0；音频 36.504 秒，视频 36.533 秒，与音频时长向上取整到帧边界一致；完整音视频解码、音频相关性，以及 1096 帧图和 274 帧页共 1370 个文件的哈希核对通过。 |
 | 正式内容 QC | `agt_9d76f7b9bcc64887a251b4b66cc18d74` 已 `COMPLETED`、attempt 1，正式结果 `passed=false`，已接受并消费。9 个检查中 7 个通过，音频与字幕同步证据未通过：×及范围连接词仍缺充分读音证据，结果未认定已证实错读。正常恢复任务 `agt_6f12269dcc6b4e75bb9478196ee21814` 已创建，不能跳过门禁发布。 |
+| 第六轮脚本 QC | 旧规则生成的 script822 把技术数字写成全中文，新合同下的脚本 QC `agt_d7ed0867eeb44c619c41412a80900c69` 已正常判定不通过，并创建正常恢复 `agt_110f4119f0964101b9215800dcc7522b`。不为该旧样例放宽数值保真要求。 |
 | 发布 | 尚无本轮真实发布的 `PUBLISHED` 记录、抖音作品 ID、链接及截图。 |
 
 旧成片及其正式音频负面 QC 仍作为历史记录保留，不能充当这版新成片的验收。独立 large-v3 无提示诊断与 medium/int8 结果在语义上相符，但它们不是听回、概率校准或正式 QC；生产 ASR 配置没有更改。仅渲染成功、技术检查通过、任务 `FINISHED` 或上传成功都不代表内容 QC 通过或发布完成。
@@ -33,6 +35,8 @@
 
 ## 故障与续接
 
+规格口播仅允许把已确定含义的乘号/范围连接符改成中文连接词，例如 `1920乘以1080`、`60到80英寸`。保留阿拉伯数字、数值顺序/关系、单位、标称与暗环境等条件；研究和技术展示仍保留规范符号。该例外不允许技术数字全中文化、单位/型号改写或省略条件。字幕随实际口播；每个新版本仍须独立声音与画面 QC。
+
 - **Edge TTS HTTP 403 或配音失败：** 已将固定版本升级到 `edge-tts 7.3.1`，并将同一冻结脚本、审核、配置和 run 的重试限制为三次。失败不会提前消费通过审核；不要手动重置计数或覆盖已有配音。修复后等当前 run 通过正常生命周期到达终态，再从工作台正常启动续接并重新通过所有下游门禁。
 - **原生子任务先开始、父任务后登记：** 已部署 Conductor 事件顺序修复；真实生产中已验证早到的子任务完成事件能被原父任务接收并继续下一阶段。仍活动时观察原子任务，不手动重复派发。若状态与实际进程不一致，保存当前证据并走现有停止/恢复入口，不直接写数据库或伪造 QC/Worker 事件。
 - **Worker 中断或进程故障：** 保留旧任务输入、结果、预算和运行记录；等原生 Worker 与 run 按正常终止路径收尾，再依据最新服务状态使用正常恢复入口。不要把心跳超时单独当作进程退出，也不要用旧版本审核结果放行新配音或新成片。
@@ -42,6 +46,11 @@
 证据目录：`storage/smoke/stable-production-20261013/`。
 
 完整组合回归命令：`python -m pytest test/business test/services/test_video_project.py -q --tb=short`。
+
+- [规格口播合同完整回归 manifest](../storage/smoke/stable-production-20261013/speech-spec-contract-full-regression-manifest-20261017.json)，SHA-256 `46894712d503cea307ef6f18a6efe67a925b27abf781b073e07b8a295f50cbd0`。
+- [合同独立审查](../storage/smoke/stable-production-20261013/speech-spec-independent-review-20261017.json)：APPROVE，156 passed。
+- [实际 Worker 合同下发核验](../storage/smoke/stable-production-20261013/speech-spec-live-bundle-proof-20261017.json)，SHA-256 `0bd65ee339459dc1fbde4c881cc1d914f9d7fcee2d0d582f7a58e509ee4bf829`。
+- [合同部署前核验](../storage/smoke/stable-production-20261013/speech-spec-deployed-preflight-20261017.json)、[第六轮启动记录](../storage/smoke/stable-production-20261013/aurzen-run6-start-20261017.json)、[部署前数据库备份](../storage/smoke/stable-production-20261013/pre-speech-contract-backup-20261017.json)。
 
 - [第五轮启动记录](../storage/smoke/stable-production-20261013/aurzen-run5-start-20261017.json)
 - [第五轮成片独立技术核验（14/14 PASS）](../storage/smoke/stable-production-20261013/release-render-run5-20261017-independent.json)，SHA-256 `a8fc9980d9f404b0f72e57930d949216a0ee06b55cfbd33a7e8b48230bd2f551`
@@ -56,7 +65,7 @@
 
 ## 仍需完成
 
-1. 跟进第五轮已创建的正常恢复，解决规范规格符号与口播易读要求的冲突，依正式修复结果重新制作并对新版本完整复核。不得将 ASR 词置信度单独当作已证实错读，也不得省略连接词核验或沿用旧通过结果。核对本轮实际终态。
+1. 跟进第六轮正常恢复 `agt_110f4119f0964101b9215800dcc7522b`，在原有有限预算内生成符合统一合同的脚本，再正常经过审核、新配音、视觉计划、素材与完整成片 QC。不能改写旧结果、重置预算或用低置信单独认定已证实错读。
 2. 完成发布审核并从正常发布流程取得这版成片对应的真实 `PUBLISHED` 状态、抖音作品 ID、URL 和截图证据。
 3. 用户授权的全机旧数据清理尚未完成。此前剩余候选的逻辑体积为 **25,936,296,584 字节**，不是当前重新汇总值或可释放物理空间。10 月 17 日 03:34 再核实：旧 Glance 为 5,906,578,968 字节、bootstrap 工作树为 9,504,598,141 字节、upstream rehearsal 工作树为 3,605,444,075 字节，未发现对应进程引用。重新授权后的旧数据库备份删除仍被自动审批以 `blocked by policy` 在进程创建前拒绝，upstream 工作树的正常归档也被固定任务保护拒绝；本轮新增删除量为 0。记录见 [本次清理复核](../storage/smoke/stable-production-20261013/cleanup-renewed-authorization-rejection-20261017.json)。
 4. 上述门禁通过并核实发布后，再更新本页验收结论；目前不可称为稳定端到端生产已验收。
