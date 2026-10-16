@@ -172,6 +172,8 @@ def _skip_terminal_recoveries(runtime):
     from app.business.runtime import (
         _require_current_revision,
         _require_reconciled_content,
+        _content_qc_target_changed,
+        QC_PLAN_REJECTED,
         QC_TARGET_REJECTION,
     )
 
@@ -283,6 +285,15 @@ def _skip_terminal_recoveries(runtime):
                     plan = RecoveryPlan.model_validate(recovery.result_data)
                     reason = plan.reason
                     if plan.action != "mark_recovery_blocked":
+                        if not (
+                            (_content_qc_target_changed(recovery.result_data)
+                             and (recovery.input_data.get("failure") or {}).get("source_task_type") == TaskType.CONTENT_QC.value)
+                            or session.exec(select(AuditEvent.id).where(
+                                AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                                AuditEvent.action == QC_PLAN_REJECTED,
+                            )).first()
+                        ):
+                            continue
                         runtime._check_content_qc_rejection_receipt(session, recovery)
                         reason = QC_TARGET_REJECTION
                     blocks = session.exec(

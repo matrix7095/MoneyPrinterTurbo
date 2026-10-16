@@ -22,6 +22,7 @@ from glance_core.models import (
     utc_now,
 )
 from test.business import test_content_qc_recovery as qc_recovery
+from test.business import test_bundle_failure_recovery as bundle_recovery
 
 from test.business.test_agent_failure_recovery import (
     registered_client,
@@ -34,6 +35,7 @@ from app.business.maintenance import INTERVAL, TERMINAL_SCAN_CURSOR, Maintenance
 from app.business.runtime import AGENT_CONSUMED, QC_PLAN_REJECTED
 from glance_core.task_service import TaskConflictError
 from glance_core.content_acceptance import acceptance_subject, verify_acceptance
+from test.business.test_discovery_http import ADMIN
 
 
 failed_qc = qc_recovery.failed_qc
@@ -62,6 +64,51 @@ def terminal(failed_qc, request):
     )
     enable(runtime, handsfree_auto_topic_enabled=False)
     return runtime, content_id, recovery.id, qc_id
+
+
+@pytest.mark.parametrize("new_qc_pending", [False, True])
+def test_consumed_context_recovery_is_not_a_qc_target_rejection(failed_qc, caplog, new_qc_pending):
+    runtime, http, content_id, root, source_id, recovery_id = bundle_recovery.legacy_accepted_chain(failed_qc)
+    response = http.post(f"/api/v1/agent/tasks/{source_id}/retry-recovery", headers=ADMIN)
+    assert response.status_code == 200, response.text
+    assert runtime.consume_agent(recovery_id)
+    enable(runtime, handsfree_auto_topic_enabled=False)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        assert (content.business_status, content.current_stage) == (ContentStatus.FAILED, "recovery_blocked")
+        if new_qc_pending:
+            # Model the later pending stage only; this regression does not render or approve a new video.
+            runtime.workflow_service(session).create_agent_task(
+                content_id, TaskType.CONTENT_QC, {"fixture_new_render_revision": True},
+                schema_version="3", allow_multiple=True,
+            )
+            content.business_status, content.current_stage = ContentStatus.WAITING_AGENT, "content_qc"
+            content.error_code, content.error_message = None, None
+            session.add(content)
+            session.commit()
+            session.refresh(content)
+        before_content = content.model_dump(mode="json")
+        before_tasks = {task.id: task.model_dump(mode="json") for task in session.exec(
+            select(AgentTask).where(AgentTask.content_id == content_id),
+        ).all()}
+    before_files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    caplog.clear()
+    for now in (utc_now() + INTERVAL, utc_now() + INTERVAL * 2):
+        assert runtime.maintenance.run(now=now)["skipped"] == 0
+        assert runtime.consume_agent(recovery_id) is False
+    assert "RECOVERY_QC_REJECTION_RECEIPT_CHANGED" not in caplog.text
+    with Session(runtime.engine) as session:
+        assert session.get(Content, content_id).model_dump(mode="json") == before_content
+        assert {task.id: task.model_dump(mode="json") for task in session.exec(
+            select(AgentTask).where(AgentTask.content_id == content_id),
+        ).all()} == before_tasks
+        assert len(session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == recovery_id, AuditEvent.action == AGENT_CONSUMED,
+        )).all()) == 1
+        assert not session.exec(select(AuditEvent.id).where(
+            AuditEvent.entity_id == content_id, AuditEvent.action == "handsfree_content_skipped",
+        )).first()
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before_files
 
 
 def test_real_maintenance_archives_consumed_terminal_once_and_preserves_history(
