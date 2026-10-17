@@ -149,6 +149,12 @@ class StopRunRequest(StrictRequest):
     expected_binding: ExpectedHostBinding
 
 
+class ReconcileHostLossRequest(StrictRequest):
+    launch_id: str = Field(pattern=r"^[0-9a-f]{32}$", strict=True)
+    run_id: str = Field(pattern=r"^run_[0-9a-f]{32}$", strict=True)
+    generation: int = Field(ge=1, strict=True)
+
+
 class SpawnIntentRequest(StrictRequest):
     generation: int = Field(ge=1, strict=True)
     host_epoch: int = Field(ge=1, strict=True)
@@ -185,7 +191,7 @@ class HostObservationRequest(StrictRequest):
 
 
 class HostIntentRecord(StrictRequest):
-    state: Literal["SPAWN_INTENT", "VERIFIED", "CLAIMED", "TERMINAL", "REJECTED", "UNKNOWN", "OBSERVATION_LOST"]
+    state: Literal["SPAWN_INTENT", "VERIFIED", "CLAIMED", "TERMINAL", "REJECTED", "UNKNOWN", "OBSERVATION_LOST", "ABANDONED_BEFORE_CLAIM"]
     host_epoch: int = Field(ge=1, strict=True)
     offer_hash: str = Field(min_length=1)
     child: NativeChild | None

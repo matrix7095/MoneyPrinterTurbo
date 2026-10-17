@@ -12,15 +12,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from glance_core.models import AgentWorker, AuditEvent, Content, RuntimeSetting, utc_now
+from glance_core.database import begin_immediate
+from glance_core.models import (
+    AgentSubmission, AgentTask, AgentWorker, AuditEvent, Content, PublicationRecord,
+    RuntimeSetting, SchedulerOffer, TaskStatus, TaskType, as_utc, utc_now,
+)
 from glance_core.scheduler_profiles import load_scheduler_config
-from glance_core.task_service import TaskConflictError
+from glance_core.task_service import TaskConflictError, stable_hash
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
 
 from app.business.conductor import ConductorError, SchedulerPlanner
 from app.business.consumption import content_operation_lock
-from app.business.content_run import get_run, start_run
+from app.business.content_run import OFFER_ACTION, get_run, invalidate_offers, load_run, save_run, start_run
 from app.business.scheduler import VERIFIED, tree_hash
 
 PREFIX = "mpt_content_execution_v1:"
@@ -80,13 +84,14 @@ def _load(session, content_id):
         raise TaskConflictError("CONTENT_EXECUTION_RECORD_INVALID") from None
 
 
-def _save(session, record):
+def _save(session, record, *, commit=True):
     for key in (PREFIX + record.content_id, PREFIX + record.run_id):
         row = session.get(RuntimeSetting, key) or RuntimeSetting(key=key, value="")
         row.value = record.model_dump_json()
         row.updated_at = utc_now()
         session.add(row)
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def launch_command(runtime, session, run):
@@ -336,3 +341,205 @@ def stop_execution(runtime, session, content_id):
             raise TaskConflictError("CONTENT_EXECUTION_HOST_BINDING_CHANGED")
         get_run(session, content_id, stop=True, expected_binding=binding)
         return _view(runtime, session, record)
+
+
+HOST_LOSS_RECONCILED = "mpt_content_execution_host_loss_reconciled"
+
+
+def process_absence_proof(pid):
+    """Only Windows' nonexistent-PID error proves absence; never inspect or kill it."""
+    import ctypes
+    from ctypes import wintypes
+
+    if os.name != "nt" or type(pid) is not int or not 0 < pid <= 0xFFFFFFFF:
+        raise TaskConflictError("CONTENT_EXECUTION_PROCESS_PROOF_UNAVAILABLE")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
+        kernel.CloseHandle(handle)
+        raise TaskConflictError("CONTENT_EXECUTION_PROCESS_STILL_EXISTS")
+    error = ctypes.get_last_error()
+    if error != 87:
+        raise TaskConflictError("CONTENT_EXECUTION_PROCESS_PROOF_UNAVAILABLE")
+    return {"pid": pid, "winerror": error}
+
+
+def _reconcilable_intents(session, run, journal):
+    from app.business.content_host import accepted_binding, claim_summary, offer_receipt, validate_child
+    from app.business.requests import NativeChild
+
+    pending = []
+    if set(journal["intents"]) != set(run.intents):
+        raise TaskConflictError("CONTENT_EXECUTION_JOURNAL_CHANGED")
+    receipts = session.exec(select(AuditEvent).where(
+        AuditEvent.action == OFFER_ACTION,
+        AuditEvent.metadata_json["worker"]["run_id"].as_string() == run.run_id,
+    )).all()
+    if {row.entity_id for row in receipts} != set(run.intents):
+        raise TaskConflictError("CONTENT_EXECUTION_UNRESOLVED_OFFERS")
+    for request_id, intent in run.intents.items():
+        worker, offer_hash = offer_receipt(session, request_id)
+        task = session.get(AgentTask, worker["task_id"])
+        local = journal["intents"][request_id]
+        offer = session.get(SchedulerOffer, request_id)
+        if (
+            task is None or (offer is None and intent["state"] != "TERMINAL")
+            or worker.get("run_id") != run.run_id or worker.get("run_generation") != run.generation
+            or worker.get("content_id") != run.content_id or task.content_id != run.content_id
+            or worker.get("request_id") != request_id or worker.get("host_epoch") != run.host_epoch
+            or worker.get("task_type") != task.task_type.value or task.task_type == TaskType.DOUYIN_PUBLISH
+            or worker.get("input_hash") != task.input_hash or stable_hash(task.input_data) != task.input_hash
+            or (offer is not None and (
+                offer.task_id != task.id or offer.agent_id != worker.get("agent_id") or offer.task_type != task.task_type.value
+            ))
+            or intent["offer_hash"] != offer_hash or intent["host_epoch"] != run.host_epoch
+            or any(local.get(key) != value for key, value in {
+                "request_id": request_id, "task_id": task.id, "host_epoch": run.host_epoch,
+                "offer_hash": offer_hash,
+                "issued_prompt_sha256": hashlib.sha256(worker["prompt"].encode()).hexdigest(),
+            }.items())
+        ):
+            raise TaskConflictError("CONTENT_EXECUTION_TASK_BINDING_CHANGED")
+        if intent["state"] == "TERMINAL":
+            child = NativeChild.model_validate(intent["child"])
+            validate_child(run, worker, child, terminal=True)
+            summary = claim_summary(session, intent)
+            binding = accepted_binding(session, task, task.assigned_agent_id)
+            if (
+                not summary or not summary["accepted"] or not summary["consumed"]
+                or summary["task_id"] != task.id or summary["claim_id"] != intent["claim_id"]
+                or summary["accepted_result_hash"] != summary["consumed_result_hash"]
+                or local.get("child") != intent["child"] or local.get("last_observation") != "TERMINAL"
+                or local.get("business") != summary
+                or run.offer_children.get(request_id) != child.child_id
+                or task.started_at is None
+                or not binding or any(binding.get(key) != value for key, value in {
+                    "claim_id": intent["claim_id"], "run_id": run.run_id, "generation": run.generation,
+                    "host_epoch": run.host_epoch, "request_id": request_id, "offer_hash": offer_hash,
+                    "task_id": task.id, "agent_id": worker["agent_id"], "child_id": child.child_id,
+                    "parent_thread_id": run.parent_thread_id,
+                    "lease_token_hash": task.lease_token_hash,
+                    "started_at": as_utc(task.started_at).isoformat() if task.started_at else None,
+                }.items())
+            ):
+                raise TaskConflictError("CONTENT_EXECUTION_PRIOR_WORK_UNPROVEN")
+            continue
+        events = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+        )).all()
+        if (
+            intent["state"] != "SPAWN_INTENT" or intent["child"] is not None or intent["claim_id"] is not None
+            or request_id in run.offer_children or task.task_type != TaskType.RECOVERY
+            or task.status != TaskStatus.PENDING or task.attempt != 0
+            or any(getattr(task, key) is not None for key in (
+                "assigned_agent_id", "lease_token_hash", "lease_expires_at", "started_at",
+                "attempt_started_at", "last_heartbeat_at", "completed_at", "result_data",
+                "error_code", "error_message",
+            ))
+            or local.get("state") != "SPAWN_SEND_INTENT"
+            or any(local.get(key) is not None for key in ("child", "started", "business", "last_observation", "claim_id"))
+            or any(event.action not in {"created", "recovery_task_created", "mpt_task_owned"} for event in events)
+            or any(event.action == "mpt_task_owned" and event.metadata_json.get("input_hash") != task.input_hash for event in events)
+            or session.exec(select(AgentSubmission.id).where(AgentSubmission.task_id == task.id)).first()
+        ):
+            raise TaskConflictError("CONTENT_EXECUTION_UNCLAIMED_RECOVERY_UNPROVEN")
+        pending.append((request_id, task))
+    if len(pending) != 1:
+        raise TaskConflictError("CONTENT_EXECUTION_UNCLAIMED_RECOVERY_UNPROVEN")
+    return pending[0]
+
+
+def reconcile_host_loss(runtime, session, content_id, *, expected):
+    """Explicitly release one unclaimed recovery only after both host PIDs are gone."""
+    from app.business.content_host import host_live
+
+    with content_operation_lock(runtime.settings, "execution:" + content_id):
+        begin_immediate(session)
+        try:
+            repeated = session.exec(select(AuditEvent).where(
+                AuditEvent.action == HOST_LOSS_RECONCILED, AuditEvent.entity_id == expected.run_id,
+            )).one_or_none()
+            if repeated:
+                if repeated.metadata_json["expected"] != expected.model_dump() or repeated.metadata_json["content_id"] != content_id:
+                    raise TaskConflictError("CONTENT_EXECUTION_RECONCILIATION_BINDING_CHANGED")
+                session.rollback()
+                return repeated.metadata_json["response"]
+            record = _load(session, content_id)
+            run = load_run(session)
+            if (
+                record is None or run is None or session.get(Content, content_id) is None
+                or record.launch_id != expected.launch_id or record.run_id != expected.run_id
+                or record.generation != expected.generation or run.run_id != expected.run_id
+                or run.generation != expected.generation or run.content_id != content_id
+                or record.launch_id in _handles or record.state != "UNKNOWN"
+                or record.error_code != "CONTENT_EXECUTION_OBSERVATION_LOST"
+                or run.state != "running" or run.stop_requested or not run.host_epoch
+                or not run.host_observed_at or host_live(run) or not run.parent_thread_id or not run.process_identity
+                or not record.pid or not record.process_started_at or not record.binary_sha256
+                or record.exit_code is not None or record.exited_at is not None
+            ):
+                raise TaskConflictError("CONTENT_EXECUTION_RECONCILIATION_BINDING_CHANGED")
+            archived = session.get(RuntimeSetting, PREFIX + record.run_id)
+            if archived is None or LaunchRecord.model_validate_json(archived.value) != record:
+                raise TaskConflictError("CONTENT_EXECUTION_RECORD_CHANGED")
+            if (
+                datetime.fromisoformat(record.process_started_at).tzinfo is None
+                or datetime.fromisoformat(run.process_identity["started_at"]).tzinfo is None
+                or len(record.binary_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in record.binary_sha256)
+            ):
+                raise TaskConflictError("CONTENT_EXECUTION_RECORD_CHANGED")
+            path = runtime.settings.data_dir / "private" / "content-runs" / record.run_id / "state.json"
+            if path != path.resolve():
+                raise TaskConflictError("CONTENT_EXECUTION_JOURNAL_CHANGED")
+            original = path.read_bytes()
+            journal = json.loads(original)
+            if journal.get("version") != 1 or any(journal.get(key) != getattr(run, key) for key in (
+                "content_id", "run_id", "generation", "host_epoch", "parent_thread_id", "process_identity",
+            )):
+                raise TaskConflictError("CONTENT_EXECUTION_JOURNAL_CHANGED")
+            if (
+                session.exec(select(AgentTask.id).where(
+                    AgentTask.content_id == content_id,
+                    (AgentTask.task_type == TaskType.DOUYIN_PUBLISH) | AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+                )).first()
+                or session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first()
+            ):
+                raise TaskConflictError("CONTENT_EXECUTION_BUSINESS_WORK_UNRESOLVED")
+            request_id, task = _reconcilable_intents(session, run, journal)
+            proofs = [process_absence_proof(record.pid), process_absence_proof(run.process_identity["pid"])]
+            if path.read_bytes() != original:
+                raise TaskConflictError("CONTENT_EXECUTION_JOURNAL_CHANGED")
+            before = record.model_dump()
+            binding = {key: getattr(run, key) for key in (
+                "run_id", "generation", "host_epoch", "parent_thread_id", "process_identity",
+            )}
+            run.intents[request_id] = {**run.intents[request_id], "state": "ABANDONED_BEFORE_CLAIM"}
+            run.state, run.stop_requested, run.stop_reason = "stopped", True, "host_process_exit"
+            invalidate_offers(session, run)
+            save_run(session, run, "mpt_content_run_host_exit_reconciled")
+            record.state, record.error_code = "FAILED", "CONTENT_EXECUTION_HOST_EXIT_CONFIRMED"
+            record.exited_at = utc_now().isoformat()
+            _save(session, record, commit=False)
+            response = {**record.model_dump(), "run_state": run.state, "stop_requested": True, "host_ready": False, "can_stop": False}
+            session.add(AuditEvent(
+                actor_type="admin", actor_id="mpt-admin-api", entity_type="content_run", entity_id=run.run_id,
+                action=HOST_LOSS_RECONCILED, metadata_json={
+                    "expected": expected.model_dump(), "content_id": content_id, "previous_launch": before,
+                    "binding": binding, "process_absence_proofs": proofs,
+                    "journal_sha256": hashlib.sha256(original).hexdigest(), "request_id": request_id,
+                    "task_id": task.id, "task_input_hash": task.input_hash, "response": response,
+                },
+            ))
+            session.commit()
+            return response
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            session.rollback()
+            raise TaskConflictError("CONTENT_EXECUTION_RECONCILIATION_UNPROVEN") from exc
+        except Exception:
+            session.rollback()
+            raise

@@ -7,7 +7,8 @@ from glance_core.task_service import TaskConflictError
 from sqlmodel import Session
 
 from app.business.auth import require_admin
-from app.business.conductor_launch import execute_content, execution_view, stop_execution
+from app.business.conductor_launch import execute_content, execution_view, reconcile_host_loss, stop_execution
+from app.business.requests import ReconcileHostLossRequest
 from app.business.runtime import get_runtime, get_session
 
 router = APIRouter(prefix="/api/v1", tags=["Content"], dependencies=[Depends(require_admin)])
@@ -55,3 +56,8 @@ def execution(*, content_id: str, request: Request, session: Annotated[Session, 
 def stop(*, content_id: str, request: Request, session: Annotated[Session, Depends(get_session)], payload: Annotated[object | None, Body()] = None):
     _empty_request(payload)
     return _operation(stop_execution, request, session, content_id)
+
+
+@router.post("/contents/{content_id}/execution/reconcile-host-loss")
+def reconcile(*, content_id: str, request: Request, session: Annotated[Session, Depends(get_session)], payload: ReconcileHostLossRequest):
+    return _operation(reconcile_host_loss, request, session, content_id, expected=payload)
