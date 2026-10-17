@@ -846,6 +846,10 @@ realtime_motion_observed=false，realtime_motion_required 如实判断；limitat
 不能用帧序列推定速度观感、平滑感、杂音或音乐平衡已验证。
 pages[] 必须按顺序覆盖每页（page_index/sha256/frame_indices/observed=true/observation），
 每页 observation 写实际看见的具体内容与时码，不复制模板或声称只核对hash即观察过。
+按小批顺序实际打开全部页，每批在本任务工作区保存本轮自己的逐页观察进度笔记，再接续下一批；
+需要压缩上下文时从自己的笔记接续，不能把其他任务/审核者的观察当作本轮已看过。
+页数多或任务较长本身不构成无法审核的证据；继续使用可用工具直到全部核验。
+真实工具失败或确实无法观察时仍须诚实非通过，保留已观察范围与实际错误，不虚构观察。
 segments[] 覆盖全部计划段：segment_index/frame_index/pts_sec/motion_continuous/observation，
 结合实际原生观察、逐帧位移和独立ASR，写画面身份、旁白对应、字幕显示与运动/重复缺陷。
 boundaries[] 覆盖所有相邻段切换，boundary_index 与左右实际frame_index，
@@ -982,6 +986,18 @@ _RECOVERY = """\
   成片画面问题可指定 `visual_plan`，服务端会携带上一版计划、脚本和场景上下文重新规划。
   先对照研究和原始证据核验质检意见；质检意见可能误认产品或术语，不能直接当成事实。
   相互矛盾的整改要求必须在恢复计划中说明取舍依据，禁止累积执行互不相容的要求。
+  极窄的成片覆盖补审：源任务为 schema v3 CONTENT_QC，唯一 error 的 field=visual_review，
+  冻结 manifest 每页都有匹配SHA/帧索引的结果行但部分 observed=false，facts/technical 通过，
+  且需保留同一成片、音频、完整页包及全部上游时，可以明确选择
+  action=create_repair_task、target_task_type=content_qc。不得声称其他未通过硬项已通过。
+  acceptance_checks 必须包含 CONTENT_QC_SAME_SUBJECT_FULL_REVIEW_V1 和
+  CONTENT_QC_ALL_NINE_HARD_GATES；evidence_refs 包含确切源QC任务ID；must_change、
+  must_preserve、must_not_do 明确要求新审核者自己从第0页重审全部页和全部九项，保留原负向
+  结果及同一subject，禁止继承旧观察、改媒体或重置预算。这些是新恢复计划的明确承诺，
+  不能作为旧结果“没有物理缺陷”的证明；新完整审核仍须拒绝任何真实缺陷或证据不足。
+  历史冻结 lineage.target_task_type=short_script/repair_target_task_id 为旧脚本时，保持原样，
+  它仍是原恢复来源锚点；仅上述明确content_qc计划可请求服务端窄补审，原轮次/root不变。
+  short_script、空目标或其他action绝不能暗中转换成补审；不符合上述条件仍走原修复门禁。
 - `repair_task_context`：任务包或依赖上下文有误时创建新的修复任务，修复后的输入必须由
   服务端白名单重建。
 - `rebuild_bundle`：仅在上下文文件清单不完整时请求服务端重建任务包。

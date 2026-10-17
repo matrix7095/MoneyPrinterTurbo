@@ -37,6 +37,10 @@ FAILURE_RECOVERY_RECONCILED = "mpt_bundle_failure_recovery_reconciled"
 QC_RECOVERY = "mpt_content_qc_recovery_created"
 QC_PLAN_REJECTED = "mpt_content_qc_recovery_plan_rejected"
 QC_TARGET_REJECTION = "RECOVERY_QC_TARGET_CHANGED"
+QC_REINSPECTION = "mpt_content_qc_reinspection_created"
+QC_REINSPECTION_CHECKS = frozenset({
+    "CONTENT_QC_SAME_SUBJECT_FULL_REVIEW_V1", "CONTENT_QC_ALL_NINE_HARD_GATES",
+})
 
 
 def _content_qc_target_changed(result):
@@ -782,7 +786,11 @@ class BusinessRuntime:
                     if marker is not None:
                         if marker.metadata_json.get("result_hash") != stable_hash(recovery.result_data):
                             raise TaskConflictError("RECOVERY_SOURCE_RESULT_CHANGED")
-                        if _content_qc_target_changed(recovery.result_data):
+                        if session.exec(select(AuditEvent.id).where(
+                            AuditEvent.entity_id == task_id, AuditEvent.action == QC_REINSPECTION,
+                        )).first():
+                            self._check_content_qc_reinspection_receipt(session, recovery)
+                        elif _content_qc_target_changed(recovery.result_data):
                             self._check_content_qc_rejection_receipt(session, recovery)
                         return False
                     self._require_accepted_native_task(session, recovery, consumed=False)
@@ -794,7 +802,10 @@ class BusinessRuntime:
                     from app.business.pipeline import workflow
                     flow = workflow(session, effective_settings(session, self.settings))
                     flow.tasks = self.task_service(session)
-                    if (result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
+                    if (result.get("action") == "create_repair_task" and result.get("target_task_type") == "content_qc"
+                            and QC_REINSPECTION_CHECKS.issubset(result.get("acceptance_checks", []))):
+                        repair = self._create_content_qc_reinspection(session, recovery, source, script, flow)
+                    elif (result.get("action") in {"create_repair_task", "reroute_to_role", "repair_task_context"}
                             and (result.get("target_task_type") or "short_script") != "short_script"):
                         metadata = self._content_qc_rejection_metadata(recovery, source, script)
                         if session.exec(select(AuditEvent.id).where(
@@ -823,6 +834,151 @@ class BusinessRuntime:
                     raise TaskConflictError(str(exc)) from exc
                 finally:
                     session.rollback()
+
+    @staticmethod
+    def _content_qc_reinspection_metadata(recovery, source, script, child):
+        return {"recovery_input_hash": recovery.input_hash, "recovery_result_hash": stable_hash(recovery.result_data),
+                "source_task_id": source.id, "source_input_hash": source.input_hash,
+                "source_result_hash": stable_hash(source.result_data), "source_attempt": source.attempt,
+                "legacy_target_task_id": script.id, "legacy_target_input_hash": script.input_hash,
+                "legacy_target_result_hash": stable_hash(script.result_data),
+                "lineage": deepcopy(recovery.input_data["lineage"]), "child_task_id": child.id,
+                "child_input_hash": child.input_hash, "subject": deepcopy(source.input_data["acceptance_subject"]),
+                "manifest_sha256": source.input_data["visual_evidence"]["manifest_sha256"],
+                "acceptance_receipt_artifact_id": child.input_data["acceptance_receipt_artifact_id"]}
+
+    def _check_content_qc_reinspection_receipt(self, session, recovery):
+        self._require_accepted_native_task(session, recovery, consumed=True)
+        receipts = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == QC_REINSPECTION,
+        )).all()
+        children = session.exec(select(AgentTask).where(
+            AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
+        )).all()
+        source = session.get(AgentTask, recovery.input_data["failure"]["source_task_id"])
+        script = session.get(AgentTask, recovery.input_data["lineage"]["repair_target_task_id"])
+        if (len(receipts) != 1 or receipts[0].actor_type != "system" or receipts[0].actor_id != "mpt-content-qc"
+                or len(children) != 1 or source is None or script is None):
+            raise TaskConflictError("RECOVERY_QC_REINSPECTION_RECEIPT_CHANGED")
+        child = children[0]
+        if (child.task_type != TaskType.CONTENT_QC or child.schema_version != "3"
+                or child.content_id != recovery.content_id or stable_hash(child.input_data) != child.input_hash
+                or receipts[0].metadata_json != self._content_qc_reinspection_metadata(recovery, source, script, child)
+                or session.exec(select(AuditEvent.id).where(
+                    AuditEvent.entity_id == recovery.id, AuditEvent.action == QC_PLAN_REJECTED,
+                )).first()):
+            raise TaskConflictError("RECOVERY_QC_REINSPECTION_RECEIPT_CHANGED")
+        _require_owned_input(session, child)
+        self._require_accepted_native_task(session, source, consumed=True)
+        self._require_accepted_native_task(session, script, consumed=True)
+        self._require_accepted_native_task(session, session.get(AgentTask, source.input_data["upstream_task_ids"]["visual_plan"]), consumed=True)
+        self._check_content_qc_recovery_receipt(session, recovery, source, script)
+        from app.business.bundles import sha256_file
+        content = session.get(Content, child.content_id)
+        receipt = session.get(Artifact, child.input_data.get("acceptance_receipt_artifact_id"))
+        root = Path(content.content_dir).resolve() if content else None
+        path = (root / receipt.relative_path).resolve() if root and receipt else None
+        if (root is None or not root.is_relative_to(self.settings.content_dir.resolve())
+                or receipt is None or receipt.content_id != child.content_id or receipt.artifact_type != "acceptance_input"
+                or not path.is_relative_to(root) or not path.is_file() or path.stat().st_size != receipt.size_bytes
+                or sha256_file(path) != receipt.sha256 or json.loads(path.read_text(encoding="utf-8")) != child.input_data):
+            raise TaskConflictError("RECOVERY_QC_REINSPECTION_RECEIPT_CHANGED")
+
+    def _create_content_qc_reinspection(self, session, recovery, source, script, flow):
+        from glance_core.content_acceptance import is_handsfree_content
+        from glance_core.task_schemas import RecoveryPlan
+        from glance_media.executor import MediaExecutor
+        from app.business.pipeline import _write_acceptance_receipt
+
+        plan = RecoveryPlan.model_validate(recovery.result_data)
+        self._require_accepted_native_task(session, script, consumed=True)
+        self._require_accepted_native_task(session, session.get(AgentTask, source.input_data["upstream_task_ids"]["visual_plan"]), consumed=True)
+        result, inputs = source.result_data, source.input_data
+        lineage, failure = recovery.input_data["lineage"], recovery.input_data["failure"]
+        policy = recovery.input_data.get("policy") or {}
+        current = effective_settings(session, self.settings)
+        content = session.get(Content, source.content_id)
+        signature = flow._root_cause_signature("BUSINESS_QC", "CONTENT_QC_FAILED")
+        rounds = [item for item in flow._recovery_history(source.content_id)
+                  if item["root_cause_signature"] == signature]
+        origins = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+            AuditEvent.action == "recovery_task_created",
+        )).all()
+        expected_origin = {"source_task_id": source.id, "failure_class": "BUSINESS_QC", "code": "CONTENT_QC_FAILED",
+                           "root_cause_signature": signature, "round": lineage.get("round"), "target_task_id": script.id}
+        limits = [lineage.get("max_rounds"), policy.get("max_rounds"), current.recovery_max_rounds]
+        if (plan.failure_class != "BUSINESS_QC" or plan.action != "create_repair_task"
+                or plan.target_task_type != "content_qc" or source.id not in plan.evidence_refs
+                or not QC_REINSPECTION_CHECKS.issubset(plan.acceptance_checks)
+                or not plan.must_change or not plan.must_preserve or not plan.must_not_do
+                or any("create_repair_task" not in actions for actions in
+                       (recovery.input_data.get("allowed_actions", []), policy.get("allowed_actions", [])))
+                or policy.get("enabled") is not True or not current.recovery_enabled
+                or any(type(limit) is not int or limit < 1 for limit in limits)
+                or type(lineage.get("round")) is not int or not 1 <= lineage["round"] <= min(limits)
+                or lineage["round"] != len(rounds) or lineage.get("root_cause_signature") != signature
+                or lineage.get("root_task_id") != (inputs.get("lineage") or {}).get("root_task_id", source.id)
+                or lineage.get("parent_task_id") != source.id or lineage.get("content_id") != source.content_id
+                or lineage.get("source_attempt") != source.attempt
+                or lineage.get("target_task_type") != "short_script" or lineage.get("same_task_retries") != 0
+                or lineage.get("repair_fingerprint") != flow._repair_fingerprint(
+                    source, failure_class="BUSINESS_QC", code="CONTENT_QC_FAILED")
+                or failure.get("code") != "CONTENT_QC_FAILED" or failure.get("retryable") is not False
+                or failure.get("validation_errors") != result.get("issues")
+                or len(origins) != 1 or origins[0].actor_type != "system" or origins[0].actor_id != "mpt-content-qc"
+                or origins[0].metadata_json != expected_origin
+                or content is None or (content.business_status, content.current_stage) != (ContentStatus.WAITING_AGENT, "recovery")):
+            raise TaskConflictError("RECOVERY_QC_REINSPECTION_NOT_ALLOWED")
+        issues, review = result.get("issues", []), result.get("visual_review") or {}
+        visual = inputs.get("visual_evidence") or {}
+        manifest = visual.get("manifest") or {}
+        pages, observations = manifest.get("pages", []), review.get("pages", [])
+        # This proves missing coverage, not the absence of a physical defect; all nine checks run anew.
+        if (source.schema_version != "3" or len(issues) != 1 or issues[0].get("severity") != "error"
+                or issues[0].get("field") != "visual_review" or issues[0].get("segment_index") is not None
+                or any(result.get("checks", {}).get(key, {}).get("passed") is not True for key in ("facts", "technical"))
+                or review.get("method") != "native_contact_pages_asr_pcm"
+                or review.get("video_sha256") != inputs["acceptance_subject"]["video_sha256"]
+                or review.get("manifest_sha256") != visual.get("manifest_sha256")
+                or review.get("realtime_motion_required") is not False or review.get("realtime_motion_observed") is not False
+                or not pages or len(observations) != len(pages)
+                or any(type(row.get("observed")) is not bool or any(row.get(key) != page.get(key)
+                       for key in ("page_index", "sha256", "frame_indices"))
+                       for row, page in zip(observations, pages, strict=True))
+                or not 0 < sum(row["observed"] for row in observations) < len(pages)):
+            raise TaskConflictError("RECOVERY_QC_REINSPECTION_NOT_ALLOWED")
+        if (session.exec(select(AgentTask.id).where(
+                AgentTask.content_id == source.content_id, AgentTask.id != recovery.id,
+                AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
+            )).first() or session.exec(select(AgentTask.id).where(
+                AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
+            )).first() or session.exec(select(AuditEvent.id).where(
+                AuditEvent.entity_id == recovery.id, AuditEvent.action.in_([QC_REINSPECTION, QC_PLAN_REJECTED,
+                                                                           "recovery_blocked", "recovery_escalated"]),
+            )).first()):
+            raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
+        if session.exec(select(AuditEvent.id).where(
+            AuditEvent.entity_type == "publish_intent",
+            AuditEvent.metadata_json["content_id"].as_string() == source.content_id,
+        )).first():
+            raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
+        new_input = deepcopy(inputs)
+        new_input.update(recovery_task_id=recovery.id, previous_acceptance_task_id=source.id,
+                         lineage=deepcopy(lineage), recovery_plan=plan.model_dump(mode="json"))
+        _write_acceptance_receipt(session, content, MediaExecutor(Path(content.content_dir)), new_input)
+        child = flow.create_agent_task(source.content_id, TaskType.CONTENT_QC, new_input, priority=60,
+                                       allow_multiple=True, schema_version="3",
+                                       handsfree=is_handsfree_content(session, source.content_id))
+        session.add(AuditEvent(actor_type="system", actor_id="mpt-content-qc", entity_type="agent_task",
+                               entity_id=recovery.id, action=QC_REINSPECTION,
+                               metadata_json=self._content_qc_reinspection_metadata(recovery, source, script, child)))
+        content.business_status, content.current_stage = ContentStatus.WAITING_AGENT, "content_qc"
+        content.error_code, content.error_message = None, None
+        content.updated_at = utc_now()
+        session.add(content)
+        return child
 
     def _failure_recovery_needs_apply(self, session, recovery):
         receipts = session.exec(select(AuditEvent).where(
@@ -975,7 +1131,13 @@ class BusinessRuntime:
                     raise ValueError("Consumed Agent result changed")
                 if kind == TaskType.RECOVERY:
                     _require_owned_input(session, task)
-                if kind == TaskType.RECOVERY and (
+                reinspection = kind == TaskType.RECOVERY and session.exec(select(AuditEvent.id).where(
+                    AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+                    AuditEvent.action == QC_REINSPECTION,
+                )).first()
+                if reinspection:
+                    self._check_content_qc_reinspection_receipt(session, task)
+                elif kind == TaskType.RECOVERY and (
                     (_content_qc_target_changed(task.result_data)
                      and (task.input_data or {}).get("failure", {}).get("source_task_type") == TaskType.CONTENT_QC.value)
                     or session.exec(select(AuditEvent.id).where(
