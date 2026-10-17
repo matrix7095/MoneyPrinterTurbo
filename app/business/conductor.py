@@ -453,6 +453,9 @@ class NativeTransport:
                 "-c",
                 "features.multi_agent=true",
                 "-c",
+                # Large-image remote compaction mitigation; transport recovery is not guaranteed.
+                "features.enable_request_compression=false",
+                "-c",
                 "model_auto_compact_token_limit=65536",
             ],
             cwd=workspace,

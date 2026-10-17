@@ -1342,10 +1342,16 @@ def test_scheduler_uses_ps7_argument_array_not_service_command_text(
     assert kwargs["creationflags"] == getattr(c.subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch):
+def test_native_transport_uses_process_local_runtime_configuration(
+    tmp_path, monkeypatch
+):
     import io
 
     calls = []
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[features]\nenable_request_compression = true\n", encoding="utf-8"
+    )
     process = SimpleNamespace(
         pid=111,
         stdin=io.StringIO(),
@@ -1359,17 +1365,22 @@ def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch)
         return process
 
     monkeypatch.setattr(c.subprocess, "Popen", popen)
-    transport = c.NativeTransport(
-        c.NativeDesktopBinary(tmp_path / "codex.exe", "a" * 64, "0.162"), tmp_path
-    )
-    assert calls[0][0][1:] == [
+    binary = c.NativeDesktopBinary(tmp_path / "codex.exe", "a" * 64, "0.162")
+    transport = c.NativeTransport(binary, tmp_path)
+    assert calls[0][0] == [
+        str(binary.path),
         "app-server",
         "--stdio",
         "-c",
         "features.multi_agent=true",
         "-c",
+        "features.enable_request_compression=false",
+        "-c",
         "model_auto_compact_token_limit=65536",
     ]
+    assert config.read_text(encoding="utf-8") == (
+        "[features]\nenable_request_compression = true\n"
+    )
     assert calls[0][1]["shell"] is False
     assert calls[0][1]["creationflags"] == getattr(c.subprocess, "CREATE_NO_WINDOW", 0)
     assert not transport.process_alive()
