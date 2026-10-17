@@ -870,6 +870,13 @@ event_index/word_indices/observed_sync/observation；word_indices 为 audio_evid
 token概率升高或同系列Whisper相互一致可作为补充线索，但本身不能证明相应连接词
 已被听清或全部音频硬项通过。应结合实际成片音轨证据核验数字、单位及关系，不得把
 字幕或TTS原文当作实际读音证据或回填低置信ASR词。
+仅冻结输入 audio_review_policy_version=2 时，词概率低于0.7不自动否决；
+必须在相应 subtitle_alignment.observation 逐项解释每个低置信词的索引、原时段、
+是否涉及关键数字/单位/关系及实际核验依据，并在 checks.audio/subtitles.evidence 汇总结论。
+服务端仅绑定完整词覆盖、时码和物理证据，不把自由文本解释当作机器证明语义正确。
+未声明或版本1仍使用旧概率门槛，不能因提示更新或再次签发采用版本2。
+整词区间至少有声不要求词中点一定有声；句尾ASR拖入停顿不能单凭中点静音判缺字。
+PCM只证明信号，不能证明发音或关键语义；仍须以实际独立成片音频证据核验。
 关键关系低置信且无法凭独立证据消歧时，audio必须false并定位时段；
 任何关键关系缺乏充分证据时也必须false。静音/削波、
 其他音频硬项或任一九项硬项

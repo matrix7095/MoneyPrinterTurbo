@@ -92,9 +92,58 @@ def joint_pack(tmp_path):
     return tmp_path, evidence, review, audio, plan
 
 
-def verify(pack, *, passed=True):
+def verify(pack, *, passed=True, audio_review_policy_version=1):
     root, evidence, review, audio, plan = pack
-    verify_visual_joint_evidence(root, evidence, review, audio, plan, passed=passed)
+    verify_visual_joint_evidence(root, evidence, review, audio, plan, passed=passed,
+                                 audio_review_policy_version=audio_review_policy_version)
+
+
+def test_low_probability_is_a_review_locator_only_for_prospective_policy(joint_pack):
+    joint_pack[3]["segments"][0]["words"][0]["probability"] = .69
+    joint_pack[2]["subtitle_alignment"][0]["observation"] = (
+        "词索引0，原0–1秒，产品身份词；独立ASR及同成片词区间PCM与画面来源对应。"
+        "此为合成契约测试，不声称实际听回；没有未消歧的数字、单位或关系。"
+    )
+    with pytest.raises(ValueError, match="SUBTITLE_ASR_MISMATCH"):
+        verify(joint_pack)
+    verify(joint_pack, audio_review_policy_version=2)
+
+
+@pytest.mark.parametrize("policy", [True, False, "2", 2.0, None, 0, 3])
+@pytest.mark.parametrize("passed", [True, False])
+def test_unknown_audio_policy_is_never_accepted(joint_pack, policy, passed):
+    with pytest.raises(ValueError, match="AUDIO_REVIEW_POLICY_VERSION_UNSUPPORTED"):
+        verify(joint_pack, passed=passed, audio_review_policy_version=policy)
+
+
+@pytest.mark.parametrize("probability", [None, True, "0.9", -0.1, 1.1, float("nan"), float("inf")])
+def test_prospective_policy_preserves_raw_probability_validation(joint_pack, probability):
+    joint_pack[3]["segments"][0]["words"][0]["probability"] = probability
+    with pytest.raises(ValueError, match="ASR_PROBABILITY_INVALID"):
+        verify(joint_pack, audio_review_policy_version=2)
+
+
+@pytest.mark.parametrize("fault", ["time", "silence", "missing_word", "no_observation"])
+def test_prospective_low_confidence_review_does_not_waive_physical_gates(joint_pack, fault):
+    word = joint_pack[3]["segments"][0]["words"][0]
+    word["probability"] = .69
+    if fault == "time":
+        word.update(start_sec=.8, end_sec=1.8)
+    elif fault == "silence":
+        joint_pack[3]["signal"]["rms_dbfs"][:10] = [-100] * 10
+    elif fault == "missing_word":
+        joint_pack[3]["segments"][1]["words"].append(
+            {"word": "未覆盖", "start_sec": 1.1, "end_sec": 1.9, "probability": .9}
+        )
+    else:
+        joint_pack[2]["subtitle_alignment"][0]["observation"] = ""
+    with pytest.raises(ValueError):
+        verify(joint_pack, audio_review_policy_version=2)
+
+
+def test_silent_midpoint_does_not_mean_the_whole_word_is_silent(joint_pack):
+    joint_pack[3]["signal"]["rms_dbfs"][4:7] = [-100] * 3
+    verify(joint_pack, audio_review_policy_version=2)
 
 
 def test_complete_observed_pack_can_support_but_does_not_decide_qc(joint_pack):
@@ -261,6 +310,11 @@ def test_new_v3_issuance_http_pages_heartbeat_submission_and_publish_binding(tmp
     runtime = make_runtime(tmp_path / "http")
     with TestClient(content_app(runtime)) as http:
         content_id, evidence, review, audio, review_input = seed_joint(runtime, joint_pack)
+        audio["segments"][0]["words"][0]["probability"] = .69
+        review["subtitle_alignment"][0]["observation"] = (
+            "索引0，原0–1秒产品词，低置信定位已核对独立ASR与同final PCM；"
+            "合成契约证据，不宣称原生听回，不包含未消歧的关键关系。"
+        )
         monkeypatch.setattr(MptMediaExecutor, "final_audio_evidence", lambda *args, **kwargs: deepcopy(audio))
         monkeypatch.setattr(pipeline, "_collect_visual_evidence", lambda *args: deepcopy(evidence))
         with Session(runtime.engine) as session:
@@ -271,6 +325,7 @@ def test_new_v3_issuance_http_pages_heartbeat_submission_and_publish_binding(tmp
         assert claimed["status"] == "CLAIMED"
         bundle = client.bundle(claimed["bundle_url"], claimed["lease_token"])
         assert bundle["task"]["schema_version"] == "3"
+        assert bundle["input"]["audio_review_policy_version"] == 2
         assert "受限 image_card 联合证据验收" in bundle["instructions"]
         pages = [row for row in bundle["context_manifest"] if row["name"].startswith("page-")]
         assert len(pages) == 2
@@ -291,14 +346,141 @@ def test_new_v3_issuance_http_pages_heartbeat_submission_and_publish_binding(tmp
                              for key in CONTENT_ACCEPTANCE_CHECKS}}
         submitted = client.complete(claimed["task_id"], claimed["lease_token"], "script-worker", result)
         assert submitted["status"] == "COMPLETED"
+        assert client.complete(claimed["task_id"], claimed["lease_token"], "script-worker", result) == submitted
         with Session(runtime.engine) as session:
             task = session.get(AgentTask, claimed["task_id"])
             assert task.schema_version == "3"
+            assert task.result_data == result  # No new result fields or normalization defaults.
             verify_acceptance(session, task, task.result_data)
+            frozen_input = task.input_data
+            task.input_data = {**frozen_input, "audio_review_policy_version": 1}
+            with pytest.raises(ValueError, match="snapshot changed"):
+                verify_acceptance(session, task, task.result_data)
+            task.input_data = frozen_input
             path = pipeline.verify_publish_ready(session, runtime.settings, content_id)
             path.write_bytes(b"changed final")
             with pytest.raises(ValueError, match="video file|video hash"):
                 pipeline.verify_publish_ready(session, runtime.settings, content_id)
+
+
+@pytest.mark.parametrize("status", list(TaskStatus))
+@pytest.mark.parametrize("original_policy", [None, 1, 2, True, "2", 3])
+def test_reissued_qc_inherits_first_policy_regardless_of_prior_status(
+    tmp_path, joint_pack, monkeypatch, status, original_policy
+):
+    from app.business.media_executor import MptMediaExecutor
+    from glance_core.task_service import stable_hash
+    from sqlmodel import select
+
+    runtime = make_runtime(tmp_path / "history")
+    with TestClient(content_app(runtime)):
+        content_id, evidence, _, audio, review_input = seed_joint(runtime, joint_pack)
+        monkeypatch.setattr(MptMediaExecutor, "final_audio_evidence", lambda *args, **kwargs: deepcopy(audio))
+        monkeypatch.setattr(pipeline, "_collect_visual_evidence", lambda *args: deepcopy(evidence))
+        with Session(runtime.engine) as session:
+            inputs = deepcopy(review_input)
+            if original_policy is not None:
+                inputs["audio_review_policy_version"] = original_policy
+            old = pipeline.workflow(session, runtime.settings).create_agent_task(content_id, TaskType.CONTENT_QC, inputs)
+            old.status = status
+            session.add(old)
+            session.commit()
+            session.refresh(old)
+            snapshot = old.model_dump(mode="json")
+            # A caller's requested policy can never override the first frozen QC.
+            if original_policy is not None and (type(original_policy) is not int or original_policy not in {1, 2}):
+                with pytest.raises(ValueError, match="AUDIO_REVIEW_POLICY_VERSION_UNSUPPORTED"):
+                    pipeline._issue_acceptance(session, runtime.settings, session.get(Content, content_id), review_input)
+                assert session.get(AgentTask, old.id).model_dump(mode="json") == snapshot
+                return
+            pipeline._issue_acceptance(session, runtime.settings, session.get(Content, content_id),
+                                       {**review_input, "audio_review_policy_version": 2})
+            issued = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                  AgentTask.task_type == TaskType.CONTENT_QC, AgentTask.id != old.id)).one()
+            assert issued.input_data["audio_review_policy_version"] == (original_policy or 1)
+            assert stable_hash(issued.input_data) == issued.input_hash
+            receipt = session.get(Artifact, issued.input_data["acceptance_receipt_artifact_id"])
+            path = Path(session.get(Content, content_id).content_dir) / receipt.relative_path
+            assert json.loads(path.read_text(encoding="utf-8")) == issued.input_data
+            assert session.get(AgentTask, old.id).model_dump(mode="json") == snapshot
+
+
+@pytest.mark.parametrize("policy", ["absent", 1, 2, True, "2", None, 3])
+def test_recovery_evidence_projects_only_verified_explicit_policy(tmp_path, joint_pack, monkeypatch, policy):
+    from app.business.media_executor import MptMediaExecutor
+    from glance_core.task_service import stable_hash
+    from sqlmodel import select
+
+    runtime = make_runtime(tmp_path / "projection")
+    with TestClient(content_app(runtime)):
+        content_id, evidence, _, audio, review_input = seed_joint(runtime, joint_pack)
+        monkeypatch.setattr(MptMediaExecutor, "final_audio_evidence", lambda *args, **kwargs: deepcopy(audio))
+        monkeypatch.setattr(pipeline, "_collect_visual_evidence", lambda *args: deepcopy(evidence))
+        with Session(runtime.engine) as session:
+            pipeline._issue_acceptance(session, runtime.settings, session.get(Content, content_id), review_input)
+            task = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
+                                AgentTask.task_type == TaskType.CONTENT_QC)).one()
+            inputs = deepcopy(task.input_data)
+            inputs.pop("audio_review_policy_version")
+            if policy != "absent":
+                inputs["audio_review_policy_version"] = policy
+            task.input_data, task.input_hash = inputs, stable_hash(inputs)
+            projected = pipeline.workflow(session, runtime.settings)._recovery_current_input(task)
+            binding = projected["acceptance_evidence"]["visual_evidence_binding"]
+            if type(policy) is int and policy in {1, 2}:
+                assert binding["audio_review_policy_version"] == policy
+            else:
+                assert "audio_review_policy_version" not in binding
+                if policy != "absent":
+                    assert any("audio_review_policy_version" in gap for gap in projected["evidence_gaps"])
+            # Even a valid-looking marker is unavailable when its frozen hash changed.
+            task.input_hash = "bad"
+            unverified = pipeline.workflow(session, runtime.settings)._recovery_current_input(task)
+            assert "acceptance_evidence" not in unverified
+
+
+@pytest.mark.parametrize("policy", [None, 2, True, 3])
+def test_manual_stalled_qc_rebuild_keeps_source_policy(tmp_path, joint_pack, monkeypatch, policy):
+    from app.business.media_executor import MptMediaExecutor
+
+    runtime = make_runtime(tmp_path / "manual-rebuild")
+    with TestClient(content_app(runtime)):
+        content_id, evidence, _, audio, bare = seed_joint(runtime, joint_pack)
+        monkeypatch.setattr(MptMediaExecutor, "final_audio_evidence", lambda *args, **kwargs: deepcopy(audio))
+        monkeypatch.setattr(pipeline, "_collect_visual_evidence", lambda *args: deepcopy(evidence))
+        with Session(runtime.engine) as session:
+            content = session.get(Content, content_id)
+            root = Path(content.content_dir)
+            pack = (root / evidence["manifest_path"]).parent
+            frozen = {**bare, "audio_evidence_version": 1, "audio_evidence": audio,
+                      "visual_evidence_version": 1, "visual_evidence": evidence,
+                      "context_files": [evidence["manifest_path"], *[
+                          (pack / item["path"]).relative_to(root).as_posix()
+                          for item in [*evidence["manifest"]["frames"], *evidence["manifest"]["pages"],
+                                       evidence["manifest"]["subtitles"]]]]}
+            if policy is not None:
+                frozen["audio_review_policy_version"] = policy
+            refs = {**bare["upstream_task_ids"], "video_artifact_id": bare["video_artifact_id"]}
+            frozen["acceptance_subject"] = acceptance_subject(session, content_id, refs, source_context_version=1,
+                                                             audio_evidence=audio, visual_evidence=evidence)
+            pipeline._write_acceptance_receipt(session, content, pipeline.MediaExecutor(root), frozen)
+            source = pipeline.workflow(session, runtime.settings).create_agent_task(
+                content_id, TaskType.CONTENT_QC, frozen, schema_version="3")
+            source.status = TaskStatus.FAILED
+            content.business_status, content.current_stage = ContentStatus.FAILED, "content_qc_failed"
+            session.add(source)
+            session.add(content)
+            session.commit()
+            session.refresh(source)
+            snapshot = source.model_dump(mode="json")
+        if type(policy) is bool or policy == 3:
+            with pytest.raises(ValueError, match="AUDIO_REVIEW_POLICY_VERSION_UNSUPPORTED"):
+                pipeline.repair_stalled_content_qc(runtime.engine, runtime.settings, content_id)
+        else:
+            _, child = pipeline.repair_stalled_content_qc(runtime.engine, runtime.settings, content_id)
+            assert child.input_data["audio_review_policy_version"] == (policy or 1)
+        with Session(runtime.engine) as session:
+            assert session.get(AgentTask, source.id).model_dump(mode="json") == snapshot
 
 
 @pytest.mark.parametrize("fault", ["missing_page", "foreign_video", "missing_subtitle", "hard_check"])
@@ -460,13 +642,15 @@ def real_capped_motion(request, tmp_path_factory):
     subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-loop", "1", "-i", str(asset),
                     "-vf", template, "-frames:v", str(frames_count), "-threads", "1", "-c:v", "libx264",
                     "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p", str(normal_video)],
-                   check=True, capture_output=True, timeout=120)
+                   check=True, capture_output=True, timeout=120,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     early_video = root / "early.mp4"
     subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(normal_video), "-vf",
                     "trim=end_frame=30,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=12",
                     "-frames:v", str(frames_count), "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast",
                     "-qp", "0", "-pix_fmt", "yuv420p", str(early_video)],
-                   check=True, capture_output=True, timeout=120)
+                   check=True, capture_output=True, timeout=120,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     plan = {"segments": [{"asset_id": "motion-source", "layout": "image_card", "motion": motion,
                            "transition": "hard_cut", "narration_start_sec": 0, "narration_end_sec": duration}]}
     packs = {}

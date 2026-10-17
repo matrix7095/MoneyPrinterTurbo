@@ -1023,12 +1023,15 @@ def joint_visual_plan_supported(plan: dict) -> bool:
 
 
 def verify_visual_joint_evidence(root: Path, evidence: dict, review: dict | None,
-                                 audio: dict, plan: dict, *, passed: bool) -> None:
+                                 audio: dict, plan: dict, *, passed: bool,
+                                 audio_review_policy_version: int = 1) -> None:
     """Bind native observations to every frozen page, frame and independent audio word.
 
     Generated coverage never implies observation. These checks detect only exact
     repeated decoded frames; semantic/subjective defects remain reviewer hard gates.
     """
+    if type(audio_review_policy_version) is not int or audio_review_policy_version not in {1, 2}:
+        raise ValueError("AUDIO_REVIEW_POLICY_VERSION_UNSUPPORTED")
     root = root.resolve()
 
     def checked_path(base, relative, sha):
@@ -1169,6 +1172,10 @@ def verify_visual_joint_evidence(root: Path, evidence: dict, review: dict | None
     if not words:
         raise ValueError("VISUAL_REVIEW_ASR_WORDS_MISSING")
     for word in words:
+        probability = word.get("probability")
+        if (type(probability) not in {int, float} or not isfinite(probability)
+                or not 0 <= probability <= 1):
+            raise ValueError("VISUAL_REVIEW_ASR_PROBABILITY_INVALID")
         if not 0 <= seconds(word["start_sec"]) < seconds(word["end_sec"]) <= end + .1:
             raise ValueError("VISUAL_REVIEW_ASR_TIME_INVALID")
         begin, finish = int(seconds(word["start_sec"]) / .1), int(seconds(word["end_sec"]) / .1)
@@ -1184,8 +1191,8 @@ def verify_visual_joint_evidence(root: Path, evidence: dict, review: dict | None
         first, last = words[indices[0]], words[indices[-1]]
         if (abs(seconds(first["start_sec"]) - seconds(event["start_sec"])) > .4
                 or abs(seconds(last["end_sec"]) - seconds(event["end_sec"])) > .4
-                or any(not isfinite(float(words[i].get("probability", 0)))
-                       or float(words[i].get("probability", 0)) < .7 for i in indices)):
+                or (audio_review_policy_version == 1
+                    and any(words[i]["probability"] < .7 for i in indices))):
             raise ValueError("VISUAL_REVIEW_SUBTITLE_ASR_MISMATCH")
         covered.extend(indices)
     if covered != list(range(len(words))):
@@ -1254,4 +1261,5 @@ def verify_acceptance(session: Session, task: AgentTask, result: dict, *, _archi
         content = session.get(Content, task.content_id)
         plan = resolved_visual_plan(session, session.get(AgentTask, refs["visual_plan"]))
         verify_visual_joint_evidence(Path(content.content_dir), visual,
-                                     decision.visual_review.model_dump(mode="json"), audio, plan, passed=decision.passed)
+                                     decision.visual_review.model_dump(mode="json"), audio, plan, passed=decision.passed,
+                                     audio_review_policy_version=task.input_data.get("audio_review_policy_version", 1))

@@ -78,6 +78,8 @@ def incomplete_qc(failed_qc, joint_pack, request):
         full_review = deepcopy(review)
         review["pages"][1].update(observed=False, observation="Not observed in this review.")
         frozen = deepcopy(old.input_data)
+        if getattr(request, "param", None) == "policy2":
+            frozen["audio_review_policy_version"] = 2
         frozen.update(visual_evidence_version=1, visual_evidence=evidence, audio_evidence=audio,
                       context_files=[evidence["manifest_path"], *[
                           (pack_root / item["path"]).relative_to(root).as_posix()
@@ -135,6 +137,7 @@ def submit_plan(case, plan=None):
                               plan or reinspection_plan(qc_id))
 
 
+@pytest.mark.parametrize("incomplete_qc", [None, "policy2"], indirect=True)
 def test_pending_legacy_recovery_creates_one_same_subject_review_without_rewriting_history(incomplete_qc):
     runtime, _, content_id, qc_id, _, root, recovery, _ = incomplete_qc
     with Session(runtime.engine) as session:
@@ -151,6 +154,7 @@ def test_pending_legacy_recovery_creates_one_same_subject_review_without_rewriti
         child = children[0]
         assert child.schema_version == "3" and child.status == TaskStatus.PENDING and child.attempt == 0
         assert child.input_data["acceptance_subject"] == original["input_data"]["acceptance_subject"]
+        assert child.input_data.get("audio_review_policy_version") == original["input_data"].get("audio_review_policy_version")
         for key in ("visual_evidence", "audio_evidence", "upstream_task_ids", "video_artifact_id"):
             assert child.input_data[key] == original["input_data"][key]
         assert child.input_data["lineage"] == original_recovery["lineage"]

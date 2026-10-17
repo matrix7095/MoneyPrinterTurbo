@@ -2416,7 +2416,8 @@ def repair_stalled_content_qc(
             if stable_hash(source_input) != source.input_hash or current != source_input.get("acceptance_subject"):
                 raise ValueError("ACCEPTANCE_MATERIALS_CHANGED")
             verify_visual_joint_evidence(root, old_visual, None, source_input["audio_evidence"],
-                                         resolved_visual_plan(session, plan_task), passed=False)
+                                         resolved_visual_plan(session, plan_task), passed=False,
+                                         audio_review_policy_version=source_input.get("audio_review_policy_version", 1))
             pack_root = (root / old_visual["manifest_path"]).parent.resolve()
             input_data["context_files"] = [path for path in context_files
                                            if not (root / path).resolve().is_relative_to(pack_root)]
@@ -3211,7 +3212,20 @@ def _issue_acceptance(
             visual_evidence=visual,
         ),
     }
+    complete_input.pop("audio_review_policy_version", None)
     if visual is not None:
+        # A new offer cannot upgrade content that has ever received an older QC contract.
+        first_qc = session.exec(select(AgentTask).where(
+            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_QC,
+        ).order_by(AgentTask.created_at.asc(), AgentTask.id.asc())).first()
+        policy = 2
+        if first_qc is not None:
+            if stable_hash(first_qc.input_data) != first_qc.input_hash:
+                raise ValueError("acceptance task snapshot changed")
+            policy = first_qc.input_data.get("audio_review_policy_version", 1)
+        if type(policy) is not int or policy not in {1, 2}:
+            raise ValueError("AUDIO_REVIEW_POLICY_VERSION_UNSUPPORTED")
+        complete_input["audio_review_policy_version"] = policy
         complete_input.update(visual_evidence_version=1, visual_evidence=visual)
         pack_root = (executor.root / visual["manifest_path"]).parent
         complete_input["context_files"] = list(dict.fromkeys([

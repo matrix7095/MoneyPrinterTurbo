@@ -1458,6 +1458,12 @@ class WorkflowService:
                         "page_count": len(manifest.get("pages", [])),
                         "generated_only": True,
                     }
+                    if "audio_review_policy_version" in task.input_data:
+                        policy = task.input_data["audio_review_policy_version"]
+                        if type(policy) is int and policy in {1, 2}:
+                            current["acceptance_evidence"]["visual_evidence_binding"]["audio_review_policy_version"] = policy
+                        else:
+                            gaps.append("audio_review_policy_version: frozen policy unsupported")
 
         def references(owner: AgentTask | None) -> dict:
             refs = owner.input_data.get("upstream_task_ids") if owner else None

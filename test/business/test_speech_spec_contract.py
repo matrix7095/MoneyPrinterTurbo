@@ -126,6 +126,11 @@ def test_content_qc_v3_distinguishes_asr_formatting_uncertainty_from_unresolved_
     assert "其他音频硬项或任一九项硬项" in text
     assert "证据不足/失败仍必须false" in text
     assert "九硬项仍全部需要" in text
+    assert "仅冻结输入 audio_review_policy_version=2 时，词概率低于0.7不自动否决" in text
+    assert "原时段" in text and "是否涉及关键数字/单位/关系及实际核验依据" in text
+    assert "未声明或版本1仍使用旧概率门槛" in text
+    assert "整词区间至少有声不要求词中点一定有声" in text
+    assert "PCM只证明信号，不能证明发音或关键语义" in text
     if not custom:
         assert "ASR低置信、静音/削波或硬项判断不足不能通过。" not in text
 
