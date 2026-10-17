@@ -230,7 +230,7 @@ def run_view(session, run):
     }
 
 
-def start_run(session, content_id, *, allow_local_image_adaptation=None):
+def start_run(session, content_id, *, allow_local_image_adaptation=None, execution=None, runtime=None):
     if allow_local_image_adaptation is not None and type(allow_local_image_adaptation) is not bool:
         raise TaskConflictError("CONTENT_RUN_PERMISSION_INVALID")
     begin_immediate(session)
@@ -254,6 +254,30 @@ def start_run(session, content_id, *, allow_local_image_adaptation=None):
                 raise TaskConflictError("CONTENT_RUN_PERMISSION_FROZEN")
             session.commit()
             return run_view(session, existing)
+    resume = None
+    authorization_failure = session.exec(select(AgentTask.id).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == "asset_generate_image",
+        AgentTask.status == TaskStatus.FAILED,
+        AgentTask.error_code == "LOCAL_IMAGE_AUTHORIZATION_MISSING",
+    )).first() if runtime is not None and content.current_stage == "recovery_blocked" else None
+    if authorization_failure is not None:
+        from app.business.image_authorization_recovery import prepare_resume
+
+        try:
+            resume = prepare_resume(runtime, session, content, existing, execution, allow_local_image_adaptation)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            session.rollback()
+            raise TaskConflictError("CONTENT_IMAGE_AUTHORIZATION_RESUME_UNVERIFIED") from exc
+    else:
+        from app.business.image_authorization_recovery import has_unfinished_resume, retry_unstarted_run
+
+        if has_unfinished_resume(session, content_id):
+            if existing and existing.content_id == content_id and retry_unstarted_run(
+                session, existing, execution, allow_local_image_adaptation,
+            ):
+                session.commit()
+                return run_view(session, existing)
+            raise TaskConflictError("CONTENT_IMAGE_AUTHORIZATION_RESUME_UNVERIFIED")
     now = utc_now()
     run = ContentRun(
         run_id="run_" + secrets.token_hex(16),
@@ -265,6 +289,16 @@ def start_run(session, content_id, *, allow_local_image_adaptation=None):
         allow_local_image_adaptation=allow_local_image_adaptation is True,
     )
     save_run(session, run, "mpt_content_run_started")
+    if resume is not None:
+        from app.business.image_authorization_recovery import apply_resume
+
+        source, proof = resume
+        apply_resume(session, source, proof, run)
+        content.business_status = ContentStatus.WAITING_AGENT
+        content.current_stage = "asset_generate"
+        content.error_code = content.error_message = None
+        content.updated_at = now
+        session.add(content)
     if allow_local_image_adaptation is not None:
         session.add(AuditEvent(
             actor_type="admin", actor_id="mpt-admin-api", entity_type="content_run",
@@ -320,6 +354,10 @@ def scoped_offer_clause(session=None):
             SchedulerOffer.expires_at > utc_now(),
         )
     )
+    # This once-resumed task belongs to its new native permit even before an offer exists.
+    offered |= AgentTask.id.in_(select(AuditEvent.entity_id).where(
+        AuditEvent.action == "mpt_image_authorization_changed", AuditEvent.entity_type == "agent_task",
+    ))
     if session is None:
         return offered
     from app.business.content_host import reserved_tasks
@@ -345,6 +383,10 @@ def authorize_claim(session, *, agent_id, task_id, role_id, runtime_info, scope)
         )
         if (
             receipts
+            or (task_id and session.exec(select(AuditEvent.id).where(
+                AuditEvent.action == "mpt_image_authorization_changed",
+                AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task_id,
+            )).first())
             or task_id in reserved_tasks(session)
             or (
                 task_id

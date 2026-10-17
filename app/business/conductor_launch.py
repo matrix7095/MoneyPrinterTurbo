@@ -271,8 +271,17 @@ def execute_content(runtime, session, content_id, *, allow_local_image_adaptatio
             if existing.allow_local_image_adaptation != allow_local_image_adaptation:
                 raise TaskConflictError("CONTENT_RUN_PERMISSION_FROZEN")
             return _view(runtime, session, existing)
-        run = start_run(session, content_id, allow_local_image_adaptation=allow_local_image_adaptation)
-        if existing and existing.run_id == run["run_id"]:
+        run = start_run(session, content_id, allow_local_image_adaptation=allow_local_image_adaptation,
+                        runtime=runtime, execution=existing)
+        retry_start = (existing and existing.state == "FAILED"
+                       and existing.error_code == "CONTENT_EXECUTION_START_FAILED"
+                       and run["state"] == "awaiting_host" and not run["host_epoch"])
+        if retry_start:
+            from app.business.content_run import load_run
+            from app.business.image_authorization_recovery import receipt_for_run
+
+            retry_start = receipt_for_run(session, load_run(session)) is not None
+        if existing and existing.run_id == run["run_id"] and not retry_start:
             return _view(runtime, session, existing)
         if run["host_epoch"] or run["state"] != "awaiting_host":
             raise TaskConflictError("CONTENT_EXECUTION_HOST_ALREADY_BOUND")
