@@ -451,6 +451,8 @@ class NativeTransport:
                 "--stdio",
                 "-c",
                 "features.multi_agent=true",
+                "-c",
+                "model_auto_compact_token_limit=65536",
             ],
             cwd=workspace,
             stdin=subprocess.PIPE,

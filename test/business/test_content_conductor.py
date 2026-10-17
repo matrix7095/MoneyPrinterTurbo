@@ -1366,6 +1366,8 @@ def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch)
         "--stdio",
         "-c",
         "features.multi_agent=true",
+        "-c",
+        "model_auto_compact_token_limit=65536",
     ]
     assert calls[0][1]["shell"] is False
     assert calls[0][1]["creationflags"] == getattr(c.subprocess, "CREATE_NO_WINDOW", 0)
