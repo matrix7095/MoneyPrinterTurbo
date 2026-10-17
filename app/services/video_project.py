@@ -162,6 +162,7 @@ def _tool_version(executable: str) -> str:
             text=True,
             check=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return result.stdout.splitlines()[0]
     except (OSError, subprocess.SubprocessError, IndexError) as exc:
@@ -513,7 +514,11 @@ class VideoProject:
             secured_arguments.append(argument)
         with tempfile.TemporaryFile() as errors:
             process = subprocess.Popen(
-                secured_arguments, stdout=subprocess.PIPE, stderr=errors, text=True
+                secured_arguments,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             deadline = time.monotonic() + timeout
             try:

@@ -292,6 +292,7 @@ def run_command(args: list[str], *, cwd: Path, timeout: int = 600) -> None:
         timeout=timeout,
         check=False,
         shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if completed.returncode:
         stderr = completed.stderr or ""
@@ -321,6 +322,7 @@ def probe(path: Path) -> dict[str, Any]:
         timeout=60,
         check=True,
         shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return json.loads(completed.stdout)
 
@@ -525,6 +527,7 @@ def available_ffmpeg_filters() -> frozenset[str]:
             timeout=30,
             check=False,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return frozenset()
@@ -1849,6 +1852,7 @@ class MediaExecutor:
                 capture_output=True,
                 check=True,
                 timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             samples = array("h")
             samples.frombytes(result.stdout)
