@@ -81,6 +81,9 @@ def _failed_segment_indexes(issues: list, segment_count: int) -> set[int] | None
             path = re.fullmatch(
                 r"segments\[(0|[1-9][0-9]*)\](?:\.([a-z_]+)(?:\.([a-z_]+))?)?", issue.field
             )
+            asset_path = re.fullmatch(
+                r"assets\[(0|[1-9][0-9]*)\]\.request\.([a-z_]+)", issue.field
+            )
             if path:
                 field, nested = path.group(2, 3)
                 if field and field not in VisualSegment.model_fields:
@@ -89,6 +92,11 @@ def _failed_segment_indexes(issues: list, segment_count: int) -> set[int] | None
                     return None
                 field_index = int(path.group(1))
                 if index is not None and index != field_index:
+                    return None
+                index = field_index
+            elif asset_path:
+                field_index = int(asset_path.group(1))
+                if asset_path.group(2) not in AssetRequest.model_fields or index != field_index:
                     return None
                 index = field_index
             elif issue.field not in (VisualSegment.model_fields | AssetRequest.model_fields) and (

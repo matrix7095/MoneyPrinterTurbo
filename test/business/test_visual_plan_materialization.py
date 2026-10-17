@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from glance_core.database import create_db
 from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent, Candidate, CandidateStatus, Content, ContentStatus, ProductionMode, RightsStatus, SchedulerOffer, TaskStatus, TaskType, utc_now
 from glance_core.task_service import stable_hash
+from glance_core.workflow import _failed_segment_indexes
 from glance_media.executor import sha256_file
 from sqlmodel import Session, select
 
@@ -21,6 +22,140 @@ from test.business.test_discovery_http import make_runtime
 from test.business.test_discovery_http import ADMIN
 from test.business.test_deployment_http import app_for
 from test.business.test_agent_failure_recovery import registered_client
+
+
+@pytest.mark.parametrize(
+    ("field", "segment_index", "segment_count", "expected"),
+    [
+        ("assets[7].request.subject", 7, 8, {7}),
+        ("assets[7].request.seed", 7, 8, {7}),
+        ("assets[7].request.subject", None, 8, None),
+        ("assets[7].request.subject", 6, 8, None),
+        ("assets[7].request.subject", True, 8, None),
+        ("assets[7].request.subject", "7", 8, None),
+        ("assets[8].request.subject", 8, 8, None),
+        ("assets[7].request.unknown", 7, 8, None),
+        ("assets[0].request.subject", 7, 8, None),
+    ],
+)
+def test_failed_segment_indexes_accepts_only_exact_asset_request_indexes(
+    field, segment_index, segment_count, expected
+):
+    issue = {"severity": "error", "field": field, "message": "invalid asset", "segment_index": segment_index}
+    assert _failed_segment_indexes([issue], segment_count) == expected
+
+
+def test_failed_segment_indexes_preserves_legacy_segment_and_plain_asset_fields():
+    assert _failed_segment_indexes(
+        [{"severity": "error", "field": "segments[1].purpose", "message": "invalid"}], 3
+    ) == {1}
+    assert _failed_segment_indexes(
+        [{"severity": "error", "field": "assets", "message": "invalid", "segment_index": 1}], 3
+    ) == {1}
+
+
+def test_recovery_reuses_only_qc_good_generated_segments(image_contract):
+    runtime, content_id, plan_id, generation_id, qc_id, first_image_id, _ = image_contract
+    issue = {
+        "severity": "error",
+        "field": "assets[1].request.subject",
+        "message": "second image subject is incorrect",
+        "segment_index": 1,
+    }
+    with Session(runtime.engine) as session:
+        plan = session.get(AgentTask, plan_id)
+        generation = session.get(AgentTask, generation_id)
+        qc = session.get(AgentTask, qc_id)
+        content = session.get(Content, content_id)
+        flow = runtime.workflow_service(session)
+
+        second_path = Path(content.content_dir) / "second-image.png"
+        second_path.write_bytes(b"second-generated-image")
+        second = Artifact(
+            content_id=content_id,
+            artifact_type="agent_generated_image",
+            relative_path=second_path.name,
+            sha256=sha256_file(second_path),
+            size_bytes=second_path.stat().st_size,
+            mime_type="image/png",
+            producer_stage=generation_id,
+        )
+        session.add(second)
+        session.flush()
+        second_image_id = second.id
+
+        request = deepcopy(generation.input_data["requests"][0]["asset_request"])
+        generation.input_data = deepcopy(generation.input_data)
+        generation.input_data["requests"].append({"segment_index": 1, "asset_request": request})
+        generation.input_hash = stable_hash(generation.input_data)
+        owned = session.exec(
+            select(AuditEvent).where(AuditEvent.entity_id == generation_id, AuditEvent.action == OWNED)
+        ).one()
+        owned.metadata_json = {"input_hash": generation.input_hash}
+        generation.result_data = {
+            "images": [
+                *generation.result_data["images"],
+                {"segment_index": 1, "artifact_id": second.id},
+            ]
+        }
+
+        first_segment = deepcopy(plan.result_data["segments"][0])
+        first_segment["asset_id"] = first_image_id
+        second_segment = {
+            **deepcopy(first_segment),
+            "asset_id": second.id,
+            "narration_start_sec": 3.0,
+            "narration_end_sec": 6.0,
+        }
+        plan.result_data = {"segments": [first_segment, second_segment]}
+
+        def refresh_accepted_result(task):
+            accepted = session.exec(
+                select(AgentSubmission).where(AgentSubmission.task_id == task.id)
+            ).one()
+            accepted.result_hash = stable_hash(task.result_data)
+            Path(accepted.raw_result_path).write_text(json.dumps(task.result_data), encoding="utf-8")
+            completed = session.exec(
+                select(AuditEvent).where(
+                    AuditEvent.entity_id == task.id,
+                    AuditEvent.action == "completed",
+                )
+            ).one()
+            completed.metadata_json = {"result_hash": accepted.result_hash}
+            session.add(accepted)
+            session.add(completed)
+            consumed = session.exec(
+                select(AuditEvent).where(
+                    AuditEvent.entity_id == task.id,
+                    AuditEvent.action == AGENT_CONSUMED,
+                )
+            ).first()
+            if consumed:
+                consumed.metadata_json = {"result_hash": accepted.result_hash}
+                session.add(consumed)
+
+        refresh_accepted_result(generation)
+        refresh_accepted_result(plan)
+        session.flush()
+
+        qc.input_data = pipeline._asset_qc_input(session, flow, generation, plan)
+        qc.input_hash = stable_hash(qc.input_data)
+        qc.result_data = {"passed": False, "issues": [issue]}
+        qc_owned = session.exec(
+            select(AuditEvent).where(AuditEvent.entity_id == qc_id, AuditEvent.action == OWNED)
+        ).one()
+        qc_owned.metadata_json = {"input_hash": qc.input_hash}
+        refresh_accepted_result(qc)
+        session.add_all([second, generation, plan, qc, owned, qc_owned])
+        session.commit()
+
+        reusable, gaps, excluded = flow._visual_repair_generated_assets(
+            plan, {"validation_errors": [issue]}
+        )
+
+    assert [material["artifact_id"] for material in reusable] == [first_image_id]
+    assert excluded == {second_image_id}
+    assert gaps == []
 
 
 def record_accepted_completion(session, runtime, task, result):
