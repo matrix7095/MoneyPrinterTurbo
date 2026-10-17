@@ -738,10 +738,16 @@ def layout_filter(
             zoom = "min(1.14,1+on*0.0005)"
             x_expr = f"(iw-iw/zoom)*{safe_x:.3f}"
             y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
+        # zoompan 的整数裁剪会让慢速运动跳动；4:4:4 放大可减小取整步长。
         return (
             "scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,"
-            f"zoompan=z='{zoom}':x='{x_expr}':y='{y_expr}':d=1:s=1080x1920:fps=30"
+            + (
+                "scale=4320:7680:flags=lanczos,format=yuv444p,"
+                if motion != "hold"
+                else ""
+            )
+            + f"zoompan=z='{zoom}':x='{x_expr}':y='{y_expr}':d=1:s=1080x1920:fps=30"
         )
     if layout == "blur_background":
         return (
