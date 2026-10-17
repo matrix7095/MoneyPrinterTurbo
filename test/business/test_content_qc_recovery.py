@@ -13,7 +13,7 @@ from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent,
 from glance_core.task_schemas import CONTENT_ACCEPTANCE_CHECKS, RecoveryPlan
 from glance_core.task_service import TaskConflictError, stable_hash
 from glance_core.workflow import WorkflowService
-from glance_media.executor import sha256_file
+from glance_media.executor import MediaExecutor, sha256_file
 from sqlmodel import Session, select
 
 from app.business.runtime import AGENT_CONSUMED, OWNED, QC_RECOVERY, QC_PLAN_REJECTED, QC_TARGET_REJECTION, _require_current_revision
@@ -151,6 +151,35 @@ def test_admin_old_consumed_failure_is_authenticated_and_idempotent(failed_qc):
     assert http.post(url, headers=ADMIN).json() == first.json()
     assert len(recovery_rows(runtime)) == 1
     assert http.post(f"/api/v1/agent/tasks/{qc_id}/retry-recovery", headers=ADMIN).status_code == 409
+
+
+@pytest.mark.parametrize("storage, allowed", [
+    ("identity", True), ("legacy", True), ("mismatched_legacy", False),
+    ("corrupt_identity_valid_legacy", False), ("identity_valid_mismatched_legacy", True),
+])
+def test_qc_recovery_checks_exact_frozen_audio_at_identity_or_legacy_path(failed_qc, storage, allowed):
+    runtime, http, _, qc_id, _, root = failed_qc
+    runtime.settings.asr_model = "different-current-model"
+    with Session(runtime.engine) as session:
+        consumed(session, qc_id)
+        audio = session.get(AgentTask, qc_id).input_data["audio_evidence"]
+    legacy = root / "render" / f"audio-evidence-{audio['video_sha256']}.json"
+    identity = MediaExecutor(root).final_audio_evidence_path(audio)
+    if "identity" in storage:
+        identity.write_text(json.dumps(audio), encoding="utf-8")
+    if storage == "identity":
+        legacy.unlink()
+    elif "mismatched_legacy" in storage:
+        legacy.write_text(json.dumps({**audio, "asr_model": "another-model"}), encoding="utf-8")
+    elif storage == "corrupt_identity_valid_legacy":
+        identity.write_text(json.dumps({**audio, "segments": []}), encoding="utf-8")
+    before = {path: path.read_bytes() for path in (identity, legacy) if path.is_file()}
+
+    response = http.post(f"/api/v1/agent/tasks/{qc_id}/content-qc-recovery", headers=ADMIN)
+
+    assert response.status_code == (200 if allowed else 409), response.text
+    assert len(recovery_rows(runtime)) == int(allowed)
+    assert all(path.read_bytes() == data for path, data in before.items())
 
 
 @pytest.mark.parametrize("explicit_null", [False, True])

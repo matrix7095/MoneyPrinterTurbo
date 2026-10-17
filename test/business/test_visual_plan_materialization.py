@@ -13,7 +13,7 @@ from glance_core.database import create_db
 from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent, Candidate, CandidateStatus, Content, ContentStatus, ProductionMode, RightsStatus, SchedulerOffer, TaskStatus, TaskType, utc_now
 from glance_core.task_service import stable_hash
 from glance_core.workflow import _failed_segment_indexes
-from glance_media.executor import sha256_file
+from glance_media.executor import MediaExecutor, sha256_file
 from sqlmodel import Session, select
 
 from app.business import pipeline
@@ -551,6 +551,36 @@ def test_admin_restoration_preserves_receipts_video_and_supersedes_only_pending_
     runtime.recover_agent_results()
     assert "Consumed Agent result changed" not in caplog.text
     assert http.post(f"/api/v1/contents/{content_id}/restore-visual-plan", headers=ADMIN).json()["restored"] is False
+
+
+@pytest.mark.parametrize("storage, allowed", [
+    ("identity", True), ("legacy", True), ("mismatched_legacy", False),
+    ("corrupt_identity_valid_legacy", False), ("identity_valid_mismatched_legacy", True),
+])
+def test_restoration_checks_exact_frozen_audio_at_identity_or_legacy_path(restoration_contract, storage, allowed):
+    runtime, http, content_id, plan_id, offer_id, root, original, backfilled = restoration_contract
+    runtime.settings.asr_model = "different-current-model"
+    with Session(runtime.engine) as session:
+        audio = session.get(AgentTask, offer_id).input_data["audio_evidence"]
+    legacy = root / "render" / f"audio-evidence-{audio['video_sha256']}.json"
+    identity = MediaExecutor(root).final_audio_evidence_path(audio)
+    if "identity" in storage:
+        identity.write_text(json.dumps(audio), encoding="utf-8")
+    if storage == "identity":
+        legacy.unlink()
+    elif "mismatched_legacy" in storage:
+        legacy.write_text(json.dumps({**audio, "asr_model": "another-model"}), encoding="utf-8")
+    elif storage == "corrupt_identity_valid_legacy":
+        identity.write_text(json.dumps({**audio, "segments": []}), encoding="utf-8")
+    before = {path: path.read_bytes() for path in (identity, legacy) if path.is_file()}
+
+    response = http.post(f"/api/v1/contents/{content_id}/restore-visual-plan", headers=ADMIN)
+
+    assert response.status_code == (200 if allowed else 409), response.text
+    with Session(runtime.engine) as session:
+        assert session.get(AgentTask, plan_id).result_data == (original if allowed else backfilled)
+        assert session.get(AgentTask, offer_id).status == (TaskStatus.CANCELLED if allowed else TaskStatus.PENDING)
+    assert all(path.read_bytes() == data for path, data in before.items())
 
 
 @pytest.mark.parametrize("tamper", ["submission", "projection", "receipt", "audio", "offer_started", "intent", "unknown_intent", "native", "new_failed_script_qc", "new_pending_script", "missing_script_qc_submission", "missing_script_consumed", "active_cover", "submitted_cover", "scheduler_offer"])

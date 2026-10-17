@@ -1764,6 +1764,15 @@ class MediaExecutor:
             return [], f"local ASR failed ({type(exc).__name__}): {exc}"
         return segments, ""
 
+    def final_audio_evidence_path(self, evidence: dict[str, Any]) -> Path:
+        """Keep observations from different ASR identities in separate files."""
+        identity = {key: evidence.get(key) for key in (
+            "version", "method", "video_sha256", "asr_model", "asr_device", "asr_compute_type",
+        )}
+        canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return self.root / "render" / f"audio-evidence-{fingerprint}.json"
+
     def final_audio_evidence(
         self,
         video_path: Path,
@@ -1793,10 +1802,12 @@ class MediaExecutor:
                 "Agent must assess evidence sufficiency; no automatic audio approval.",
             ],
         }
-        cache = self.root / "render" / f"audio-evidence-{evidence['video_sha256']}.json"
-        if cache.is_file():
+        cache = self.final_audio_evidence_path(evidence)
+        legacy = self.root / "render" / f"audio-evidence-{evidence['video_sha256']}.json"
+        candidate = cache if cache.is_file() else legacy
+        if candidate.is_file():
             try:
-                cached = json.loads(cache.read_text(encoding="utf-8"))
+                cached = json.loads(candidate.read_text(encoding="utf-8"))
                 if (
                     all(
                         cached.get(key) == evidence[key]

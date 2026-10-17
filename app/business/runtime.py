@@ -619,7 +619,9 @@ class BusinessRuntime:
         if original_receipt != frozen:
             raise TaskConflictError("RECOVERY_ACCEPTANCE_RECEIPT_CHANGED")
         audio = task.input_data["audio_evidence"]
-        path = (root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json").resolve()
+        path = MptMediaExecutor(root).final_audio_evidence_path(audio).resolve()
+        if not path.is_file():
+            path = (root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json").resolve()
         if (not path.is_relative_to(root) or not path.is_file()
                 or json.loads(path.read_text(encoding="utf-8")) != audio):
             raise TaskConflictError("RECOVERY_AUDIO_EVIDENCE_CHANGED")
@@ -1367,7 +1369,9 @@ class BusinessRuntime:
                     if receipt != without_audio:
                         raise ValueError("Visual restoration QC/render receipt mismatch")
                     audio = frozen["audio_evidence"]
-                    audio_path = root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json"
+                    audio_path = MptMediaExecutor(root).final_audio_evidence_path(audio)
+                    if not audio_path.is_file():
+                        audio_path = root / "render" / f"audio-evidence-{audio.get('video_sha256')}.json"
                     if (not audio_path.resolve().is_relative_to(root) or not audio_path.is_file()
                             or json.loads(audio_path.read_text(encoding="utf-8")) != audio):
                         raise ValueError("Visual restoration independent audio evidence changed")
