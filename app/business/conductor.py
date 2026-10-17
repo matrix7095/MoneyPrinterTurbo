@@ -401,6 +401,7 @@ class SchedulerPlanner:
                 timeout=30,
                 check=False,
                 shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired):
             raise ConductorError("CONDUCTOR_PLAN_UNAVAILABLE") from None

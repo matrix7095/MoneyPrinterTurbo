@@ -1339,6 +1339,7 @@ def test_scheduler_uses_ps7_argument_array_not_service_command_text(
         and kwargs["shell"] is False
         and kwargs["timeout"] == 30
     )
+    assert kwargs["creationflags"] == getattr(c.subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def test_native_transport_inherits_security_configuration(tmp_path, monkeypatch):
