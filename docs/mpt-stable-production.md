@@ -1,18 +1,19 @@
 # MoneyPrinterTurbo 按需生产运行手册
 
-更新：2026-10-17 07:24（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
+更新：2026-10-17 09:35（Asia/Shanghai）。本页是生产操作入口；排查历史见 [历史记录](mpt-stable-production-history.md)。运行状态会变化，开始操作前先刷新工作台。
 
 ## 当前验收状态
 
-**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署。第八轮正常接续后，脚本 QC、脚本审核、视觉计划、视觉计划 QC、新图片与素材 QC 均已完成并被服务端消费。新配音和新成片已生成，独立技术与封存清单核验 18 项通过；完整成片 QC 已正式不通过；恢复预算 round 3/3 耗尽后，系统正常归档该内容，未发布。诊断补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次正常推进不能证明此前提前返回的根因已解决。IKEA PS 2026 的研究、脚本与独立脚本 QC 均已完成；脚本助手高置信 APPROVE 后，从正常显式审批入口生成了新配音。第九轮在人工审核停点正常 NO_TASK 结束，第十轮已从视觉阶段续接。尚无新成片或发布。下表为 07:24（+08）快照。父子指令作用域及 ASR 证据判定一致性修复已独立审查、提交并部署；它们不能替代新一轮正式成片验收。
+**端到端稳定生产尚未验收。** 配音与规格口播合同修复均已通过独立审查、业务回归并部署。第三版未领取诊断补丁也已通过完整回归、提交、推送和部署。第八轮正常接续后，脚本 QC、脚本审核、视觉计划、视觉计划 QC、新图片与素材 QC 均已完成并被服务端消费。新配音和新成片已生成，独立技术与封存清单核验 18 项通过；完整成片 QC 已正式不通过；恢复预算 round 3/3 耗尽后，系统正常归档该内容，未发布。诊断补丁只保存固定枚举、计数和消息哈希，不保存任意消息正文，不改变领取、停止、重试预算或 QC；本次正常推进不能证明此前提前返回的根因已解决。IKEA PS 2026 的研究、脚本与独立脚本 QC 均已完成；脚本助手高置信 APPROVE 后，从正常显式审批入口生成了新配音。第九轮在人工审核停点正常 NO_TASK 结束，第十轮完成视觉计划 QC 后因主线程漏传已获授权的本机图片适配开关而失败，现已停止。一次性授权变化续接修复已独立通过、提交并部署，第十一轮已正常恢复同一图片任务；尚无新成片或发布。下表为 09:35（+08）快照。父子指令作用域及 ASR 证据判定一致性修复已独立审查、提交并部署；它们不能替代新一轮正式成片验收。
 
 | 项目 | 已核实状态 |
 | --- | --- |
-| 生产服务 | API `8000` worker PID `28548`、启动器 PID `14176`，于 07:01 从主目录启动；此前 PID `21552/28588` 均已退出。工作台 `http://127.0.0.1:8510/` PID `24868`。认证接口 200、匿名 401、UI health 200；MPT Runtime Watchdog 已恢复启用，旧 Glance Watchdog 停用。 |
+| 生产服务 | API `8000` worker PID `11044`、启动器 PID `23828`，于 09:34 从主目录启动并加载 `d2f818a` 修复。工作台 `http://127.0.0.1:8510/` PID `12048`，进程命令确认指向主目录。认证接口 200、匿名 401、UI health 200；MPT Runtime Watchdog 已恢复启用，旧 Glance Watchdog 停用。 |
 | 生产触发 | 按需从工作台点击“运行一次”。业务定时调度、自动选题关闭；不需要 Gemini 或周期生产任务。 |
 | 代码 | 配音修复 `db64dfb85bf1b0a5603aeca38b669b3ccbf4e93e`、规格口播合同修复 `05c43348e31e3bcfb29213535dab00463edc31ec`、诊断补丁 `0915005562b6387e889f554cd9c6f07aba7382a3` 均已推送 Main 与实施分支。最新修复提交 `c7ea02012d10dd86637d96c8fe1ef3f85d416fca` 只澄清父/子指令作用域和 schema v3 ASR 证据判定；部署前新增 SQLite 备份 `pre-instruction-scope-20261017.db`，119,066,624 字节、quick_check=ok，部署后当前内容 37 个任务的状态/attempt/instructions/input/result 哈希全部不变。本次诊断补丁 SQLite 备份 `pre-preclaim-diagnostics-20261017.db` 为 115,744,768 字节，quick_check=ok。部署前后 30 个任务的状态、attempt、instructions/input/result 哈希一致。 |
 | 自动化回归 | 最新指令/证据合同修复：主线程组合回归 **408 passed**（87 warnings，exit 0，262.35 秒）；作者 272 passed；独立 Conductor 审查 233 passed，独立音频合同/身份回归 136 passed。Ruff、compileall、diff 检查通过。此前诊断补丁：作者 456 项、独立审查 235 项、完整组合回归 **1737 passed**（8513 warnings，exit 0，941.79 秒；运行器 947.188 秒）；359 个源码/依赖文件前后一致。此前合同修复 1686 passed、配音修复 1651 passed 的证据保留。 |
-| 当前第十轮 | `content_865a305c1e99487bbf26bdb78b954ee9`，IKEA PS 2026，`image_only`。`run_0dbcfb6cc6c15b2a73454e512083a5bd`、generation 10 正常 running；包装 PID `20176`、原生 PID `12660` 均存活。视觉计划 `agt_6e3ad6f497ff461cbeebf5dd7335b1f2` 已 LEASED、attempt 1、intent CLAIMED。本次未开启本机图片适配权限。 |
+| 当前第十轮终态 | `content_865a305c1e99487bbf26bdb78b954ee9`，IKEA PS 2026，`image_only`。`run_0dbcfb6cc6c15b2a73454e512083a5bd`、generation 10 已 stopped，execution FINISHED/exit 0、host_live=false。视觉计划及其独立 QC 已正式完成、接受并消费。图片任务 `agt_e4c0a0b62b004bbd889047a5df071216` 在 attempt 1/3 报 `LOCAL_IMAGE_AUTHORIZATION_MISSING`：实际原图 941×1672 低于 1080×1920，而主线程漏传此前已获用户授权的本机适配开关，旧 Run 冻结值为 false。Recovery round 1/3 已接受、消费并阻断；当前内容 FAILED/recovery_blocked，无新图上传。旧 Run 与失败历史保持不变；本次一次性续接已在第十一轮完成原子提交。 |
+| 第十一轮授权恢复 | 修复提交 `d2f818a2652f75652b675851317277a71d21e2ce` 已推送两个分支并部署。正常执行接口明确传入 `allow_local_image_adaptation=true`，返回 200；新 Run `run_fb52ac644a6506f4b50d3081a47d7ba5`、generation 11 已 running，包装 PID `7140`、原生 PID `5544`。同一图片 Task 先从 FAILED→PENDING、attempt 保持 1，再于 09:35:25 正常确认领取为 LEASED、attempt 2，max_attempts 仍为 3。45 个任务仍在；其余 44 个任务全部字段和原 816 条审计摘要不变，原输入/result/attempt/max_attempts 均未改。最终 V3 独立专项 49 passed；V2 未影响普通路径 324 passed、主线程扩大回归 563 passed，源码差异桥接证明最终仅增加有效配置读取及 3 个覆盖测试。当前还未完成图片或成片 QC、未发布。 |
 | IKEA 脚本与配音 | 研究与脚本均已接受、消费；脚本 QC `agt_1b427d465b074175be5173048be1b8e9` 正式 passed=true，脚本审核 `agt_c3b80749c13a4e398e2028af93d0c588` 为高置信 APPROVE、无 blocker。按现有人工选题流程正常批准脚本后，新配音 `asset_dfa5ccc31b024a71bcf9f9f6f291b77f` 生成：216,288 字节、36.048 秒，SHA-256 `6e6dfc3da78d9ca5cbe3bde3942c62f5691ac30edd9cd2e5318f29fbde48017b`。离线 large-v3 实际 exit 0、严格解码成功；品牌字母被原样识别成 `IPEA`，不能确定实际误读或识别差异，未回填为预期词。诊断不能替代新 final 的正式 QC。 |
 | 第八轮历史内容 | `content_0e05066e9e8b48c092e5f3c3ffaa3637`。第八轮 `run_847ee6ec4e57016c589e5356c340e51f` 已停止；包装进程于 06:42:34 正常 exit 0，原生 PID `11436` 与包装进程 `10448` 均已退出，host_live=false。内容于 06:44:44 被系统归档，状态 `ARCHIVED/archived`，保留 `RECOVERY_BLOCKED`。新脚本 `agt_723466ed4dbb4c27a60c13aa3ae70f4e` 的脚本 QC `agt_bce2ee7f682a43c8980e92edad0453c1` 已通过；脚本审核 `agt_673ffed96d8a4596a65a693e7d737f7c`、视觉计划 `agt_8cbc3754e6ad4b289e6b37926f40d91c` 和视觉计划 QC `agt_916204acacf642b6aaab1af6e9a54d7f` 均已完成并被接受、消费。 |
 | 第八轮新配音 | asset `asset_48df80306acf44688d27fa7b6f245c10`，`audio/voice-wy1nvt3i/narration.mp3`，SHA-256 `9e83e9d4ec9aea2dede7510fb5aec55de653249c1e3fa4fabe6de4cbebb73ac9`，217,440 字节、36.24 秒，完整解码无错误。12 条 TTS 句子边界包含 `1920乘以1080`、`60到80英寸`；这不是可听读音或正式成片 QC 通过证明。 |
@@ -42,7 +43,7 @@
 
 1. 打开[工作台](http://127.0.0.1:8510/)，选择目标内容，先刷新运行状态，再点击一次“运行一次”。生产经正常入口按阶段接续，不靠定时任务启动。
 2. 若页面显示该内容已有活动 run、`LEASED` 任务或活动 Worker，继续刷新并观察同一 run 和原生 Worker；不要重复启动、重复领取或重置尝试次数。界面心跳字段不是操作系统进程存活证明。
-3. 图片本机适配默认关闭。只有当前内容获得明确授权时才为该次任务启用；授权不自动扩展到其他内容或之后另一次未授权运行。原生原图、哈希、适配产物和独立素材 QC 都应留存，最低成片素材要求仍为 1080×1920。
+3. 图片本机适配默认关闭。用户已经明确允许本轮新生成的 AI 概念图片本机放大并继续质检发布；该授权在本次持续目标及其正常续接内有效，不因主线程漏传参数而要求用户重复确认。每个实际运行仍须由受认证入口写入并冻结 `allow_local_image_adaptation=true`；旧 Run 的 false 与失败历史保持不变。不能从 Worker 文本推定授权，也不扩展为任意照片、未来内容或全局定时生产的许可。原生原图、哈希、适配产物和独立素材 QC 都应留存，最低成片素材要求仍为 1080×1920。
 4. 让系统依次完成脚本质检、脚本审核、配音、视觉计划及其质检、素材 QC、渲染、完整成片 QC 和发布审核。只接受对应当前版本及其 subject 哈希的正式结果；诊断 ASR、抽帧、渲染检查不能替代正式 QC。
 5. 人工选题入口创建的内容仍保留显式审核：脚本助手给出 APPROVE 后，原生运行可能在 SCRIPT_REVIEW 以 CONDUCTOR_NO_TASK 正常结束。先确认当前脚本 QC 通过、助手高置信 APPROVE 且无 blocker，在用户已授权的制作范围内通过正常“批准脚本”入口生成配音；旧宿主与租约结束后再从后续阶段运行。不要伪造 Handsfree 归属或审核回执。
 6. 发布只在正式状态为 `PUBLISHED`，且同一新成片记录包含真实平台作品 ID、URL 和证据截图后算完成。遇到登录失效、验证码等确需用户参与的步骤时，保留当前 run 和页面现场，仅处理该步骤要求的操作。
@@ -99,10 +100,19 @@
 - [第九轮审核停点与正式建议](../storage/smoke/stable-production-20261013/ikea-run9-script-review-terminal-20261017.json)、[正常显式脚本审批](../storage/smoke/stable-production-20261013/ikea-normal-script-approval-20261017.json)、[第十轮视觉续接](../storage/smoke/stable-production-20261013/ikea-run10-visual-resume-20261017.json)。
 - [IKEA 新配音离线诊断](../storage/smoke/stable-production-20261013/ikea-new-voice-large-v3-canary-20261017.json)，SHA-256 `1a1681c12dd9aef549a3dd490d560dbf870a595b815081699b7a44af8637ea2f`，保留全部原样转写及概率，不是正式成片 QC。
 
+- [IKEA 正式视觉计划 QC 通过](../storage/smoke/stable-production-20261013/ikea-formal-visual-plan-qc-pass-20261017.json)、[第十轮授权遗漏记录](../storage/smoke/stable-production-20261013/ikea-run10-local-image-authorization-omission-20261017.json)、[第十轮失败与 Recovery 终态](../storage/smoke/stable-production-20261013/ikea-run10-authority-recovery-terminal-20261017.json)。终态封存时 host TTL 尚未过期；07:40 刷新已为 host_live=false。
+- [原生生图次数核验](../storage/smoke/stable-production-20261013/ikea-run10-native-image-generation-count-20261017.json)：指定旧图片子任务恰有 1 次 started 和 1 次 completed，不能当作全局计费账本。[抖音登录预检](../storage/smoke/stable-production-20261013/douyin-login-preflight-20261017.json) 仅证明当时可访问已登录作品管理页，未上传或发布本次内容。
+- [授权续接部署前状态封存](../storage/smoke/stable-production-20261013/image-authorization-before-deploy-20261017.json)：45 个现有任务全部字段和 816 条相关审计的摘要，SHA-256 `ffd2e417a63678331aacbd8eadd31b168ed3acd36d2ef9892da1ae5c676854a8`；用于核对部署及后续受控状态变化，不能代替续接运行验收。
+- [授权续接部署前数据库备份](../storage/smoke/stable-production-20261013/pre-image-authorization-backup-20261017.json)：119,750,656 字节，SQLite 在线备份、源连接只读，quick_check=ok，SHA-256 `b3eee98933d8a681c25403309064d68223ae0cf12cb92273244ebbba3ced6f07`。创建备份不表示补丁已经部署。
+
 ## 仍需完成
 
-1. 继续观察第十轮同一原生宿主与视觉任务，按正常门禁接续脚本、声画及发布，不重复派发或把 heartbeat 当作完成。第八轮已终止并归档，不再等待旧 Worker，不重放 offer、不重置预算或手工取消归档。现有服务没有给该归档内容附加新 ASR 并重新签发正式 QC 的入口；后续修复须先确认实际证据缺口与正常业务路径。父子指令作用域及音频合同对齐已部署，但不能据此宣称当前归档内容通过或稳定端到端生产已验收。
+1. 第十轮已经终止，不再等待旧 Worker。一次性授权变化续接已实现、独立审查、回归、推送并部署，第十一轮已从正常执行接口携带已授权的 true 参数启动。继续观察同一原生运行及图片任务，已核对正常领取 attempt=2、上限仍为 3，继续完成 7 张图片、独立素材 QC、合成及正式成片 QC；保留原输入、失败审计、Recovery 和旧 Run，attempt 不回退、max_attempts 不扩大。新领取可正常从 attempt 1 增为 2，当前错误清除须由完整续接回执封存原值。原生事件已核实历史生成 1 张；7 个镜头各最多新生 1 张，累计不得超过冻结预算 8。第八轮已归档，不重放 offer、不重置预算或手工取消归档。父子指令作用域及音频合同对齐已部署，但不能据此宣称稳定端到端生产已验收。
 2. 完成发布审核并从正常发布流程取得这版成片对应的真实 `PUBLISHED` 状态、抖音作品 ID、URL 和截图证据。
 3. 用户授权的全机旧数据清理尚未完成。此前剩余候选的逻辑体积为 **25,936,296,584 字节**，不是当前重新汇总值或可释放物理空间。10 月 17 日 03:34 再核实：旧 Glance 为 5,906,578,968 字节、bootstrap 工作树为 9,504,598,141 字节、upstream rehearsal 工作树为 3,605,444,075 字节，未发现对应进程引用。重新授权后的旧数据库备份删除仍被自动审批以 `blocked by policy` 在进程创建前拒绝，upstream 工作树的正常归档也被固定任务保护拒绝；本轮新增删除量为 0。记录见 [本次清理复核](../storage/smoke/stable-production-20261013/cleanup-renewed-authorization-rejection-20261017.json)。
 4. 新测试临时产物也未清理成功：仅拟删除 pytest-1422/1423/1424 中 617,884,412 字节普通生成文件，已核对无进程路径引用、跳过全部 reparse points 并保留目录和链接；该精确删除仍在进程启动前被自动审批以 blocked by policy 拒绝，新增删除量 0，无替代重试。见 [本轮拒绝证据](../storage/smoke/stable-production-20261013/fresh-pytest-file-cleanup-rejection-20261017.json)。
 5. 上述门禁通过并核实发布后，再更新本页验收结论；目前不可称为稳定端到端生产已验收。
+
+- [第十一轮真实授权续接](../storage/smoke/stable-production-20261013/ikea-run11-authorized-resume-20261017.json)、[部署后任务与审计比对](../storage/smoke/stable-production-20261013/image-authorization-after-deploy-20261017.json)、[续接事务后状态](../storage/smoke/stable-production-20261013/image-authorization-after-resume-20261017.json)。
+- [V2 主线程 563 项完整回归](../storage/smoke/stable-production-20261013/image-authorization-root-regression-v2-20261017.json)、[最终 V3 源码差异桥接](../storage/smoke/stable-production-20261013/image-authorization-v2-v3-source-bridge-20261017.json)。首次工具会话中断的半截测试没有计作通过。
+- [最终 V3 独立审查](../storage/smoke/stable-production-20261013/image-authorization-independent-review-v3-20261017.json)、[部署及真实领取验收](../storage/smoke/stable-production-20261013/image-authorization-deployed-resume-verification-20261017.json)：代码审查与真实领取通过，不能代替图片 QC、成片 QC 或平台发布结果。
