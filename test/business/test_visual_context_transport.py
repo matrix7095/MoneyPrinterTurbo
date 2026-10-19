@@ -12,6 +12,7 @@ import pytest
 from sqlmodel import Session, select
 
 from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent, Candidate, Content, TaskStatus, TaskType
+from glance_agent.workspace import prepare_workspace
 from glance_core.task_service import stable_hash
 from glance_core.security import issue_role_token
 
@@ -254,6 +255,19 @@ def test_visual_plan_receives_declared_images(visual_images, tmp_path):
         assert claim["task_id"] == pending_id
         bundle = client.bundle(claim["bundle_url"], claim["lease_token"])
         assert {entry["input_ref"] for entry in bundle["context_manifest"]} == set(bodies)
+        workspace = prepare_workspace(tmp_path / "mapped-worker", bundle=bundle,
+            lease_token=claim["lease_token"], api_url=client.settings.api_url,
+            agent_id=client.settings.agent_id)
+        manifest = json.loads((workspace / "context_manifest.json").read_text(encoding="utf-8"))
+        assert manifest == bundle["context_manifest"]
+        download_urls = {entry["name"]: entry["url"] for entry in bundle["context_files"]}
+        for entry in manifest:
+            destination = workspace / "context" / entry["name"]
+            client.download_context(download_urls[entry["name"]], claim["lease_token"], destination)
+            assert destination.read_bytes() == bodies[entry["input_ref"]]
+            assert hashlib.sha256(destination.read_bytes()).hexdigest() == entry["sha256"]
+            assert destination.stat().st_size == entry["size_bytes"]
+        assert json.loads((workspace / "input.json").read_text(encoding="utf-8")) == bundle["input"]
         with Session(runtime.engine) as session:
             assert session.get(AgentTask, pending_id).input_data == frozen
 

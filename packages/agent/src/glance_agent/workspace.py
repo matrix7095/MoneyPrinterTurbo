@@ -56,6 +56,7 @@ def prepare_workspace(
     directory.mkdir(parents=True, exist_ok=True)
     write_json_atomic(directory / "task.json", bundle["task"])
     write_json_atomic(directory / "input.json", bundle["input"])
+    write_json_atomic(directory / "context_manifest.json", bundle.get("context_manifest", []) or [])
     write_json_atomic(directory / "result.schema.json", bundle["result_schema"])
     write_json_atomic(
         directory / ".lease.json",

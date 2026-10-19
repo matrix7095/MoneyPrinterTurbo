@@ -124,13 +124,18 @@ def test_explicit_nonempty_required_context_still_rejects_missing_files(tmp_path
 
 
 def test_dispatch_keeps_declared_visual_and_content_qc_files_mandatory():
-    for kind in (TaskType.CONTENT_RESEARCH, TaskType.VISUAL_PLAN_QC, TaskType.CONTENT_QC):
+    for kind in (TaskType.CONTENT_RESEARCH, TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC, TaskType.CONTENT_QC):
         prompt = render_dispatch_task_prompt(task_id="test", task_type=kind.value, skill_name="test-skill",
                                              workspace_dir="C:/isolated/task", launcher="C:/isolated/worker.ps1")
         assert_leaf_prompt(prompt)
         assert "仅核验本任务明确声明的非空 context_files/context_manifest" in prompt
         assert "视觉/成片QC等已声明的必需素材缺文件或哈希不符仍须 fail" in prompt
         assert "缺少必需输入时只用 `fail`" in prompt
+        assert "context_manifest.json" in prompt
+        assert "context/<name>" in prompt
+        assert "input_ref" in prompt and "sha256/size_bytes" in prompt
+        assert "allowed_asset_ids" in prompt
+        assert "不得按列表顺序推断图片ID" in prompt
 
 
 def test_actual_staged_research_skill_matches_role_version_and_declared_context_rule(staged):
