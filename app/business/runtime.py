@@ -1285,6 +1285,21 @@ class BusinessRuntime:
         )):
             raise TaskConflictError("VISUAL_REPAIR_HISTORY_CANCELLATION_CHANGED")
 
+    def request_pending_render_revision(self, content_id: str, expected: dict) -> dict:
+        from app.business.pending_render_revision import request_rerender
+        from app.business.requests import PendingRenderRevisionRequest
+
+        expected = PendingRenderRevisionRequest.model_validate(expected).model_dump()
+        with content_operation_lock(self.settings, content_id):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    response = request_rerender(self, session, content_id, expected)
+                    Session.commit(session)
+                    return response
+                finally:
+                    session.rollback()
+
     def reconcile_packaged_visual_context(self, content_id: str, expected: dict) -> dict:
         from app.business.requests import PackagedVisualContextRequest
         from app.business.visual_plan_context import reconcile_packaged_visual_context

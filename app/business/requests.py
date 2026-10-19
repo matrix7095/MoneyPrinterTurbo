@@ -171,6 +171,28 @@ class StopRunRequest(StrictRequest):
     expected_binding: ExpectedHostBinding
 
 
+class PendingRenderTaskBinding(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_id: str = Field(min_length=1, max_length=100)
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt: int = Field(ge=0, le=0, strict=True)
+
+
+class PendingRenderRevisionRequest(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: int = Field(ge=1, le=1, strict=True)
+    run: ExpectedHostBinding
+    execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qc: PendingRenderTaskBinding
+    final_artifact_id: str = Field(min_length=1, max_length=100)
+    final_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    render_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    previous_renderer_version: str = Field(min_length=1, max_length=100)
+    renderer_version: str = Field(min_length=1, max_length=100)
+
+
 class ReconcileHostLossRequest(StrictRequest):
     launch_id: str = Field(pattern=r"^[0-9a-f]{32}$", strict=True)
     run_id: str = Field(pattern=r"^run_[0-9a-f]{32}$", strict=True)

@@ -177,7 +177,9 @@ class MptMediaExecutor(MediaExecutor):
             run_command(
                 ["ffmpeg", "-y", "-threads", "1", "-filter_threads", "1", *source_arguments,
                  "-frames:v", str(frame_count), "-an", "-vf", filters, *_encoder_args(encoder),
-                 *(["-crf", "18"] if segment.layout == "image_card" and encoder == "libx264" else []),
+                 # Temporal bit allocation can erase the last subpixel image-motion step.
+                 *(["-crf", "18", "-x264-params", "mbtree=0"]
+                   if segment.layout == "image_card" and encoder == "libx264" else []),
                  "-pix_fmt", "yuv420p", str(footage)],
                 cwd=self.root,
             )

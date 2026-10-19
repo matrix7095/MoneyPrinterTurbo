@@ -24,7 +24,7 @@ from uuid import uuid4
 
 PREPARED_FORMATS = "mov,matroska,avi,mpegts,mpegvideo,ogg,flv,wav,mp3,flac,aac"
 SCHEMA_VERSION = 1
-RENDERER_VERSION = "local-ffmpeg-v2-cfr-pcm"
+RENDERER_VERSION = "local-ffmpeg-v3-cfr-pcm-no-mbtree"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -774,6 +774,9 @@ class VideoProject:
                         "veryfast",
                         "-crf",
                         str(settings.video_crf),
+                        # Preserve micro-motion through the second H.264 encode too.
+                        "-x264-params",
+                        "mbtree=0",
                         "-pix_fmt",
                         "yuv420p",
                         "-movflags",
