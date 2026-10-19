@@ -224,7 +224,8 @@ _PUBLISH_REVIEW_ASSIST = """\
 
 ## 输入
 读取 `script`、`research`、`publish_prepare`、`publish_artifact_id`、`publish_video_url`、
-`cover_artifact_id`、`cover_image_url`、可选的 `publish_policy`、`production_evidence` 和 `context_files`。
+`cover_artifact_id`、`cover_image_url`、可选的 `publish_policy`、`package_review_contract`、
+`production_evidence` 和 `context_files`。
 先检查 `context/` 下实际下发的成片和封面；
 `cover_artifact_id` 是服务端登记的权威封面，不能把脚本里的封面视觉描述当作封面文件。
 
@@ -232,7 +233,18 @@ _PUBLISH_REVIEW_ASSIST = """\
 封面合成披露、当前脚本/画面计划/成片 QC 的精确绑定及证据缺项。已接受的生成结果记录来源陈述，
 QC 通过记录说明对应审核结果；两者都不是许可证。研究中的制作计划不能替代实际生成凭据。
 历史音轨 provider、BGM 使用或本机适配凭据未知时，按明确限制独立判断，不从当前配置反推历史事实。
-核对实际封面的“AI概念示意·非实拍”披露及标题在平台裁切预览中可读；不能用简介中的披露替代封面。
+核对实际封面文件的“AI概念示意·非实拍”披露、标题完整与主体可见，并据文件及合成布局预评估裁切安全；
+不能用简介中的披露替代封面，不能把文件预评估写成已检查真实平台裁切预览。
+
+## 发布包审核相位边界（覆盖旧提示词中的平台操作要求）
+本任务只审核实际下发的发布包。READY 表示发布包材料达到本阶段要求，不表示已登录平台、核对账号、
+检查真实平台裁切或授权发布。不得要求先取得仅在上传后才能产生的平台界面证据来完成本阶段。
+DOUYIN_PUBLISH 必须在实际发布页面核对账号、标题、完整正文、全部标签、保存后的横竖封面裁切和
+AI 内容声明，先保存截图，再登记发布意图；只有 AUTHORIZED 且 click_authorized=true 才能点击一次。
+这些检查是后续发布任务的强制条件，不因本阶段 READY 而免除；本审核者不得登录、上传或登记发布意图。
+若 package_review_contract 指定 operator_requested_douyin_after_ready，这是服务端后续手动发布路径，
+不代表用户已经点击、授权时机或开启 Handsfree；不要仅因尚未执行后续平台检查或未提供自动发布时间而阻塞。
+真实封面文件缺字、披露不清、裁切安全存在具体问题、内容/权利证据缺失或其它本阶段硬项仍须返回非通过。
 
 ## 输出
 在 `result.json` 给出 `READY`、`BLOCKED` 或 `HUMAN` 结论及理由、问题和检查清单。
@@ -241,7 +253,8 @@ QC 通过记录说明对应审核结果；两者都不是许可证。研究中�
 
 核对发布视频和封面是否存在，标题、简介、标签和封面是否与成片内容一致。缺少必需产物或发布信息明显
 不完整时返回 `BLOCKED`；
-普通人工发布中，平台差异、发布时间等未确定事项返回 `HUMAN`。如果输入含有服务端固定的
+普通人工发布中，本阶段必须解决的真实平台差异或人工决定未确定时返回 `HUMAN`；
+后续操作员发起时机不属于包材料缺项。如果输入含有服务端固定的
 `publish_policy.platform_fixed=douyin` 且 `publish_policy.timing=immediate_when_gates_pass`，
 平台和时机已经由 Handsfree 闸门确定，不要仅因这两项缺失用户填写而返回 `HUMAN`；仍需对实际的
 内容、封面、权利、平台规则或其它未覆盖的人工决定返回 `HUMAN`。不得接触发布凭据、调用上传接口或修改

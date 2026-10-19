@@ -799,9 +799,10 @@ class WorkflowService:
             "context_files": context_files,
         }
         # Older packages keep their frozen payload and dedup identity during maintenance.
-        if (content.production_mode == ProductionMode.IMAGE_ONLY and cover
+        versioned_image_review = bool(content.production_mode == ProductionMode.IMAGE_ONLY and cover
                 and cover.relative_path.replace("\\", "/").startswith("publish/cover-revisions/")
-                and self._is_ai_cover_artifact(content.id, cover.id)):
+                and self._is_ai_cover_artifact(content.id, cover.id))
+        if versioned_image_review:
             from glance_core.runtime_config import effective_settings
 
             evidence_base = settings if settings is not None else self.base_settings
@@ -816,12 +817,23 @@ class WorkflowService:
             # A scanner's global opt-in never changes a manual item's identity.
             # Missing base settings cannot infer authorization from process env.
             current = effective_settings(self.session, settings) if settings is not None else None
-            if (current is None or not current.handsfree_enabled
+            if (stable_hash(publish_policy) != stable_hash(handsfree_review_policy()) or current is None or not current.handsfree_enabled
                 or not current.handsfree_auto_publish_douyin_enabled
                 or not is_handsfree_content(self.session, content_id)):
                 publish_policy = None
         if publish_policy is not None:
             payload["publish_policy"] = dict(publish_policy)
+        if versioned_image_review:
+            payload["package_review_contract"] = {
+                "version": 1, "phase": "package_preflight", "ready_means": "package_ready_only",
+                "platform": "douyin",
+                "publication_path": ("handsfree_after_service_gates" if stable_hash(publish_policy) == stable_hash(handsfree_review_policy())
+                                     else "operator_requested_douyin_after_ready"),
+                "live_platform_verification": "required_in_douyin_publish_before_intent",
+                "required_live_checks": ["account", "title", "full_description", "all_tags",
+                                         "portrait_and_landscape_cover_crop", "ai_declaration"],
+                "authorizes_publication": False,
+            }
         return payload
 
     def _publish_production_evidence(
@@ -1511,6 +1523,11 @@ class WorkflowService:
             ).first()
             if existing:
                 return existing
+        if task_type == TaskType.PUBLISH_REVIEW_ASSIST:
+            from glance_core.content_acceptance import is_handsfree_content
+
+            handsfree = bool(stable_hash(input_data.get("publish_policy")) == stable_hash(handsfree_review_policy())
+                             and is_handsfree_content(self.session, content_id))
         return self.tasks.create_task(
             task_type=task_type,
             content_id=content_id,
@@ -1706,6 +1723,10 @@ class WorkflowService:
         current = {
             key: task.input_data[key] for key in _RECOVERY_INPUT_FIELDS if key in task.input_data
         }
+        if task.task_type == TaskType.PUBLISH_REVIEW_ASSIST:
+            for field in ("package_review_contract", "publish_policy"):
+                if field in task.input_data:
+                    current[field] = deepcopy(task.input_data[field])
         overlay = self.opening_identity_input(task.content_id or "", task.task_type, task.input_data)
         if overlay:
             field = ("opening_identity_overlay" if "opening_identity_overlay" in task.input_data

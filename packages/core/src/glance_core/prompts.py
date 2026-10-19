@@ -276,6 +276,8 @@ Handsfree 不返回 HUMAN、不要求人工确认；无可执行路线返回 REJ
 只有发布包、成片、封面、内容与现有权利证据均可核验时才返回高置信度 READY。缺少权利或平台合规证据、
 存在冲突或无法核验时返回 BLOCKED/HUMAN 等非通过结论；服务端有限复核后自动跳过，不要求人工补批。
 不得推断授权、编造证据或仅为推进发布而放行。
+READY 仅表示发布包本阶段就绪；实际平台账号、完整正文、标签、横竖封面裁切及 AI 声明，
+由后续 DOUYIN_PUBLISH 在登记发布意图前强制核验，不要求本审核者登录或先行上传。
 """,
     TaskType.DOUYIN_PUBLISH: """
 
@@ -332,11 +334,12 @@ def resolve_instructions(
         from glance_core.workflow import TASK_INSTRUCTIONS
 
         template = TASK_INSTRUCTIONS[task_type]
-    if task_type in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE} and row is not None and row.instructions.strip():
+    if task_type in {TaskType.DOUYIN_PUBLISH, TaskType.ASSET_GENERATE_IMAGE, TaskType.PUBLISH_REVIEW_ASSIST} and row is not None and row.instructions.strip():
         from glance_core.task_instructions import TASK_INSTRUCTIONS
 
         # Legacy overrides must retain the current preparation and final-click boundaries.
-        boundary = "发布" if task_type == TaskType.DOUYIN_PUBLISH else "图片"
+        boundary = {TaskType.DOUYIN_PUBLISH: "发布", TaskType.ASSET_GENERATE_IMAGE: "图片",
+                    TaskType.PUBLISH_REVIEW_ASSIST: "发布包审核"}[task_type]
         template += f"\n## 固定{boundary}执行边界：以下规则覆盖自定义提示词中冲突的执行方式\n"
         template += TASK_INSTRUCTIONS[task_type]
     current = effective_settings(session, base_settings if base_settings is not None else Settings())
@@ -346,7 +349,8 @@ def resolve_instructions(
         TaskType.CONTENT_QC, TaskType.FINAL_REVIEW_ASSIST, TaskType.RECOVERY,
     }:
         template += _MPT_OPENING_IDENTITY_RULE
-    use_handsfree = current.handsfree_enabled if handsfree is None else handsfree
+    use_handsfree = (handsfree is True if task_type == TaskType.PUBLISH_REVIEW_ASSIST
+                    else current.handsfree_enabled if handsfree is None else handsfree)
     if use_handsfree:
         template += _HANDSFREE_INSTRUCTIONS.get(task_type, "")
         if task_type in {TaskType.RECOVERY, TaskType.SCRIPT_QC, TaskType.SCRIPT_REVIEW_ASSIST}:

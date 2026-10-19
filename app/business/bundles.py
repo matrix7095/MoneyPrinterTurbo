@@ -284,6 +284,20 @@ def _is_handsfree_publish_policy(policy: object) -> bool:
     )
 
 
+def _publish_instruction_mode(task: AgentTask, session: Session) -> bool | None:
+    if task.task_type == TaskType.DOUYIN_PUBLISH:
+        return _is_handsfree_publish_policy(task.input_data.get("publish_policy"))
+    if task.task_type == TaskType.PUBLISH_REVIEW_ASSIST:
+        from glance_core.content_acceptance import is_handsfree_content
+        from glance_core.workflow import handsfree_review_policy
+
+        return bool(stable_hash(task.input_data) == task.input_hash
+            and _is_handsfree_publish_policy(task.input_data.get("publish_policy"))
+            and stable_hash(task.input_data.get("publish_policy")) == stable_hash(handsfree_review_policy())
+            and task.content_id and is_handsfree_content(session, task.content_id))
+    return None
+
+
 def scene_evidence_context(
     task: AgentTask, session: Session, flow: WorkflowService
 ) -> list[tuple[str, bytes]]:
@@ -410,15 +424,10 @@ def build_bundle(
         raise HTTPException(status_code=404, detail="Task not found") from None
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
-    handsfree_publish = None
-    if task.task_type == TaskType.DOUYIN_PUBLISH:
-        handsfree_publish = _is_handsfree_publish_policy(
-            task.input_data.get("publish_policy")
-        )
     current_instructions = resolve_instructions(
         session,
         task.task_type,
-        handsfree=handsfree_publish,
+        handsfree=_publish_instruction_mode(task, session),
         schema_version=task.schema_version,
         base_settings=flow.base_settings,
         opening_identity_overlay=flow.opening_identity_overlay,
@@ -454,11 +463,7 @@ def build_bundle(
                     schema_version=source.schema_version,
                     base_settings=flow.base_settings,
                     opening_identity_overlay=flow.opening_identity_overlay,
-                    handsfree=_is_handsfree_publish_policy(
-                        source.input_data.get("publish_policy")
-                    )
-                    if source.task_type == TaskType.DOUYIN_PUBLISH
-                    else None,
+                    handsfree=_publish_instruction_mode(source, session),
                 ),
             }
             bundle_input["current_input"] = context
