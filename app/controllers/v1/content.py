@@ -299,6 +299,11 @@ def reject_script(
 
     def reject(engine, settings, target_id):
         with Session(engine) as session:
+            content = session.get(Content, target_id)
+            if content is not None and content.business_status == ContentStatus.PACKAGED:
+                from app.business.voice_rebuild import revise_packaged_script
+
+                return revise_packaged_script(session, settings, target_id, payload.note)
             return runtime.workflow_service(session).reject_script(
                 target_id, payload.note
             )
@@ -307,8 +312,15 @@ def reject_script(
         return runtime.run_content_stage(content_id, reject).model_dump(mode="json")
     except KeyError:
         raise HTTPException(status_code=404, detail="Content not found") from None
-    except (ValueError, TaskConflictError) as exc:
+    except (ValueError, TaskConflictError, NonRetryableMediaError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/rebuild-voice")
+def rebuild_voice(*, content_id: str, request: Request):
+    from app.business.voice_rebuild import rebuild_voice
+
+    return run_stage(request, content_id, rebuild_voice, {ContentStatus.PACKAGED})
 
 
 @router.post("/contents/{content_id}/render")
@@ -328,6 +340,29 @@ def approve_final(*, content_id: str, request: Request):
     from app.business.pipeline import approve_final
 
     return run_stage(request, content_id, approve_final, {ContentStatus.FINAL_REVIEW})
+
+
+@router.post("/contents/{content_id}/image-preparations/{prepared_artifact_id}")
+async def register_image_preparation(*, content_id: str, prepared_artifact_id: str, request: Request):
+    from starlette.concurrency import run_in_threadpool
+    from app.business.image_preparation_evidence import MAX_BODY, register_image_preparation
+
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/zip":
+        raise HTTPException(status_code=415, detail="Image preparation import requires application/zip")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_BODY:
+            raise HTTPException(status_code=413, detail="Image preparation archive exceeds 26 MiB")
+        body.extend(chunk)
+    runtime = get_runtime(request)
+
+    def register(engine, settings, target_id):
+        return register_image_preparation(engine, settings, target_id, prepared_artifact_id, bytes(body))
+
+    try:
+        return await run_in_threadpool(runtime.run_content_stage, content_id, register)
+    except (ValueError, KeyError, OSError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail="Image preparation evidence verification failed") from exc
 
 
 class RebuildCoverRequest(BaseModel):

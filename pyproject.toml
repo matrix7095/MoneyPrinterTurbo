@@ -46,6 +46,8 @@ upstream-providers = [
 # Local transcription and speech are optional media capabilities, not LLMs.
 asr = ["faster-whisper==1.1.0", "av<19"]
 azure-speech = ["azure-cognitiveservices-speech==1.41.1"]
+# Local ONNX CPU speech; no torch or external speech service.
+kokoro = ["sherpa-onnx==1.13.8", "sherpa-onnx-core==1.13.8"]
 # Optional TwelveLabs (https://twelvelabs.io) video-understanding/embedding
 # integration. Only needed when `twelvelabs_api_keys` is configured; install
 # with `uv sync --extra twelvelabs`.

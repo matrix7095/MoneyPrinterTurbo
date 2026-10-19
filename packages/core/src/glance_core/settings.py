@@ -6,7 +6,8 @@ from urllib.parse import urlparse
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-SUPPORTED_TTS_PROVIDERS: tuple[str, ...] = ("edge", "cosyvoice3")
+SUPPORTED_TTS_PROVIDERS: tuple[str, ...] = ("edge", "cosyvoice3", "kokoro")
+KOKORO_VOICES: dict[str, int] = {"zm_009": 58, "zf_001": 3}
 DEFAULT_COSYVOICE_ENDPOINT = "http://127.0.0.1:8765"
 DEFAULT_COVER_STYLE_PRESET = (
     "账号 Brand Kit v1：深石墨背景（#101722），冷蓝单一强调色（#58B9FF），"
@@ -14,6 +15,13 @@ DEFAULT_COVER_STYLE_PRESET = (
     "极简，无文字、无拼贴、无水印"
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+
+
+def resolve_kokoro_voice(voice: str) -> tuple[str, int]:
+    for name, sid in KOKORO_VOICES.items():
+        if voice in {name, f"kokoro:{sid}"}:
+            return name, sid
+    raise ValueError("Kokoro 中文音色必须为 kokoro:58 (zm_009) 或 kokoro:3 (zf_001)")
 
 
 def normalize_tts_provider(value: object, *, default: str | None = "edge") -> str:
@@ -45,9 +53,9 @@ def validate_tts_provider_endpoint(
     else:
         raise ValueError("TTS Provider 地址必须是字符串")
 
-    if normalized_provider == "edge":
+    if normalized_provider in {"edge", "kokoro"}:
         if normalized_endpoint:
-            raise ValueError("Edge TTS 不接受 Provider 地址")
+            raise ValueError(f"{normalized_provider} TTS 不接受 Provider 地址")
         return normalized_provider, ""
 
     if not normalized_endpoint:
@@ -113,6 +121,8 @@ class Settings(BaseSettings):
     tts_volume: str = "+0%"
     tts_provider: str = "edge"
     tts_provider_endpoint: str = ""
+    # Server environment only; never editable through runtime settings or Agent input.
+    kokoro_model_dir: str = ""
     # CosyVoice access token, if the isolated loopback service requires one.
     # This is never exposed to the console or Agent task payloads.
     cosyvoice_token: SecretStr = SecretStr("")
@@ -131,6 +141,8 @@ class Settings(BaseSettings):
             self.tts_provider_endpoint,
             allow_unconfigured=True,
         )
+        if self.tts_provider == "kokoro":
+            resolve_kokoro_voice(self.tts_voice)
         return self
 
     # 视频编码器：libx264（默认）或 h264_nvenc（需要 NVIDIA 显卡）。

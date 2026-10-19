@@ -307,6 +307,11 @@ def verify_publish_ready(session: Session, settings: Settings, content_id: str, 
     _require_current_qc(session, content_id, TaskType.SCRIPT_QC, {"script": script, "research": research})
     _require_script_assist(session, settings, content_id, automatic=automatic, release=True)
     _require_current_qc(session, content_id, TaskType.VISUAL_PLAN_QC, {"visual_plan": plan, "script": script})
+    if plan.input_data.get("voice_generation"):
+        from glance_core.voice_generation import verify_voice_generation
+
+        verify_voice_generation(session, settings, content, plan.input_data.get("voice_artifact", {}),
+                                plan.input_data["voice_generation"], script)
     qc = _require_current_qc(session, content_id, TaskType.CONTENT_QC, {"script": script, "visual_plan": plan})
     if qc.schema_version not in {"2", "3"}:
         raise NonRetryableMediaError("Publication requires schema-v2 or schema-v3 acceptance")
@@ -681,8 +686,9 @@ def _queue_post_package_tasks(
         ).first()
         cover_artifact_id = cover.id if cover is not None else None
 
+    prepare = None
     if settings.publish_prepare_enabled:
-        flow.create_agent_task(
+        prepare = flow.create_agent_task(
             content.id,
             TaskType.PUBLISH_PREPARE,
             {
@@ -693,10 +699,8 @@ def _queue_post_package_tasks(
             priority=35,
             allow_multiple=True,
         )
-    else:
-        # With no metadata-preparation Agent enabled, build the review input directly.
-        # When preparation is enabled, schedule_manual_assist_tasks creates review only
-        # after its result exists so the review cannot consume a partial package.
+    if prepare is None or prepare.status == TaskStatus.COMPLETED:
+        # Reuse completed metadata but rebind newly registered evidence in a fresh deduplicated review.
         flow.create_agent_task(
             content.id,
             TaskType.PUBLISH_REVIEW_ASSIST,
@@ -705,7 +709,7 @@ def _queue_post_package_tasks(
                 settings=settings,
                 script=script,
                 research=research,
-                publish_prepare={},
+                publish_prepare={} if prepare is None else prepare.result_data,
                 publish_policy=(
                     handsfree_review_policy()
                     if settings.handsfree_enabled and settings.handsfree_auto_publish_douyin_enabled
@@ -2702,6 +2706,7 @@ def approve_script(
     engine: Engine, settings: Settings, content_id: str, *, automatic: bool = False, manual_approval: bool = False,
 ) -> Content:
     with Session(engine) as session:
+        settings = effective_settings(session, settings)
         content = session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
@@ -2745,9 +2750,16 @@ def approve_script(
             "provider_endpoint": settings.tts_provider_endpoint,
             "target_duration_sec": float(script.get("estimated_duration_sec") or 0) or None,
         }
+        model_identity = {}
+        if settings.tts_provider == "kokoro":
+            from glance_media.tts.kokoro import verify_kokoro_bundle
+
+            model_identity = {"model_manifest_sha256": verify_kokoro_bundle(settings.kokoro_model_dir)["manifest_sha256"]}
+            voice_options["model_dir"] = settings.kokoro_model_dir
         voice_input_hash = stable_hash({
             "version": 1, "script": script_proof, "approval": snapshot,
-            "voice_options": {**voice_options, "provider_endpoint": stable_hash(settings.tts_provider_endpoint)},
+            "voice_options": {**{key: value for key, value in voice_options.items() if key != "model_dir"},
+                              "provider_endpoint": stable_hash(settings.tts_provider_endpoint), **model_identity},
             "automatic_scope": _voice_retry_scope(session, content_id) if automatic else None,
         })
 
@@ -2774,23 +2786,56 @@ def approve_script(
             session.add(content)
             session.commit()
 
-        if automatic and voice_attempts() >= 3:
-            voice_failed(voice_attempts())
-            raise VoiceRetryExhausted("VOICE_RETRY_EXHAUSTED")
+        def require_voice_allowance():
+            if automatic and voice_attempts() >= 3:
+                voice_failed(voice_attempts())
+                raise VoiceRetryExhausted("VOICE_RETRY_EXHAUSTED")
+
+        if settings.tts_provider != "kokoro":
+            require_voice_allowance()
         provider_token = settings.cosyvoice_token.get_secret_value()
         if provider_token:
             voice_options["provider_token"] = provider_token
+
+        def revalidate_voice_subject():
+            if snapshot is not None:
+                _revalidate_script_approval(session, content_id, snapshot)
+            else:
+                session.expire_all()
+                latest = session.exec(select(AgentTask).where(
+                    AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
+                    AgentTask.status != TaskStatus.CANCELLED,
+                ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+                if (not latest or _script_task_proof(latest[0]) != script_proof
+                    or (len(latest) == 2 and latest[0].created_at == latest[1].created_at)):
+                    raise NonRetryableMediaError("Script approval subject changed during voice generation")
+                try:
+                    _unchanged_material_task(session, latest[0], consumed=False)
+                except ValueError as exc:
+                    raise NonRetryableMediaError("Script approval subject changed during voice generation") from exc
+            _verify_rights(session, content)
+
+        generation_input = {}
         try:
-            tts_result = log_stage(
-                session,
-                content.id,
-                "voice",
-                lambda: executor.synthesize_voice(
-                    script["full_narration"],
-                    **voice_options,
-                ),
-                input_hash=voice_input_hash,
-            )
+            if settings.tts_provider == "kokoro":
+                from app.business.voice_rebuild import approved_script_voice
+
+                voice_artifact, generation, voice_duration, timing_evidence = approved_script_voice(
+                    session, settings, content, executor, script_task, voice_input_hash, voice_options,
+                    model_identity["model_manifest_sha256"], revalidate_voice_subject, require_voice_allowance,
+                )
+                generation_input = {"voice_generation": generation}
+            else:
+                tts_result = log_stage(
+                    session,
+                    content.id,
+                    "voice",
+                    lambda: executor.synthesize_voice(
+                        script["full_narration"],
+                        **voice_options,
+                    ),
+                    input_hash=voice_input_hash,
+                )
         except Exception as exc:
             if automatic:
                 attempts = voice_attempts()
@@ -2798,51 +2843,32 @@ def approve_script(
                 if attempts >= 3:
                     raise VoiceRetryExhausted("VOICE_RETRY_EXHAUSTED") from exc
             raise
-        voice_path = tts_result.audio_path
-        voice_duration = tts_result.duration_sec
-        timing_evidence = executor.visual_timing_evidence(voice_path, voice_duration)
-        if timing_evidence is None:
-            raise NonRetryableMediaError("Generated voice timing sidecar is missing")
-        if not settings.min_video_seconds <= voice_duration <= settings.max_video_seconds:
-            message = (
-                f"voice duration {voice_duration:.1f}s is outside bounds "
-                f"[{settings.min_video_seconds:.0f}s, {settings.max_video_seconds:.0f}s]; "
-                "reject the script for a rewrite"
+        if settings.tts_provider != "kokoro":
+            voice_path = tts_result.audio_path
+            voice_duration = tts_result.duration_sec
+            timing_evidence = executor.visual_timing_evidence(voice_path, voice_duration)
+            if timing_evidence is None:
+                raise NonRetryableMediaError("Generated voice timing sidecar is missing")
+            if not settings.min_video_seconds <= voice_duration <= settings.max_video_seconds:
+                message = (
+                    f"voice duration {voice_duration:.1f}s is outside bounds "
+                    f"[{settings.min_video_seconds:.0f}s, {settings.max_video_seconds:.0f}s]; "
+                    "reject the script for a rewrite"
+                )
+                flow.set_error(content_id, "VOICE_DURATION", message)
+                flow.mark_status(content_id, ContentStatus.SCRIPT_REVIEW, "voice_gate")
+                raise ValueError(message)
+            voice_artifact = register_artifact(
+                session, content=content, executor=executor, path=voice_path, artifact_type="voice", stage="voice",
             )
-            flow.set_error(content_id, "VOICE_DURATION", message)
-            flow.mark_status(content_id, ContentStatus.SCRIPT_REVIEW, "voice_gate")
-            raise ValueError(message)
-        voice_artifact = register_artifact(
-            session,
-            content=content,
-            executor=executor,
-            path=voice_path,
-            artifact_type="voice",
-            stage="voice",
-        )
         voice_binding = {
             "id": voice_artifact.id,
             "relative_path": voice_artifact.relative_path,
             "sha256": voice_artifact.sha256,
             "size_bytes": voice_artifact.size_bytes,
         }
-        if snapshot is not None:
-            # Task creation commits: reject a late review before invalidating or scheduling downstream work.
-            _revalidate_script_approval(session, content_id, snapshot)
-        else:
-            # Plain manual callers retain their contract but cannot bind old audio to a changed script.
-            session.expire_all()
-            latest = session.exec(select(AgentTask).where(
-                AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
-                AgentTask.status != TaskStatus.CANCELLED,
-            ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
-            if (not latest or _script_task_proof(latest[0]) != script_proof
-                or (len(latest) == 2 and latest[0].created_at == latest[1].created_at)):
-                raise NonRetryableMediaError("Script approval subject changed during voice generation")
-            try:
-                _unchanged_material_task(session, latest[0], consumed=False)
-            except ValueError as exc:
-                raise NonRetryableMediaError("Script approval subject changed during voice generation") from exc
+        # Reject a late review before invalidating or scheduling downstream work.
+        revalidate_voice_subject()
         if automatic:
             _require_script_assist(session, settings, content_id, automatic=True)
         # 重新配音后旧画面计划按新时长作废重建。
@@ -2852,6 +2878,12 @@ def approve_script(
             content_id, TaskType.VISUAL_PLAN
         )
         failed_content_qc = flow.latest_failed_content_qc(content_id)
+        latest_content_qc = session.exec(select(AgentTask).where(
+            AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+            AgentTask.status != TaskStatus.CANCELLED,
+        ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+        if latest_content_qc is None or failed_content_qc is None or latest_content_qc.id != failed_content_qc.id:
+            failed_content_qc = None
         content_qc_rework = {}
         if failed_content_qc is not None:
             previous_plan = _previous_visual_context(session, flow, content, failed_content_qc, previous_plan)
@@ -2860,7 +2892,8 @@ def approve_script(
                 "previous_plan": previous_plan or {},
                 "previous_qc_task_id": failed_content_qc.id,
             }
-        flow.invalidate_visual_plan(content_id)
+        packaged_revision = (script_task.input_data or {}).get("packaged_script_revision") is True
+        flow.invalidate_visual_plan(content_id, preserve_packaged_materials=packaged_revision)
         image_only = content.production_mode == ProductionMode.IMAGE_ONLY
         generated_asset_ids = [
             artifact.id
@@ -2882,6 +2915,7 @@ def approve_script(
                 "voice_duration_sec": voice_duration,
                 "visual_timing_evidence": timing_evidence,
                 "voice_artifact": voice_binding,
+                **generation_input,
                 "scenes": [],
                 "allowed_layouts": ["image_card"],
                 "asset_image_enabled": settings.asset_image_enabled,
@@ -2891,8 +2925,11 @@ def approve_script(
                 "context_files": [str(item["relative_path"]) for item in source_images],
                 "allowed_asset_ids": [*source_ids, *generated_asset_ids],
                 "allowed_reference_artifact_ids": source_ids,
+                **({"previous_plan": previous_plan} if previous_plan else {}),
                 **content_qc_rework,
             }
+            if generation_input:
+                plan_input["context_files"].append(generation_input["voice_generation"]["receipt_artifact"]["relative_path"])
             flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, plan_input, priority=50)
             if manual_approval:
                 _record_manual_script_approval(session, settings, content_id, snapshot, voice_binding)
@@ -2919,6 +2956,7 @@ def approve_script(
                 "voice_duration_sec": voice_duration,
                 "visual_timing_evidence": timing_evidence,
                 "voice_artifact": voice_binding,
+                **generation_input,
                 "scenes": scene_data["scenes"],
                 "production_mode": ProductionMode.FOOTAGE.value,
                 "allowed_layouts": [
@@ -2933,7 +2971,7 @@ def approve_script(
                     str(scene["thumbnail"])
                     for scene in scene_data["scenes"]
                     if scene.get("thumbnail")
-                ],
+                ] + ([generation_input["voice_generation"]["receipt_artifact"]["relative_path"]] if generation_input else []),
                 **content_qc_rework,
             },
             priority=50,

@@ -2078,12 +2078,16 @@ class MediaExecutor:
         provider: str = "edge",
         provider_endpoint: str = "",
         provider_token: str = "",
+        model_dir: str = "",
         target_duration_sec: float | None = None,
     ) -> TtsResult:
         audio_dir = self.root / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
         requested = provider.strip().casefold() or "edge"
-        implementation = get_tts_provider(requested, provider_endpoint, provider_token)
+        implementation = (
+            get_tts_provider(requested, provider_endpoint, provider_token, model_dir=model_dir)
+            if requested == "kokoro" else get_tts_provider(requested, provider_endpoint, provider_token)
+        )
         # Publish the complete pair together; retries must never overwrite approved voice bytes.
         with TemporaryDirectory(prefix=".voice-", dir=audio_dir) as directory:
             staging = Path(directory)
@@ -2098,9 +2102,22 @@ class MediaExecutor:
                 or _finite_seconds(result.duration_sec, label="TTS duration") <= 0
             ):
                 raise NonRetryableMediaError("TTS did not produce a valid staged voice")
+            if requested == "kokoro" and (result.provider != "kokoro" or not result.provenance):
+                raise NonRetryableMediaError("Kokoro requires an offline generation receipt")
             (staging / "word_boundaries.json").write_text(
                 json.dumps(result.boundaries, ensure_ascii=False), encoding="utf-8",
             )
+            if result.provenance:
+                if (
+                    result.provenance.get("provider") != result.provider
+                    or result.provenance.get("output_sha256") != sha256_file(output)
+                    or result.provenance.get("narration_sha256")
+                    != hashlib.sha256(narration.encode("utf-8")).hexdigest()
+                ):
+                    raise NonRetryableMediaError("TTS generation receipt does not match staged voice")
+                (staging / "tts_generation_receipt.json").write_text(
+                    json.dumps(result.provenance, ensure_ascii=False, allow_nan=False), encoding="utf-8",
+                )
             destination = audio_dir / staging.name.removeprefix(".")
             staging.rename(destination)
         return TtsResult(
@@ -2109,6 +2126,7 @@ class MediaExecutor:
             boundaries=result.boundaries,
             provider=result.provider,
             fallback_reason=result.fallback_reason,
+            provenance=result.provenance,
         )
 
     def visual_timing_evidence(self, voice_path: Path, duration: float) -> dict[str, Any] | None:

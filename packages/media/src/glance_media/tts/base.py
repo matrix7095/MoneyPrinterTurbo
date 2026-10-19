@@ -12,6 +12,7 @@ class TtsResult:
     boundaries: list[dict] = field(default_factory=list)
     provider: str = ""
     fallback_reason: str = ""
+    provenance: dict = field(default_factory=dict)
 
     def __iter__(self):
         """Keep the former ``path, duration = synthesize_voice(...)`` API compatible."""

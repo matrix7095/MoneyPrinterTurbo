@@ -109,6 +109,10 @@ def test_unowned_listener_conflict_does_not_stop_it_or_create_credentials():
     {"handsfree_daily_publish_limit": 21}, {"tts_provider": "model-provider"},
     {"tts_rate": "not-a-rate"}, {"asr_device": "not-a-device"},
     {"tts_volume": "not-a-volume"}, {"tts_voice": "not-a-voice"},
+    {"tts_provider": "cosyvoice3"},
+    {"tts_voice": "not-a-voice", "tts_provider": "kokoro"},
+    {"kokoro_model_dir": "not-a-model", "tts_provider": "kokoro", "tts_voice": "kokoro:58"},
+    {"tts_provider_endpoint": "http://127.0.0.1:8765", "tts_provider": "kokoro", "tts_voice": "kokoro:58"},
     {"asr_compute_type": "not-a-compute-type"}, {"asr_model": "not-a-model"},
 ])
 def test_settings_allowlist_strict_types_and_ranges_fail_before_launch(settings):

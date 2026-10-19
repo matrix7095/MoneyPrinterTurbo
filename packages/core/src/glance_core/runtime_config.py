@@ -18,6 +18,7 @@ from glance_core.settings import (
     SUPPORTED_TTS_PROVIDERS,
     Settings,
     normalize_tts_provider,
+    resolve_kokoro_voice,
     validate_tts_provider_endpoint,
 )
 
@@ -44,7 +45,7 @@ EDITABLE_FIELDS: tuple[EditableField, ...] = (
         "配音 Provider",
         "配音",
         "select",
-        "支持 edge 和 cosyvoice3；不会因为 Provider 不可用而静默切换。",
+        "支持 edge、cosyvoice3 和本机 kokoro；不可用时不会静默切换。",
         SUPPORTED_TTS_PROVIDERS,
     ),
     EditableField(
@@ -52,14 +53,14 @@ EDITABLE_FIELDS: tuple[EditableField, ...] = (
         "配音 Provider 地址",
         "配音",
         "text",
-        "cosyvoice3 只能填写本机 loopback 地址；edge 留空。修改后下一个配音任务生效。",
+        "cosyvoice3 只能填写本机 loopback 地址；edge 和 kokoro 留空。",
     ),
     EditableField(
         "tts_voice",
         "配音音色",
         "配音",
         "select",
-        "edge-tts 中文音色。云希偏沉稳男声，晓晓偏亲和女声。",
+        "Edge 中文音色；Kokoro 本机中文男声 kokoro:58，女声 kokoro:3。",
         (
             "zh-CN-YunxiNeural",
             "zh-CN-XiaoxiaoNeural",
@@ -67,6 +68,8 @@ EDITABLE_FIELDS: tuple[EditableField, ...] = (
             "zh-CN-XiaoyiNeural",
             "zh-CN-YunyangNeural",
             "zh-CN-liaoning-XiaobeiNeural",
+            "kokoro:58",
+            "kokoro:3",
         ),
     ),
     EditableField(
@@ -488,6 +491,10 @@ def save_overrides(session: Session, values: dict[str, Any], *, actor_id: str = 
         ),
         allow_unconfigured=True,
     )
+    provider = values.get("tts_provider", current_overrides.get("tts_provider", base.tts_provider))
+    voice = values.get("tts_voice", current_overrides.get("tts_voice", base.tts_voice))
+    if provider == "kokoro":
+        resolve_kokoro_voice(voice)
     by_key = {field.key: field for field in EDITABLE_FIELDS}
     changed: dict[str, str] = {}
     for key, value in values.items():

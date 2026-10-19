@@ -116,6 +116,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot identify this virtual environment runti
 $businessOptions = [ordered]@{
     asr_model = 'medium'; asr_device = 'cpu'; asr_compute_type = 'int8'
     tts_provider = 'edge'; tts_voice = 'zh-CN-YunxiNeural'; tts_rate = '+20%'; tts_volume = '+0%'
+    tts_provider_endpoint = ''; kokoro_model_dir = ''
     handsfree_enabled = $false; handsfree_auto_topic_enabled = $true
     handsfree_auto_review_enabled = $true; handsfree_auto_publish_douyin_enabled = $true
     handsfree_min_candidate_score = 70; handsfree_daily_publish_limit = 1
@@ -157,7 +158,7 @@ from pydantic import TypeAdapter, ValidationError
 from glance_core.settings import Settings
 options = json.load(sys.stdin)
 failures = []
-if options["tts_provider"] != "edge":
+if options["tts_provider"] not in {"edge", "kokoro"}:
     failures.append("tts_provider:approved_provider_required")
 for key, value in options.items():
     field = Settings.model_fields[key]
@@ -168,12 +169,26 @@ for key, value in options.items():
     except ValidationError as error:
         failures.extend(f"{key}:{item['type']}" for item in error.errors(include_input=False, include_context=False, include_url=False))
 if not failures:
-    import edge_tts
-    for key, argument in (("tts_voice", "voice"), ("tts_rate", "rate"), ("tts_volume", "volume")):
+    if options["tts_provider_endpoint"]:
+        failures.append("tts_provider_endpoint:local_provider_requires_blank")
+    if options["tts_provider"] == "edge":
+        import edge_tts
+        for key, argument in (("tts_voice", "voice"), ("tts_rate", "rate"), ("tts_volume", "volume")):
+            try:
+                edge_tts.Communicate("startup validation", **{argument: options[key]})
+            except (ValueError, TypeError):
+                failures.append(f"{key}:invalid_edge_parameter")
+    else:
+        from glance_media.tts.kokoro import _runtime, kokoro_parameters, verify_kokoro_bundle
         try:
-            edge_tts.Communicate("startup validation", **{argument: options[key]})
+            kokoro_parameters(options["tts_voice"], options["tts_rate"], options["tts_volume"])
         except (ValueError, TypeError):
-            failures.append(f"{key}:invalid_edge_parameter")
+            failures.append("tts_voice/tts_rate/tts_volume:invalid_kokoro_parameter")
+        try:
+            verify_kokoro_bundle(options["kokoro_model_dir"])
+            _runtime()
+        except Exception:
+            failures.append("kokoro_model_dir:pinned_local_bundle_or_runtime_unavailable")
     from pathlib import Path
     from faster_whisper.utils import available_models
     import ctranslate2

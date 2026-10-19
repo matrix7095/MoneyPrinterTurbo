@@ -987,10 +987,6 @@ class WorkflowService:
         refs = {"script": script.id if script else None, "visual_plan": plan.id if plan else None}
         evidence["registered_source_context"] = source_context(self.session, content.id, refs)
         evidence["images"] = []
-        evidence["local_adaptation"] = {
-            "receipt_status": "not_registered_as_content_artifact",
-            "limitation": "Generation results describe uploaded images; original-to-prepared adaptation is not proved by those results or QC.",
-        }
         if plan:
             try:
                 segments = resolved_visual_plan(self.session, plan).get("segments", [])
@@ -1010,6 +1006,57 @@ class WorkflowService:
                     except ValueError:
                         gaps.append(f"image_{index}: exact generation lineage unavailable")
                 evidence["images"].append(item)
+        # Imported processing evidence is separate from generation claims, quality approval and rights.
+        expected_preparations = {item["artifact"]["artifact_id"] for item in evidence["images"]
+                                 if item.get("artifact") and item["artifact"].get("artifact_type") == "agent_generated_image"}
+        if base is not None:
+            expected_preparations.add(base.id)
+        preparation_records, missing_preparations = [], []
+        for prepared_id in sorted(expected_preparations):
+            registrations = self.session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "artifact", AuditEvent.entity_id == prepared_id,
+                AuditEvent.action == "image_preparation_registered",
+            )).all()
+            prepared = self.session.get(Artifact, prepared_id)
+            registration = registrations[0] if len(registrations) == 1 else None
+            metadata = registration.metadata_json if registration else {}
+            original = self.session.get(Artifact, metadata.get("original_artifact_id", ""))
+            receipt_artifact = self.session.get(Artifact, metadata.get("receipt_artifact_id", ""))
+            valid = bool(registration and registration.actor_type == "admin" and registration.actor_id == "mpt-admin-api"
+                and prepared and original and receipt_artifact and original.content_id == receipt_artifact.content_id == content.id
+                and original.artifact_type == "image_preparation_original" and receipt_artifact.artifact_type == "image_preparation_receipt"
+                and original.producer_stage == receipt_artifact.producer_stage == prepared.producer_stage
+                and metadata.get("prepared_sha256") == prepared.sha256
+                and metadata.get("record_sha256") == receipt_artifact.sha256)
+            record = {}
+            if valid:
+                original_info = artifact_record(original, "preparation_original")
+                receipt_info = artifact_record(receipt_artifact, "preparation_receipt")
+                valid = bool(original_info["bytes_verified"] and receipt_info["bytes_verified"])
+                if valid:
+                    record, _ = json_record(root / receipt_artifact.relative_path, "preparation_receipt")
+                    generation = self.session.get(AgentTask, prepared.producer_stage)
+                    valid = bool(generation and record.get("prepared_artifact_id") == prepared.id
+                        and record.get("prepared_sha256") == prepared.sha256 and record.get("task_id") == generation.id
+                        and record.get("input_sha256") == generation.input_hash == stable_hash(generation.input_data)
+                        and record.get("result_sha256") == stable_hash(generation.result_data)
+                        and record.get("source_sha256") == original.sha256 and record.get("source_size_bytes") == original.size_bytes
+                        and record.get("source_receipt_sha256") == metadata.get("source_receipt_sha256")
+                        and record.get("replay_verified") is True and record.get("raw_input_bytes_verified") is False
+                        and record.get("license_verified") is False and record.get("vendor_generation_receipt_verified") is False)
+            if valid:
+                preparation_records.append({"prepared_artifact_id": prepared_id, "original": original_info,
+                                            "receipt": receipt_info, "processing": record})
+            else:
+                missing_preparations.append(prepared_id)
+        preparation_complete = bool(evidence["images"] and base is not None and expected_preparations
+                                    and not missing_preparations and all(item.get("artifact") for item in evidence["images"]))
+        evidence["local_adaptation"] = {
+            "receipt_status": "complete" if preparation_complete else "incomplete",
+            "complete": preparation_complete, "expected_artifact_ids": sorted(expected_preparations),
+            "missing_artifact_ids": missing_preparations, "records": preparation_records,
+            "limitation": "Registered originals and processing replay do not establish vendor-native generation provenance or a license; historical workspace input bytes remain unverified.",
+        }
         evidence["plan_qc"] = task_record(self.completed_task_for(content.id, TaskType.VISUAL_PLAN_QC), "plan_qc")
         image_qcs = self.session.exec(select(AgentTask).where(
             AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
@@ -1023,6 +1070,21 @@ class WorkflowService:
         evidence["voice"] = {"artifact": voice_record, "provider": "unknown",
                              "provider_evidence": "historical voice has no persisted provider receipt",
                              "plan_binding_matches": bool(voice and voice.sha256 == voice_binding.get("sha256"))}
+        if plan and plan.input_data.get("voice_generation"):
+            from glance_core.voice_generation import verify_voice_generation
+
+            try:
+                if settings is None or script is None:
+                    raise ValueError("configured verifier/current script unavailable")
+                generation, generation_artifact = verify_voice_generation(
+                    self.session, settings, content, voice_binding, plan.input_data["voice_generation"], script,
+                )
+                evidence["voice"].update(
+                    provider="kokoro", provider_evidence="signed local generation receipt matches current script and voice bytes",
+                    generation=generation, generation_receipt=artifact_record(generation_artifact, "voice_generation_receipt"),
+                )
+            except (ValueError, OSError, TypeError, KeyError):
+                gaps.append("voice: current local generation receipt failed verification")
         # A matching signed historical request proves requested options, not the provider's response or rights.
         if settings is not None and script and voice and voice_record and voice_record["bytes_verified"]:
             approvals = self.session.exec(select(AuditEvent).where(
@@ -5459,7 +5521,8 @@ class WorkflowService:
         return content
 
     def invalidate_visual_plan(
-        self, content_id: str, *, include_review_tasks: bool = False, reason: str = "voice_redub"
+        self, content_id: str, *, include_review_tasks: bool = False, reason: str = "voice_redub",
+        preserve_packaged_materials: bool = False,
     ) -> int:
         """作废旧画面链路，允许按新输入重建。"""
         task_types = set(_VISUAL_PLAN_DOWNSTREAM_TASK_TYPES)
@@ -5472,7 +5535,10 @@ class WorkflowService:
                     TaskType.PUBLISH_REVIEW_ASSIST,
                 }
             )
-        return self._cancel_content_tasks(content_id, task_types, reason=reason)
+        return self._cancel_content_tasks(
+            content_id, task_types, reason=reason,
+            preserve_packaged_materials=preserve_packaged_materials,
+        )
 
     def _queue_script_rewrite(
         self,
@@ -5491,6 +5557,8 @@ class WorkflowService:
         target_duration_sec: float | None = None,
         min_video_seconds: float | None = None,
         max_video_seconds: float | None = None,
+        previous_plan: dict | None = None,
+        preserve_packaged_materials: bool = False,
     ) -> AgentTask:
         transcript_path = Path(content.content_dir).resolve() / "transcript" / "transcript.json"
         previous_script_data = previous_script if isinstance(previous_script, dict) else {}
@@ -5511,6 +5579,7 @@ class WorkflowService:
                 *_VISUAL_PLAN_DOWNSTREAM_TASK_TYPES,
             },
             reason=reason,
+            preserve_packaged_materials=preserve_packaged_materials,
         )
         input_data = {
             "upstream_task_ids": upstream_task_ids,
@@ -5537,6 +5606,10 @@ class WorkflowService:
         }
         if auto_rewrite_attempt is not None:
             input_data["auto_rewrite_attempt"] = auto_rewrite_attempt
+        if previous_plan is not None:
+            input_data["previous_plan"] = previous_plan
+        if preserve_packaged_materials:
+            input_data["packaged_script_revision"] = True
         if auto_assist_revision_attempt is not None:
             input_data["auto_assist_revision_attempt"] = auto_assist_revision_attempt
         if script_qc_issues is not None:
@@ -5547,13 +5620,22 @@ class WorkflowService:
             input_data["min_video_seconds"] = min_video_seconds
         if max_video_seconds is not None:
             input_data["max_video_seconds"] = max_video_seconds
+        if preserve_packaged_materials:
+            # create_task commits: publish the revision state with its frozen input.
+            content.script_version += 1
+            content.error_code = content.error_message = None
+            content.business_status = ContentStatus.WAITING_AGENT
+            content.current_stage = "script_rewrite"
+            content.updated_at = utc_now()
+            self.session.add(content)
         rewrite = self.create_agent_task(
             content.id,
             TaskType.SHORT_SCRIPT,
             input_data,
             priority=priority,
         )
-        content.script_version += 1
+        if not preserve_packaged_materials:
+            content.script_version += 1
         content.error_code = None
         content.error_message = None
         content.business_status = ContentStatus.WAITING_AGENT
@@ -5812,11 +5894,16 @@ class WorkflowService:
         self.session.refresh(content)
         return True
 
-    def reject_script(self, content_id: str, note: str) -> Content:
+    def reject_script(
+        self, content_id: str, note: str, *, packaged_previous_plan: dict | None = None
+    ) -> Content:
         content = self.session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
-        if content.business_status not in {ContentStatus.SCRIPT_REVIEW, ContentStatus.FAILED}:
+        packaged_revision = (
+            content.business_status == ContentStatus.PACKAGED and packaged_previous_plan is not None
+        )
+        if not packaged_revision and content.business_status not in {ContentStatus.SCRIPT_REVIEW, ContentStatus.FAILED}:
             raise ValueError("Only SCRIPT_REVIEW or FAILED content can have its script rejected")
         research_task = self.completed_task_for(content_id, TaskType.CONTENT_RESEARCH)
         scene_tasks = self.scene_analysis_tasks(content_id)
@@ -5833,6 +5920,8 @@ class WorkflowService:
             reviewer_note=note,
             reason="script_rejected",
             priority=45,
+            previous_plan=packaged_previous_plan if packaged_revision else None,
+            preserve_packaged_materials=packaged_revision,
         )
         self.session.add(
             AuditEvent(
@@ -5845,6 +5934,7 @@ class WorkflowService:
                     "note": note,
                     "script_version": content.script_version,
                     "rewrite_task_id": rewrite.id,
+                    **({"packaged_script_revision": True} if packaged_revision else {}),
                 },
             )
         )
@@ -6006,6 +6096,7 @@ class WorkflowService:
         task_types: set[TaskType],
         *,
         reason: str,
+        preserve_packaged_materials: bool = False,
     ) -> int:
         tasks = self.session.exec(
             select(AgentTask).where(
@@ -6014,6 +6105,15 @@ class WorkflowService:
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED]),
             )
         ).all()
+        if preserve_packaged_materials:
+            # A manual packaged revision reuses its cover and retains negative evidence.
+            tasks = [task for task in tasks if not (
+                (task.input_data or {}).get("asset_purpose") == "cover"
+                or (task.status == TaskStatus.COMPLETED and (
+                    (task.result_data or {}).get("passed") is False
+                    or (task.result_data or {}).get("verdict") in {"REVISE", "HUMAN", "READY", "BLOCKED", "REJECTED", "REJECT"}
+                ))
+            )]
         for task in tasks:
             if task.status in {TaskStatus.PENDING, TaskStatus.LEASED}:
                 self.tasks.cancel(task.id, actor_id=reason)
@@ -6034,5 +6134,8 @@ class WorkflowService:
                     )
                 )
         if tasks:
-            self.session.commit()
+            if preserve_packaged_materials:
+                self.session.flush()
+            else:
+                self.session.commit()
         return len(tasks)
