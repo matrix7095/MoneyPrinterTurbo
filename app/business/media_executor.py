@@ -1,9 +1,11 @@
 """Glance acquisition/QC helpers with MPT's real deterministic render backend."""
 
+import hashlib
 import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from uuid import uuid4
@@ -302,18 +304,74 @@ class MptMediaExecutor(MediaExecutor):
         return [(evidence.root / path).relative_to(self.root).as_posix() for path in paths]
 
     def package(self, metadata, *, final_path=None):
-        final = self._local_asset(
-            Path(final_path) if final_path is not None else self.root / "render" / "final.mp4"
-        )
+        source = Path(final_path) if final_path is not None else self.root / "render" / "final.mp4"
+        final = self._local_asset(source)
+        root = self.root.resolve()
+
+        def is_reparse_point(path: Path) -> bool:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return False
+            attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            return path.is_symlink() or bool(getattr(info, "st_file_attributes", 0) & attributes)
+
+        lexical_source = Path(os.path.abspath(source))
+        if not lexical_source.is_relative_to(root):
+            raise NonRetryableMediaError("Render asset must be a file within the content directory")
+        current = lexical_source
+        while current != root:
+            if is_reparse_point(current):
+                raise NonRetryableMediaError("Package source must not use reparse points")
+            current = current.parent
+
         publish_dir = self.root / "publish"
-        publish_dir.mkdir(parents=True, exist_ok=True)
-        destination = publish_dir / "final.mp4"
-        destination.unlink(missing_ok=True)
-        try:
-            os.link(final, destination)
-        except OSError:
-            shutil.copy2(final, destination)
-        (publish_dir / "publish.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-        return publish_dir
+        revisions_dir = publish_dir / "package-revisions"
+        for directory in (publish_dir, revisions_dir):
+            if is_reparse_point(directory):
+                raise NonRetryableMediaError("Package directory must not use reparse points")
+            try:
+                directory.mkdir(exist_ok=True)
+            except FileExistsError as exc:
+                raise NonRetryableMediaError("Package directory path is not a directory") from exc
+            if is_reparse_point(directory) or not directory.resolve().is_relative_to(root):
+                raise NonRetryableMediaError("Package directory must stay within the content directory")
+
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        source_sha256 = sha256_file(final)
+        revision_id = hashlib.sha256(source_sha256.encode("ascii") + b"\0" + metadata_bytes).hexdigest()
+        destination = revisions_dir / revision_id
+
+        def verify_existing() -> Path:
+            if is_reparse_point(destination) or not destination.is_dir():
+                raise NonRetryableMediaError("Immutable package revision path is unsafe")
+            if not destination.resolve().is_relative_to(revisions_dir.resolve()):
+                raise NonRetryableMediaError("Package revision must stay within its revision directory")
+            video_path, metadata_path = destination / "final.mp4", destination / "publish.json"
+            if is_reparse_point(video_path) or is_reparse_point(metadata_path):
+                raise NonRetryableMediaError("Immutable package revision contains a reparse point")
+            video_path, metadata_path = self._local_asset(video_path), self._local_asset(metadata_path)
+            if sha256_file(video_path) != source_sha256 or metadata_path.read_bytes() != metadata_bytes:
+                raise NonRetryableMediaError("Immutable package revision failed integrity validation")
+            return destination
+
+        if destination.exists() or is_reparse_point(destination):
+            return verify_existing()
+
+        with tempfile.TemporaryDirectory(prefix=".package-", dir=revisions_dir) as temporary_dir:
+            staging = Path(temporary_dir)
+            staged_video = staging / "final.mp4"
+            shutil.copy2(final, staged_video)
+            if sha256_file(staged_video) != source_sha256:
+                raise NonRetryableMediaError("Package source changed while it was being copied")
+            with (staging / "publish.json").open("xb") as target:
+                target.write(metadata_bytes)
+                target.flush()
+                os.fsync(target.fileno())
+            try:
+                os.rename(staging, destination)
+            except OSError:
+                if destination.exists() or is_reparse_point(destination):
+                    return verify_existing()
+                raise
+        return verify_existing()

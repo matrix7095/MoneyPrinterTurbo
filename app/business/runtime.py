@@ -1285,6 +1285,21 @@ class BusinessRuntime:
         )):
             raise TaskConflictError("VISUAL_REPAIR_HISTORY_CANCELLATION_CHANGED")
 
+    def reconcile_packaged_visual_context(self, content_id: str, expected: dict) -> dict:
+        from app.business.requests import PackagedVisualContextRequest
+        from app.business.visual_plan_context import reconcile_packaged_visual_context
+
+        expected = PackagedVisualContextRequest.model_validate(expected).model_dump()
+        with content_operation_lock(self.settings, content_id):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    response = reconcile_packaged_visual_context(self, session, content_id, expected)
+                    Session.commit(session)
+                    return response
+                finally:
+                    session.rollback()
+
     def reconcile_visual_repair_context(self, content_id: str, expected: dict) -> dict:
         """Supersede only the proven indexed-continuity context defect, without a new Recovery."""
         from glance_core.content_acceptance import generated_image_material

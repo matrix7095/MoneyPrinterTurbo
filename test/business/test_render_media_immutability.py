@@ -222,6 +222,15 @@ def test_package_uses_current_output_and_preserves_metadata(tmp_path):
     (executor.root / "render").mkdir()
     legacy = executor.root / "render" / "final.mp4"
     legacy.write_bytes(b"old video")
+    old_publish = executor.root / "publish"
+    old_publish.mkdir()
+    legacy_package = {
+        old_publish / "final.mp4": b"historical package",
+        old_publish / "publish.json": b"historical metadata",
+        old_publish / "cover.jpg": b"historical cover",
+    }
+    for path, content in legacy_package.items():
+        path.write_bytes(content)
     current = executor.root / "current.mp4"
     current.write_bytes(b"current accepted video")
     metadata = {"title": "标题", "sources": ["https://example.com/"], "narration": "test"}
@@ -229,7 +238,154 @@ def test_package_uses_current_output_and_preserves_metadata(tmp_path):
     assert (directory / "final.mp4").read_bytes() == current.read_bytes()
     assert json.loads((directory / "publish.json").read_text(encoding="utf-8")) == metadata
     assert legacy.read_bytes() == b"old video"
-    assert (executor.package(metadata) / "final.mp4").read_bytes() == legacy.read_bytes()
+    default_package = executor.package(metadata)
+    assert default_package != directory
+    assert (default_package / "final.mp4").read_bytes() == legacy.read_bytes()
+    assert {path: path.read_bytes() for path in legacy_package} == legacy_package
+
+
+def test_package_revisions_preserve_previous_video_and_metadata_bytes(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    old_render = executor.root / "render" / "revisions" / "old" / "final.mp4"
+    new_render = executor.root / "render" / "revisions" / "new" / "final.mp4"
+    old_render.parent.mkdir(parents=True)
+    new_render.parent.mkdir(parents=True)
+    old_render.write_bytes(b"old rendered video")
+    new_render.write_bytes(b"new rendered video")
+    old_metadata = {"title": "旧版", "narration": "旧配音"}
+    new_metadata = {"title": "新版", "narration": "新配音"}
+
+    old_package = executor.package(old_metadata, final_path=old_render)
+    frozen_old_video = (old_package / "final.mp4").read_bytes()
+    frozen_old_metadata = (old_package / "publish.json").read_bytes()
+    new_package = executor.package(new_metadata, final_path=new_render)
+
+    assert old_package != new_package
+    assert (new_package / "final.mp4").read_bytes() == b"new rendered video"
+    assert json.loads((new_package / "publish.json").read_text(encoding="utf-8")) == new_metadata
+    assert (old_package / "final.mp4").read_bytes() == frozen_old_video
+    assert (old_package / "publish.json").read_bytes() == frozen_old_metadata
+    assert old_render.read_bytes() == b"old rendered video"
+    assert new_render.read_bytes() == b"new rendered video"
+
+
+def test_package_metadata_change_creates_a_new_immutable_revision(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"same rendered video")
+    first = executor.package({"title": "标题一"}, final_path=source)
+    first_metadata = (first / "publish.json").read_bytes()
+
+    second = executor.package({"title": "标题二"}, final_path=source)
+
+    assert first != second
+    assert (first / "final.mp4").read_bytes() == b"same rendered video"
+    assert (second / "final.mp4").read_bytes() == b"same rendered video"
+    assert (first / "publish.json").read_bytes() == first_metadata
+    assert json.loads((second / "publish.json").read_text(encoding="utf-8")) == {"title": "标题二"}
+
+
+def test_package_reuses_identical_revision_and_rejects_tampering(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"same rendered video")
+    metadata = {"title": "稳定"}
+    first = executor.package(metadata, final_path=source)
+    assert executor.package(metadata, final_path=source) == first
+
+    packaged_video = first / "final.mp4"
+    packaged_video.write_bytes(b"tampered package")
+    with pytest.raises(NonRetryableMediaError, match="integrity"):
+        executor.package(metadata, final_path=source)
+    assert packaged_video.read_bytes() == b"tampered package"
+    assert source.read_bytes() == b"same rendered video"
+
+
+def test_package_copy_succeeds_without_hard_link_support(tmp_path, monkeypatch):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"complete video")
+    monkeypatch.setattr(media_executor.os, "link", lambda *a: pytest.fail("package should use an independent copy"))
+
+    package = executor.package({"title": "copy fallback"}, final_path=source)
+
+    assert (package / "final.mp4").read_bytes() == b"complete video"
+    assert source.read_bytes() == b"complete video"
+
+
+def test_package_partial_staging_failure_never_publishes_a_revision(tmp_path, monkeypatch):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"complete video")
+    legacy = executor.root / "publish" / "final.mp4"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"legacy video")
+    def partial_copy(_, destination):
+        Path(destination).write_bytes(b"partial")
+        raise OSError("copy interrupted")
+
+    monkeypatch.setattr(media_executor.shutil, "copy2", partial_copy)
+    with pytest.raises(OSError, match="copy interrupted"):
+        executor.package({"title": "interrupted"}, final_path=source)
+
+    revisions = executor.root / "publish" / "package-revisions"
+    assert list(revisions.iterdir()) == []
+    assert legacy.read_bytes() == b"legacy video"
+    assert source.read_bytes() == b"complete video"
+
+
+def test_package_rejects_external_symlink_source(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"external video")
+    alias = executor.root / "outside.mp4"
+    try:
+        alias.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(NonRetryableMediaError, match="within"):
+        executor.package({"title": "unsafe"}, final_path=alias)
+    assert not (executor.root / "publish").exists()
+
+
+def test_package_rejects_internal_reparse_source(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"local video")
+    alias = executor.root / "alias.mp4"
+    try:
+        alias.symlink_to(source)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(NonRetryableMediaError, match="reparse"):
+        executor.package({"title": "unsafe"}, final_path=alias)
+    assert not (executor.root / "publish").exists()
+
+
+def test_package_rejects_reparse_revision_directory(tmp_path):
+    executor = MptMediaExecutor(tmp_path / "content")
+    source = executor.root / "render" / "final.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"local video")
+    outside = tmp_path / "outside-revisions"
+    outside.mkdir()
+    revisions = executor.root / "publish" / "package-revisions"
+    revisions.parent.mkdir()
+    try:
+        revisions.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(NonRetryableMediaError, match="reparse"):
+        executor.package({"title": "unsafe"}, final_path=source)
+    assert list(outside.iterdir()) == []
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg/ffprobe required")

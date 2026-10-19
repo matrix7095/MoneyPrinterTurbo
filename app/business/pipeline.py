@@ -2909,6 +2909,16 @@ def approve_script(
             # 生图段（参考重绘 + 纯生图）受管理台预算限制。
             source_images = source_image_index(content)
             source_ids = [str(item["artifact_id"]) for item in source_images]
+            visual_context = {
+                "source_images": source_images,
+                "context_files": [str(item["relative_path"]) for item in source_images],
+                "allowed_asset_ids": [*source_ids, *generated_asset_ids],
+                "allowed_reference_artifact_ids": source_ids,
+            }
+            if packaged_revision:
+                from app.business.visual_plan_context import packaged_visual_context
+
+                visual_context = packaged_visual_context(session, content, script_task, previous_plan, source_images)
             budget = settings.image_only_gen_budget if settings.asset_image_enabled else 0
             plan_input = {
                 "upstream_task_ids": {"script": script_task.id},
@@ -2921,10 +2931,7 @@ def approve_script(
                 "asset_image_enabled": settings.asset_image_enabled,
                 "production_mode": ProductionMode.IMAGE_ONLY.value,
                 "image_only_gen_budget": budget,
-                "source_images": source_images,
-                "context_files": [str(item["relative_path"]) for item in source_images],
-                "allowed_asset_ids": [*source_ids, *generated_asset_ids],
-                "allowed_reference_artifact_ids": source_ids,
+                **visual_context,
                 **({"previous_plan": previous_plan} if previous_plan else {}),
                 **content_qc_rework,
             }

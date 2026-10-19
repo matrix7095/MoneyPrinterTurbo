@@ -145,6 +145,28 @@ class ExpectedHostBinding(StrictRequest):
     process_identity: HostProcess
 
 
+class PackagedVisualTaskBinding(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_id: str = Field(min_length=1, max_length=100)
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt: int = Field(ge=1)
+
+
+class PackagedVisualRecoveryBinding(PackagedVisualTaskBinding):
+    raw_file_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PackagedVisualContextRequest(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run: ExpectedHostBinding
+    execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failed_plan: PackagedVisualTaskBinding
+    recovery: PackagedVisualRecoveryBinding
+
+
 class StopRunRequest(StrictRequest):
     expected_binding: ExpectedHostBinding
 

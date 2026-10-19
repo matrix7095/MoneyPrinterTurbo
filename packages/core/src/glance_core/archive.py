@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -48,6 +49,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verified_file(root: Path, path: Path, artifact: Artifact | None = None) -> Path:
+    resolved = path.resolve()
+    unsafe = not resolved.is_relative_to(root)
+    current = path.absolute()
+    while current != root and current.is_relative_to(root):
+        if current.is_symlink() or (
+            current.exists()
+            and getattr(current.lstat(), "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            unsafe = True
+        current = current.parent
+    if unsafe or not resolved.is_file() or (artifact is not None and (
+        resolved.stat().st_size != artifact.size_bytes or _sha256_file(resolved) != artifact.sha256
+    )):
+        raise ArchiveError("Current artifact failed archive integrity validation")
+    return resolved
+
+
 class ArchiveService:
     def __init__(self, session: Session, settings: Settings) -> None:
         self.session = session
@@ -83,27 +103,60 @@ class ArchiveService:
             self._git("commit", "-m", "archive: initialize repository")
         return self.repo_dir
 
+    def _latest_artifact(self, content_id: str, artifact_type: str) -> Artifact | None:
+        return self.session.exec(
+            select(Artifact)
+            .where(Artifact.content_id == content_id, Artifact.artifact_type == artifact_type)
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+        ).first()
+
     def snapshot(self, content_id: str) -> Path:
         content = self.session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
         content_root = Path(content.content_dir).resolve()
-        final_artifact = self.session.exec(
-            select(Artifact)
-            .where(Artifact.content_id == content_id, Artifact.artifact_type == "final_video")
-            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
-        ).first()
+        final_artifact = self._latest_artifact(content_id, "final_video")
         final_video = content_root / (
             final_artifact.relative_path if final_artifact else "render/final.mp4"
         )
-        if final_artifact and (
-            not final_video.resolve().is_relative_to(content_root)
-            or not final_video.is_file()
-            or final_video.stat().st_size != final_artifact.size_bytes
-            or _sha256_file(final_video) != final_artifact.sha256
-        ):
-            raise ArchiveError("Current final video failed archive integrity validation")
+        if final_artifact or final_video.exists():
+            final_video = _verified_file(content_root, final_video, final_artifact)
         video_sha256 = _sha256_file(final_video) if final_video.is_file() else ""
+        legacy = final_video == content_root / "render/final.mp4"
+        sources: dict[str, Path] = {}
+        qc = final_video.with_name("qc.json")
+        if qc.exists() or qc.is_symlink():
+            sources["qc.json"] = _verified_file(content_root, qc)
+        publish = self._latest_artifact(content_id, "publish_video")
+        if publish is not None:
+            packaged_video = _verified_file(content_root, content_root / publish.relative_path, publish)
+            revision_root = content_root / "publish/package-revisions"
+            if publish.sha256 == video_sha256 and (legacy or packaged_video.is_relative_to(revision_root)):
+                metadata_path = _verified_file(content_root, packaged_video.with_name("publish.json"))
+                raw = metadata_path.read_bytes()
+                try:
+                    metadata = json.loads(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ArchiveError("Package metadata failed archive integrity validation") from exc
+                if not isinstance(metadata, dict) or metadata.get("content_id") != content.id or (
+                    packaged_video.is_relative_to(revision_root)
+                    and packaged_video.parent.name != hashlib.sha256(
+                        video_sha256.encode("ascii") + b"\0" + raw
+                    ).hexdigest()
+                ):
+                    raise ArchiveError("Package metadata failed archive integrity validation")
+                sources["publish.json"] = metadata_path
+        elif legacy:
+            metadata_path = content_root / "publish/publish.json"
+            if metadata_path.exists() or metadata_path.is_symlink():
+                sources["publish.json"] = _verified_file(content_root, metadata_path)
+        cover = self._latest_artifact(content_id, "cover")
+        if cover is not None:
+            sources["cover.jpg"] = _verified_file(content_root, content_root / cover.relative_path, cover)
+        elif legacy:
+            cover_path = content_root / "publish/cover.jpg"
+            if cover_path.exists() or cover_path.is_symlink():
+                sources["cover.jpg"] = _verified_file(content_root, cover_path)
         candidate = self.session.get(Candidate, content.candidate_id)
         tasks = self.session.exec(
             select(AgentTask)
@@ -161,14 +214,12 @@ class ArchiveService:
                 json.dumps(plan, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        for relative, name in (
-            ("render/qc.json", "qc.json"),
-            ("publish/publish.json", "publish.json"),
-            ("publish/cover.jpg", "cover.jpg"),
-        ):
-            source_path = content_root / relative
-            if source_path.is_file():
-                shutil.copy2(source_path, target / name)
+        for name in ("qc.json", "publish.json", "cover.jpg"):
+            if name in sources:
+                shutil.copy2(sources[name], target / name)
+            else:
+                # A newer unpackaged revision must not retain the previous snapshot's sidecars.
+                (target / name).unlink(missing_ok=True)
 
         entry = {
             "content_id": content.id,

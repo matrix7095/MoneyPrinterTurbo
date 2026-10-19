@@ -22,6 +22,7 @@ from sqlmodel import Session, select
 
 from app.business.auth import require_admin
 from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest, ExpectedHostBinding
+from app.business.requests import PackagedVisualContextRequest
 from app.business.runtime import get_runtime, get_session
 from app.business.bundles import sha256_file
 from app.business.quarantine import quarantine_records, task_projection
@@ -440,6 +441,20 @@ def reconcile_visual_repair_context(*, content_id: str, payload: VisualRepairCon
     try:
         return runtime.reconcile_visual_repair_context(content_id, payload.model_dump())
     except (ValueError, OSError, KeyError, TypeError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/reconcile-packaged-visual-context")
+def reconcile_packaged_visual_context(*, content_id: str, payload: PackagedVisualContextRequest, request: Request):
+    runtime = get_runtime(request)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Content not found")
+        content_root(content, runtime)
+    try:
+        return runtime.reconcile_packaged_visual_context(content_id, payload.model_dump())
+    except (ValueError, OSError, KeyError, TypeError, TaskConflictError, NonRetryableMediaError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
