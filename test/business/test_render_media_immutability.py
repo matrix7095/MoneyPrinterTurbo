@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from glance_media.executor import NonRetryableMediaError, probe, run_command, sha256_file
+from glance_media.executor import _aligned_subtitle_words, _subtitle_alignment_hash
 from PIL import Image
 
 from app.business import media_executor
@@ -283,3 +284,72 @@ def test_renderer_upgrade_creates_new_revision_without_replacing_old_outputs(ren
     receipt = json.loads((executor.root / "render/mpt-render-request.json").read_text())
     assert receipt["renderer_version"] == "local-ffmpeg-v2-cfr-pcm"
     assert executor.render(**arguments) == new
+
+
+def _subtitle_alignment(arguments, end=.3):
+    narration = arguments["narration"]
+    segments = [{"text": narration, "start_sec": 0, "end_sec": end,
+                 "words": [{"text": narration, "start_sec": 0, "end_sec": end}]}]
+    words = _aligned_subtitle_words(narration, segments, .4)
+    import hashlib
+    return {"version": 1, "method": "strict_voice_asr_words", "duration_sec": .4,
+            "voice_sha256": sha256_file(arguments["voice_path"]),
+            "narration_sha256": hashlib.sha256(narration.encode()).hexdigest(),
+            "asr_model": "fixture", "asr_device": "cpu", "asr_compute_type": "int8",
+            "segments": segments, "segments_sha256": _subtitle_alignment_hash(segments),
+            "words": words, "mapping_sha256": _subtitle_alignment_hash(words)}
+
+
+def test_each_alignment_revision_keeps_its_own_immutable_receipt(render_fixture):
+    executor, arguments = render_fixture
+    first_alignment = _subtitle_alignment(arguments, .25)
+    first = executor.render(**arguments, subtitle_alignment=first_alignment)
+    receipt = first[0].parent / "subtitle-alignment.json"
+    frozen = receipt.read_bytes()
+    second_alignment = _subtitle_alignment(arguments, .35)
+    second = executor.render(**arguments, subtitle_alignment=second_alignment)
+    assert first[0].parent != second[0].parent
+    assert receipt.read_bytes() == frozen
+    assert json.loads(receipt.read_text()) == first_alignment
+    assert json.loads((second[0].parent / "subtitle-alignment.json").read_text()) == second_alignment
+    assert executor.render(**arguments, subtitle_alignment=second_alignment) == second
+
+
+def test_tampered_alignment_receipt_is_rejected(render_fixture):
+    executor, arguments = render_fixture
+    alignment = _subtitle_alignment(arguments)
+    final, _ = executor.render(**arguments, subtitle_alignment=alignment)
+    receipt = final.parent / "subtitle-alignment.json"
+    receipt.write_text(json.dumps({**alignment, "asr_model": "tampered"}))
+    with pytest.raises(NonRetryableMediaError, match="receipt changed"):
+        executor.render(**arguments, subtitle_alignment=alignment)
+
+
+def test_alignment_is_not_backfilled_into_frozen_legacy_output(render_fixture):
+    executor, arguments = render_fixture
+    final, _ = executor.render(**arguments)
+    alignment = _subtitle_alignment(arguments)
+    request = executor.root / "render/mpt-render-request.json"
+    request.write_text(json.dumps({**json.loads(request.read_text()), "subtitle_alignment": alignment}))
+    with pytest.raises(NonRetryableMediaError, match="frozen render"):
+        executor.render(**arguments, subtitle_alignment=alignment)
+    assert not (final.parent / "subtitle-alignment.json").exists()
+
+
+def test_interrupted_alignment_receipt_write_recovers_without_partial_json(render_fixture, monkeypatch):
+    executor, arguments = render_fixture
+    alignment = _subtitle_alignment(arguments)
+    original = media_executor.os.replace
+
+    def interrupt(source, destination):
+        if Path(destination).name == "subtitle-alignment.json":
+            raise OSError("interrupted before atomic rename")
+        return original(source, destination)
+
+    monkeypatch.setattr(media_executor.os, "replace", interrupt)
+    with pytest.raises(OSError, match="atomic rename"):
+        executor.render(**arguments, subtitle_alignment=alignment)
+    assert list((executor.root / "render/revisions").glob("*/subtitle-alignment.json")) == []
+    monkeypatch.setattr(media_executor.os, "replace", original)
+    final, _ = executor.render(**arguments, subtitle_alignment=alignment)
+    assert json.loads((final.parent / "subtitle-alignment.json").read_text()) == alignment

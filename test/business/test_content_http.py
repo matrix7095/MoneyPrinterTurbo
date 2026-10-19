@@ -1187,6 +1187,7 @@ def test_explicit_encoder_failure_is_recorded_without_hidden_software_retry(
             raise RuntimeError("Unrelated source file read failure")
 
         monkeypatch.setattr(MptMediaExecutor, "render", fail_render)
+        monkeypatch.setattr(MptMediaExecutor, "align_subtitles", lambda *args, **kwargs: {"fixture": "pre-render ASR contract"})
         settings = runtime.settings.model_copy(update={"video_encoder": "h264_nvenc"})
         with pytest.raises(RuntimeError, match="Unrelated source file read failure"):
             pipeline.render_content(runtime.engine, settings, content_id)

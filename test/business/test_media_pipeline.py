@@ -279,6 +279,15 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
         {"text": "测试。", "start_sec": 0.6, "end_sec": 1.2},
     ] if native_boundaries else []), encoding="utf-8")
     evidence = executor.visual_timing_evidence(voice, 1.2)
+    frozen_timing = voice.with_name("word_boundaries.json").read_bytes()
+    monkeypatch.setattr(executor, "_local_asr", lambda *args, **kwargs: ([{
+        "text": "产品测试。", "start_sec": .05, "end_sec": 1.0,
+        "words": [{"text": "产品", "start_sec": .05, "end_sec": .5},
+                  {"text": "测试。", "start_sec": .5, "end_sec": 1.0}],
+    }], ""))
+    alignment = executor.align_subtitles(voice, "产品测试。", asr_model="fixture",
+                                         asr_device="cpu", asr_compute_type="int8")
+    monkeypatch.setattr(executor, "_local_asr", lambda *args, **kwargs: pytest.fail("Renderer loaded ASR"))
     # A changed legacy alias must not contaminate an approved immutable pair or its subtitles.
     (root / "audio" / "narration.mp3").write_bytes(b"wrong alias")
     (root / "audio" / "word_boundaries.json").write_text("[]", encoding="utf-8")
@@ -308,7 +317,7 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
     final, preview = executor.render(video_path=root / "unused.mp4", voice_path=voice,
                                      narration="产品测试。", plan_data={"segments": segments}, scenes=[],
                                      assets=images, generated_image_ids=set(images),
-                                     visual_timing_evidence=evidence)
+                                     visual_timing_evidence=evidence, subtitle_alignment=alignment)
     assert final.is_file() and preview.is_file()
     metadata = probe(final)
     assert abs(float(metadata["format"]["duration"]) - 1.2) < 0.15
@@ -321,6 +330,13 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
     receipt = json.loads((root / "render" / "mpt-render-request.json").read_text(encoding="utf-8"))
     assert len(receipt["prepared_sha256"]) == 2
     assert receipt["request"]["settings"]["video_crf"] == 18
+    assert receipt["subtitle_alignment"] == alignment
+    assert json.loads((final.parent / "subtitle-alignment.json").read_text()) == alignment
+    assert voice.with_name("word_boundaries.json").read_bytes() == frozen_timing
+    assert executor.visual_timing_evidence(voice, 1.2) == evidence
+    import pysubs2
+    captions = [event for event in pysubs2.load(str(root / "transcript/narration.ass")) if event.style == "Default"]
+    assert captions[-1].end == 1000
     assert project.revision()["settings"]["video_crf"] == 18
     preparations = [command for command in commands if "libx264" in command and "-frames:v" in command]
     assert len(preparations) == 2
@@ -349,6 +365,6 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
     revision_id = project.revision()["revision_id"]
     executor.render(video_path=root / "unused.mp4", voice_path=voice, narration="产品测试。",
                     plan_data={"segments": segments}, scenes=[], assets=images, generated_image_ids=set(images),
-                    visual_timing_evidence=evidence)
+                    visual_timing_evidence=evidence, subtitle_alignment=alignment)
     assert project.revision()["revision_id"] == revision_id
     assert all(stage["reused"] for stage in project.status()["stages"].values())

@@ -3079,6 +3079,10 @@ def render_content(
                     "mood": selected_bgm.mood or bgm_mood,
                 },
             }
+            arguments["subtitle_alignment"] = executor.align_subtitles(
+                arguments["voice_path"], arguments["narration"], asr_model=settings.asr_model,
+                asr_device=settings.asr_device, asr_compute_type=settings.asr_compute_type,
+            )
             return executor.render(**arguments, encoder=settings.video_encoder)
 
         final_path, preview_path = log_stage(session, content.id, "render", do_render)

@@ -700,6 +700,109 @@ def _split_boundary(boundary: dict[str, Any], duration: float) -> list[tuple[flo
     return events
 
 
+_SUBTITLE_ALIGNMENT_VERSION = 1
+_SUBTITLE_ALIGNMENT_PUNCTUATION = frozenset("，。！？；：、,.!?;:“”‘’\"「」『』《》〈〉（）()【】[]")
+_SUBTITLE_WORD_OVERLAP_SEC = 0.1
+
+
+def _subtitle_alignment_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _spoken_subtitle_indices(text: str) -> list[int]:
+    return [index for index, char in enumerate(text) if not char.isspace() and not (
+        char in _SUBTITLE_ALIGNMENT_PUNCTUATION
+        and not (char in ".," and 0 < index < len(text) - 1
+                 and text[index - 1].isdigit() and text[index + 1].isdigit())
+    )]
+
+
+def _aligned_subtitle_words(narration: str, segments: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
+    """Map exact ASR characters back to approved text; never rewrite the script."""
+    if not isinstance(narration, str) or not narration.strip() or not isinstance(segments, list) or not segments:
+        raise NonRetryableMediaError("Subtitle alignment requires complete ASR words")
+    words = []
+    for segment in segments:
+        if (not isinstance(segment, dict) or not isinstance(segment.get("text"), str)
+                or not isinstance(segment.get("words"), list) or not segment["words"]):
+            raise NonRetryableMediaError("Subtitle alignment requires complete ASR words")
+        words.extend(segment["words"])
+    if any(not isinstance(word, dict) or not isinstance(word.get("text"), str) or not word["text"].strip() for word in words):
+        raise NonRetryableMediaError("Subtitle alignment requires complete ASR words")
+    observed = "".join(word["text"] for word in words)
+    observed_indices = _spoken_subtitle_indices(observed)
+    source_indices = _spoken_subtitle_indices(narration)
+    spoken = "".join(observed[index] for index in observed_indices)
+    segment_text = "".join(segment["text"] for segment in segments)
+    if (not spoken or spoken != "".join(narration[index] for index in source_indices)
+            or spoken != "".join(segment_text[index] for index in _spoken_subtitle_indices(segment_text))):
+        raise NonRetryableMediaError("Subtitle ASR text does not exactly match the approved narration")
+    result, consumed, source_start, observed_start = [], 0, 0, 0
+    previous_start = previous_end = None
+    for index, word in enumerate(words):
+        start, end = word.get("start_sec"), word.get("end_sec")
+        if (not all(isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value) for value in (start, end))
+                or start < 0 or end <= start or end > duration
+                or (previous_start is not None and (start < previous_start or end <= previous_end
+                    or previous_end - start > _SUBTITLE_WORD_OVERLAP_SEC + 1e-6))):
+            raise NonRetryableMediaError("Subtitle ASR word timing is invalid or out of order")
+        previous_start, previous_end = start, end
+        observed_end = observed_start + len(word["text"])
+        count = sum(observed_start <= position < observed_end for position in observed_indices)
+        observed_start = observed_end
+        if not count:
+            continue
+        consumed += count
+        source_end = source_indices[consumed] if consumed < len(source_indices) else len(narration)
+        result.append({"asr_word_index": index, "text": narration[source_start:source_end],
+                       "start_sec": float(start), "end_sec": float(end),
+                       "source_start_char": source_start, "source_end_char": source_end})
+        source_start = source_end
+    return result
+
+
+def _aligned_subtitle_events(words: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
+    # A decimal/model token may span several ASR words; keep that display token
+    # in one event without changing any original word or timestamp observation.
+    source = "".join(word["text"] for word in words)
+    tokens = [match.span() for match in _SUBTITLE_TOKEN_RE.finditer(source) if len(match.group()) > 1]
+    atoms = []
+    for word in words:
+        if atoms and any(start < word["source_start_char"] < end for start, end in tokens):
+            atoms[-1] = {**atoms[-1], "text": atoms[-1]["text"] + word["text"], "end_sec": word["end_sec"]}
+        else:
+            atoms.append(dict(word))
+    groups, current, length = [], [], 0
+    for word in atoms:
+        size = len(re.sub(r"\s+", " ", word["text"]).strip())
+        if size > 2 * _SUBTITLE_LINE_CHARS:
+            raise NonRetryableMediaError("Subtitle ASR word cannot safely display in two lines")
+        if current and (length + size > _SUBTITLE_LINE_CHARS
+                        or word["start_sec"] > current[-1]["end_sec"] + 0.15
+                        or current[-1]["text"].rstrip().endswith(tuple("。！？.!?"))):
+            groups.append(current)
+            current, length = [], 0
+        current.append(word)
+        length += size
+    if current:
+        groups.append(current)
+    events = []
+    for group in groups:
+        start, end = group[0]["start_sec"], group[-1]["end_sec"]
+        if events and start < events[-1][1]:
+            if events[-1][1] - start > _SUBTITLE_WORD_OVERLAP_SEC + 1e-6:
+                raise NonRetryableMediaError("Subtitle ASR event timing overlap is unsafe")
+            start = events[-1][1]
+        if end <= start:
+            raise NonRetryableMediaError("Subtitle ASR event timing is empty after overlap clamp")
+        text = re.sub(r"\s+", " ", "".join(word["text"] for word in group)).strip()
+        if len(text) > 2 * _SUBTITLE_LINE_CHARS:
+            raise NonRetryableMediaError("Subtitle ASR words cannot safely display in two lines")
+        events.append((start, end, hard_wrap(text, _SUBTITLE_LINE_CHARS)))
+    return events
+
+
 def layout_filter(
     layout: str,
     *,
@@ -1761,6 +1864,60 @@ class MediaExecutor:
             return [], f"local ASR failed ({type(exc).__name__}): {exc}"
         return segments, ""
 
+    def align_subtitles(
+        self, voice_path: Path, narration: str, *, asr_model: str,
+        asr_device: str = "auto", asr_compute_type: str = "float16",
+    ) -> dict[str, Any]:
+        """Fresh unprompted voice ASR for rendering, never final-track QC evidence."""
+        if not asr_model:
+            raise NonRetryableMediaError("Subtitle word alignment requires configured local ASR")
+        if not voice_path.is_file():
+            raise NonRetryableMediaError("Subtitle local ASR unavailable [source_missing]")
+        voice_sha = sha256_file(voice_path)
+        duration = _finite_seconds(probe(voice_path)["format"]["duration"], label="Subtitle voice duration")
+        if duration <= 0:
+            raise NonRetryableMediaError("Subtitle ASR timing requires positive voice duration")
+        segments, note = self._local_asr(asr_model, asr_device, asr_compute_type, video_path=voice_path)
+        if note or not segments:
+            code = next((code for prefix, code in (
+                ("faster-whisper is not installed", "dependency_missing"),
+                ("source video missing", "source_missing"),
+                ("local ASR failed (RuntimeError)", "runtime_error"),
+                ("local ASR failed (ValueError)", "value_error"),
+                ("local ASR failed (OSError)", "os_error"),
+            ) if note.startswith(prefix)), "unavailable" if note else "empty")
+            raise NonRetryableMediaError(f"Subtitle local ASR unavailable [{code}]; no estimated timing was used")
+        if sha256_file(voice_path) != voice_sha:
+            raise NonRetryableMediaError("Subtitle voice bytes changed during ASR")
+        words = _aligned_subtitle_words(narration, segments, duration)
+        _aligned_subtitle_events(words)
+        return {"version": _SUBTITLE_ALIGNMENT_VERSION, "method": "strict_voice_asr_words",
+                "voice_sha256": voice_sha, "narration_sha256": hashlib.sha256(narration.encode("utf-8")).hexdigest(),
+                "duration_sec": duration, "asr_model": asr_model, "asr_device": asr_device,
+                "asr_compute_type": asr_compute_type, "segments": segments,
+                "segments_sha256": _subtitle_alignment_hash(segments), "words": words,
+                "mapping_sha256": _subtitle_alignment_hash(words)}
+
+    def _checked_subtitle_alignment(
+        self, alignment: dict[str, Any], narration: str, duration: float, *, voice_path: Path | None = None,
+    ) -> list[tuple[float, float, str]]:
+        if (not isinstance(alignment, dict) or alignment.get("version") != _SUBTITLE_ALIGNMENT_VERSION
+                or alignment.get("method") != "strict_voice_asr_words"
+                or alignment.get("narration_sha256") != hashlib.sha256(narration.encode("utf-8")).hexdigest()
+                or alignment.get("duration_sec") != duration
+                or not all(isinstance(alignment.get(key), str) and alignment[key]
+                           for key in ("asr_model", "asr_device", "asr_compute_type", "voice_sha256"))
+                or (voice_path is not None and alignment["voice_sha256"] != sha256_file(voice_path))):
+            raise NonRetryableMediaError("Subtitle alignment identity is stale or invalid")
+        try:
+            words = _aligned_subtitle_words(narration, alignment.get("segments"), duration)
+            if (alignment.get("segments_sha256") != _subtitle_alignment_hash(alignment["segments"])
+                    or alignment.get("words") != words or alignment.get("mapping_sha256") != _subtitle_alignment_hash(words)):
+                raise NonRetryableMediaError("Subtitle alignment mapping hash is invalid")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NonRetryableMediaError("Subtitle alignment mapping is invalid") from exc
+        return _aligned_subtitle_events(words)
+
     def final_audio_evidence_path(self, evidence: dict[str, Any]) -> Path:
         """Keep observations from different ASR identities in separate files."""
         identity = {key: evidence.get(key) for key in (
@@ -1968,6 +2125,7 @@ class MediaExecutor:
         assets: dict[str, Path] | None = None,
         generated_image_ids: set[str] | None = None,
         visual_timing_evidence: dict[str, Any] | None = None,
+        subtitle_alignment: dict[str, Any] | None = None,
         encoder: str = "libx264",
         bgm_path: Path | None = None,
         bgm_volume: float = 0.15,
@@ -1976,6 +2134,12 @@ class MediaExecutor:
         plan = RenderPlan.model_validate(plan_data)
         # 合成阶段必须烧录 ass 字幕：前置自检，避免编完全部片段后才在最后一步炸。
         ensure_ass_filter()
+        if subtitle_alignment is not None:
+            self._checked_subtitle_alignment(
+                subtitle_alignment, narration,
+                _finite_seconds(probe(voice_path)["format"]["duration"], label="Subtitle voice duration"),
+                voice_path=voice_path,
+            )
         boundaries_path = voice_path.with_name("word_boundaries.json")
         raw_boundaries = self._read_boundaries(boundaries_path) if boundaries_path.is_file() else []
         timing_boundaries: list[dict[str, Any]] | None = None
@@ -2201,6 +2365,7 @@ class MediaExecutor:
             voice_duration,
             opening_identity=opening_identity,
             boundaries=timing_boundaries,
+            subtitle_alignment=subtitle_alignment,
             concept_intervals=[
                 (segment.narration_start_sec, segment.narration_end_sec)
                 for segment in plan.segments
@@ -2253,6 +2418,22 @@ class MediaExecutor:
             cwd=self.root,
         )
         _promote_render_output(final_temporary, final_path)
+        if subtitle_alignment is not None:
+            binding = {"video_sha256": sha256_file(final_path), "subtitle_alignment": subtitle_alignment}
+            receipt = render_dir / f"subtitle-alignment-{_subtitle_alignment_hash(binding)}.json"
+            if receipt.exists():
+                if json.loads(receipt.read_text(encoding="utf-8")) != binding:
+                    raise NonRetryableMediaError("Immutable subtitle alignment receipt changed")
+            else:
+                with TemporaryDirectory(prefix=".subtitle-alignment-", dir=render_dir) as temporary:
+                    complete = Path(temporary) / "receipt.json"
+                    complete.write_text(json.dumps(binding, ensure_ascii=False, sort_keys=True,
+                                                   allow_nan=False), encoding="utf-8")
+                    try:
+                        os.link(complete, receipt)
+                    except FileExistsError:
+                        if json.loads(receipt.read_text(encoding="utf-8")) != binding:
+                            raise NonRetryableMediaError("Immutable subtitle alignment receipt changed") from None
         preview_path = render_dir / "preview.mp4"
         preview_temporary = render_dir / ".preview.tmp.mp4"
         preview_temporary.unlink(missing_ok=True)
@@ -2406,8 +2587,11 @@ class MediaExecutor:
         duration: float,
         *,
         boundaries: list[dict[str, Any]] | None = None,
+        subtitle_alignment: dict[str, Any] | None = None,
     ) -> list[tuple[float, float, str]]:
         """Resolve timing from word alignment, sentence boundaries, then character estimate."""
+        if subtitle_alignment is not None:
+            return self._checked_subtitle_alignment(subtitle_alignment, narration, duration)
         if boundaries:
             logger.info("字幕时间源：与画面共用 audio/word_boundaries.json")
             return self._events_from_boundaries(boundaries, duration)
@@ -2461,6 +2645,7 @@ class MediaExecutor:
         *,
         opening_identity: str | None = None,
         boundaries: list[dict[str, Any]] | None = None,
+        subtitle_alignment: dict[str, Any] | None = None,
         concept_intervals: list[tuple[float, float]] | None = None,
     ) -> Path:
         subtitle_dir = self.root / "transcript"
@@ -2476,6 +2661,7 @@ class MediaExecutor:
             narration,
             duration,
             boundaries=boundaries,
+            subtitle_alignment=subtitle_alignment,
         ):
             subs.append(
                 pysubs2.SSAEvent(

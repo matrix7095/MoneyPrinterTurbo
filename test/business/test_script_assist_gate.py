@@ -139,6 +139,7 @@ def test_unresolved_current_review_blocks_paid_and_release_boundaries(script_rev
     review("REVISE", issues=[{"severity": "blocker", "message": "Opening is misleading"}])
     monkeypatch.setattr(pipeline, "_require_media_tools", lambda *args: None)
     monkeypatch.setattr(pipeline.MediaExecutor, "synthesize_voice", lambda *args, **kwargs: pytest.fail("TTS ran before review"))
+    monkeypatch.setattr(pipeline.MediaExecutor, "align_subtitles", lambda *args, **kwargs: pytest.fail("ASR ran before review"))
     if boundary != "voice":
         content.current_stage = "render_ready" if boundary == "render" else "package"
         content.business_status = ContentStatus.PRODUCING if boundary == "render" else ContentStatus.PACKAGED

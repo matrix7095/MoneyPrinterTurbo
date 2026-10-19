@@ -55,6 +55,7 @@ def test_pipeline_passes_approved_opening_identity(image_contract, monkeypatch, 
 
     monkeypatch.setattr(pipeline, "_require_media_tools", lambda *names: None)
     monkeypatch.setattr(pipeline, "_render_voice_path", lambda *args: Path("fixture-voice.wav"))
+    monkeypatch.setattr(pipeline.MediaExecutor, "align_subtitles", lambda *args, **kwargs: {"fixture": "pre-render ASR contract"})
     monkeypatch.setattr(pipeline.MediaExecutor, "render", render)
     with pytest.raises(RenderReached):
         pipeline.render_content(runtime.engine, runtime.settings, content_id)

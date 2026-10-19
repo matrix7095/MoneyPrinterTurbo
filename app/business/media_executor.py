@@ -54,6 +54,7 @@ class MptMediaExecutor(MediaExecutor):
         assets=None,
         generated_image_ids=None,
         visual_timing_evidence=None,
+        subtitle_alignment=None,
         encoder="libx264",
         bgm_path=None,
         bgm_volume=0.15,
@@ -65,6 +66,8 @@ class MptMediaExecutor(MediaExecutor):
         voice_duration = _finite_seconds(probe(voice_path)["format"]["duration"], label="Voice duration")
         if voice_duration <= 0:
             raise NonRetryableMediaError("Voice duration must be positive")
+        if subtitle_alignment is not None:
+            self._checked_subtitle_alignment(subtitle_alignment, narration, voice_duration, voice_path=voice_path)
         plan = RenderPlan.model_validate(plan_data)
         raw_boundaries_path = voice_path.with_name("word_boundaries.json")
         raw_boundaries = self._read_boundaries(self._local_asset(raw_boundaries_path)) if (
@@ -102,6 +105,7 @@ class MptMediaExecutor(MediaExecutor):
             voice_duration,
             opening_identity=opening_identity,
             boundaries=boundaries,
+            subtitle_alignment=subtitle_alignment,
             concept_intervals=[
                 (segment.narration_start_sec, segment.narration_end_sec)
                 for segment in plan.segments
@@ -201,6 +205,8 @@ class MptMediaExecutor(MediaExecutor):
                 for scene in project_scenes
             ],
         }
+        if subtitle_alignment is not None:
+            request_receipt["subtitle_alignment"] = subtitle_alignment
         metadata = project.metadata() if (project.directory / "project.json").is_file() else {}
         revision = project.revision() if metadata.get("current_revision") else None
         # Match the frozen request before reusing an interrupted revision; never reuse replacement assets.
@@ -229,6 +235,15 @@ class MptMediaExecutor(MediaExecutor):
         )
         # A failed QC still owns these bytes; a retry may verify them, never replace them.
         with _lock(output_dir / ".outputs.lock"):
+            if subtitle_alignment is not None:
+                alignment_receipt = output_dir / "subtitle-alignment.json"
+                if alignment_receipt.exists():
+                    if json.loads(alignment_receipt.read_text(encoding="utf-8")) != subtitle_alignment:
+                        raise NonRetryableMediaError("Immutable subtitle alignment receipt changed")
+                else:
+                    if output_receipt.exists() or final.exists() or preview.exists():
+                        raise NonRetryableMediaError("Cannot add subtitle alignment to a frozen render output")
+                    _atomic_json(alignment_receipt, subtitle_alignment)
             if output_receipt.is_file():
                 expected = json.loads(output_receipt.read_text(encoding="utf-8"))
                 if expected != {

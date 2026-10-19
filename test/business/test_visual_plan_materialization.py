@@ -525,6 +525,7 @@ def test_resolved_materials_bind_render_and_research_only_acceptance(image_contr
 
     monkeypatch.setattr(pipeline, "_require_media_tools", lambda *names: None)
     monkeypatch.setattr(pipeline, "_render_voice_path", lambda *args: Path("fixture-voice.mp3"))
+    monkeypatch.setattr(pipeline.MediaExecutor, "align_subtitles", lambda *args, **kwargs: {"fixture": "pre-render ASR contract"})
     monkeypatch.setattr(pipeline.MediaExecutor, "render", render)
     with pytest.raises(Rendered):
         pipeline.render_content(runtime.engine, runtime.settings, content_id)
