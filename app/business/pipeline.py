@@ -2570,6 +2570,89 @@ def repair_stalled_asset_generation(
         return content, task
 
 
+def _previous_visual_context(
+    session: Session, flow: WorkflowService, content: Content, failed_qc: AgentTask, previous: dict | None,
+) -> dict | None:
+    """Carry a proven mixed composition into a rewrite; this never approves the old film."""
+    from glance_core.content_acceptance import generated_image_material
+
+    plan = flow.completed_task_for(content.id, TaskType.VISUAL_PLAN)
+    segments = (plan.result_data or {}).get("segments", []) if plan else []
+    if (failed_qc.schema_version != "3" or content.production_mode != ProductionMode.IMAGE_ONLY
+            or not any(segment.get("asset_request") for segment in segments)
+            or not any(segment.get("asset_id") and not segment.get("asset_request") for segment in segments)):
+        return previous
+    try:
+        refs = failed_qc.input_data.get("upstream_task_ids", {})
+        script = session.get(AgentTask, refs.get("script"))
+        if (failed_qc.content_id != content.id or failed_qc.status != TaskStatus.COMPLETED
+                or failed_qc.result_data.get("passed") is not False or refs.get("visual_plan") != plan.id
+                or script is None or script.content_id != content.id or script.task_type != TaskType.SHORT_SCRIPT
+                or script.status != TaskStatus.COMPLETED
+                or plan.input_data.get("upstream_task_ids", {}).get("script") != script.id):
+            raise ValueError("failed QC plan/script binding changed")
+        plan_qc = _require_current_qc(session, content.id, TaskType.VISUAL_PLAN_QC,
+                                      {"visual_plan": plan, "script": script})
+        subject = failed_qc.input_data.get("acceptance_subject", {})
+        if failed_qc.result_data.get("subject") != subject:
+            raise ValueError("failed QC subject changed")
+        for key, task in (("visual_plan", plan), ("script", script), ("plan_qc", plan_qc)):
+            _unchanged_material_task(session, task, owned=True)
+            if (subject.get(f"{key}_task_id") != task.id
+                    or subject.get(f"{key}_sha256") != stable_hash(task.result_data)):
+                raise ValueError("failed QC historical subject binding changed")
+        _unchanged_material_task(session, failed_qc, owned=True)
+        evidence = failed_qc.input_data["visual_evidence"]
+        if subject.get("visual_evidence_sha256") != stable_hash(evidence):
+            raise ValueError("failed QC visual evidence binding changed")
+        root = Path(content.content_dir).resolve()
+        manifest_path = (root / evidence["manifest_path"]).resolve()
+        if (not manifest_path.is_relative_to(root) or not manifest_path.is_file()
+                or sha256_file(manifest_path) != evidence["manifest_sha256"]
+                or json.loads(manifest_path.read_text(encoding="utf-8")) != evidence["manifest"]):
+            raise ValueError("failed QC joint manifest changed")
+        checks = session.exec(select(AgentTask).where(
+            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
+            AgentTask.status != TaskStatus.CANCELLED,
+        )).all()
+        checks = [qc for qc in checks if qc.input_data.get("full_generated_assets") is True
+                  and qc.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id]
+        if len(checks) != 1 or checks[0].status != TaskStatus.COMPLETED or checks[0].result_data.get("passed") is not True:
+            raise ValueError("full passed asset QC unavailable/ambiguous")
+        full = checks[0]
+        _unchanged_material_task(session, full, owned=True)
+        if full.input_data.get("script") != script.result_data:
+            raise ValueError("full asset QC script binding changed")
+        resolved = prepared_visual_plan(session, plan)
+        assets = full.input_data.get("assets", [])
+        if len(assets) != len(resolved.get("segments", [])):
+            raise ValueError("full asset QC coverage changed")
+        for index, segment in enumerate(resolved["segments"]):
+            entries = [entry for entry in assets if entry.get("segment_index") == index]
+            if len(entries) != 1:
+                raise ValueError("full asset QC segment mapping changed")
+            material = generated_image_material(session, content, entries[0]["artifact_id"])
+            if entries[0] != {"segment_index": index, **material}:
+                raise ValueError("full asset QC material changed")
+            if segment.get("asset_request"):
+                generation = session.get(AgentTask, material["generation_task_id"])
+                if (generation.status != TaskStatus.COMPLETED or material["generation_plan_id"] != plan.id
+                        or material["generation_segment_index"] != index
+                        or material["request"] != segment["asset_request"]
+                        or full.input_data.get("upstream_task_ids", {}).get("asset_generate_image") != generation.id):
+                    raise ValueError("current generation binding changed")
+                segment.pop("asset_request")
+                segment["asset_id"] = material["artifact_id"]
+            elif (segment.get("asset_id") != material["artifact_id"]
+                    or material["artifact_id"] not in plan.input_data.get("allowed_asset_ids", [])):
+                raise ValueError("reused image binding changed")
+        if resolved != evidence["manifest"].get("visual_plan"):
+            raise ValueError("joint manifest resolved composition changed")
+        return resolved
+    except (ValueError, KeyError, TypeError, OSError, NonRetryableMediaError) as exc:
+        raise NonRetryableMediaError(f"Previous visual context: {exc}") from exc
+
+
 def approve_script(
     engine: Engine, settings: Settings, content_id: str, *, automatic: bool = False, manual_approval: bool = False,
 ) -> Content:
@@ -2726,6 +2809,7 @@ def approve_script(
         failed_content_qc = flow.latest_failed_content_qc(content_id)
         content_qc_rework = {}
         if failed_content_qc is not None:
+            previous_plan = _previous_visual_context(session, flow, content, failed_content_qc, previous_plan)
             content_qc_rework = {
                 "qc_issues": (failed_content_qc.result_data or {}).get("issues", []),
                 "previous_plan": previous_plan or {},
