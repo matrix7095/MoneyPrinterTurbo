@@ -100,7 +100,7 @@ def _failed_segment_indexes(issues: list, segment_count: int) -> set[int] | None
                     return None
                 index = field_index
             elif issue.field not in (VisualSegment.model_fields | AssetRequest.model_fields) and (
-                issue.field != "assets"
+                issue.field not in {"assets", "continuity"}
             ):
                 return None
             if index is None or not 0 <= index < segment_count:
@@ -4086,47 +4086,42 @@ class WorkflowService:
             excluded,
         )
 
-    def _create_visual_repair_from_recovery(
-        self, recovery_task: AgentTask, plan: RecoveryPlan, *, target_task: AgentTask
-    ) -> AgentTask | None:
-        content = self.session.get(Content, recovery_task.content_id)
-        previous = self.completed_task_for(recovery_task.content_id, TaskType.VISUAL_PLAN)
-        existing = self.session.exec(
-            select(AgentTask).where(
-                AgentTask.content_id == recovery_task.content_id,
-                AgentTask.task_type == TaskType.VISUAL_PLAN,
-            )
-        ).all()
-        for task in existing:
-            if (task.input_data or {}).get("recovery_task_id") == recovery_task.id:
-                return task
-        if (
-            content is None
-            or content.business_status != ContentStatus.WAITING_AGENT
-            or content.current_stage != "recovery"
-            or previous is None
-            or previous.id != target_task.id
-            or not previous.result_data
-            or not (previous.input_data or {}).get("upstream_task_ids")
-            or not (previous.input_data or {}).get("production_mode")
+    def visual_repair_input(
+        self, previous: AgentTask, recovery_task: AgentTask, plan: RecoveryPlan, *, source: AgentTask | None
+    ) -> dict:
+        """Build a new context from caller-verified frozen origins without mutating history."""
+        content = self.session.get(Content, previous.content_id)
+        if content is None:
+            raise ValueError("视觉修复内容不存在")
+        failure = recovery_task.input_data.get("failure") or {}
+        qc_source = source is not None and source.task_type in {
+            TaskType.VISUAL_PLAN_QC, TaskType.ASSET_QC, TaskType.CONTENT_QC,
+        }
+        if qc_source and (
+            source.content_id != content.id
+            or failure.get("source_task_type") != source.task_type.value
+            or source.result_data.get("passed") is not False
+            or not isinstance(failure.get("validation_errors"), list)
+            or any(not isinstance(issue, dict) for issue in failure["validation_errors"])
+            or failure["validation_errors"] != source.result_data.get("issues")
         ):
-            self._mark_recovery_blocked(
-                recovery_task, reason="视觉修复目标已过期或缺少完整上下文", action=plan.action
-            )
-            return None
-        input_data = dict(previous.input_data)
+            raise ValueError("视觉修复质检来源或问题证据不一致")
+        input_data = deepcopy(previous.input_data)
         input_data.update(
-            previous_plan=previous.result_data,
+            previous_plan=deepcopy(previous.result_data),
             previous_plan_task_id=previous.id,
             recovery_task_id=recovery_task.id,
             rework_feedback=plan.model_dump(mode="json"),
         )
-        failure = recovery_task.input_data.get("failure") or {}
         reusable, reuse_gaps, excluded = self._visual_repair_generated_assets(previous, failure)
         input_data["reusable_generated_assets"] = reusable
         input_data["original_reuse"] = bool(reusable)
         input_data["reusable_assets_evidence_gaps"] = reuse_gaps
-        source = self.session.get(AgentTask, failure.get("source_task_id", ""))
+        input_data.pop("previous_qc_task_id", None)
+        input_data.pop("qc_issues", None)
+        if qc_source:
+            input_data["previous_qc_task_id"] = source.id
+            input_data["qc_issues"] = deepcopy(failure.get("validation_errors", []))
         indexes = (
             _failed_segment_indexes(
                 failure.get("validation_errors", []), len(previous.result_data.get("segments", []))
@@ -4179,6 +4174,55 @@ class WorkflowService:
         )
         if duration_evidence is not None:
             input_data["duration_evidence"] = duration_evidence
+        return input_data
+
+    def _create_visual_repair_from_recovery(
+        self, recovery_task: AgentTask, plan: RecoveryPlan, *, target_task: AgentTask
+    ) -> AgentTask | None:
+        content = self.session.get(Content, recovery_task.content_id)
+        previous = self.completed_task_for(recovery_task.content_id, TaskType.VISUAL_PLAN)
+        existing = self.session.exec(
+            select(AgentTask).where(
+                AgentTask.content_id == recovery_task.content_id,
+                AgentTask.task_type == TaskType.VISUAL_PLAN,
+            )
+        ).all()
+        children = [task for task in existing if task.input_data.get("recovery_task_id") == recovery_task.id]
+        if children:
+            superseded = {
+                task.input_data["supersedes_task_id"] for task in children
+                if task.input_data.get("visual_repair_context_version") == 1
+                and task.input_data.get("supersedes_task_id") in {child.id for child in children}
+            }
+            current = [task for task in children if task.id not in superseded]
+            if len(current) != 1 or len(superseded) != len(children) - 1:
+                raise TaskConflictError("RECOVERY_VISUAL_REPAIR_REVISION_AMBIGUOUS")
+            return current[0]
+        if (
+            content is None
+            or content.business_status != ContentStatus.WAITING_AGENT
+            or content.current_stage != "recovery"
+            or previous is None
+            or previous.id != target_task.id
+            or not previous.result_data
+            or not (previous.input_data or {}).get("upstream_task_ids")
+            or not (previous.input_data or {}).get("production_mode")
+        ):
+            self._mark_recovery_blocked(
+                recovery_task, reason="视觉修复目标已过期或缺少完整上下文", action=plan.action
+            )
+            return None
+        failure = recovery_task.input_data.get("failure") or {}
+        source = self.session.get(AgentTask, failure.get("source_task_id", ""))
+        try:
+            if source is not None and source.task_type in {
+                TaskType.VISUAL_PLAN_QC, TaskType.ASSET_QC, TaskType.CONTENT_QC,
+            } and source.status != TaskStatus.COMPLETED:
+                raise ValueError("视觉修复质检来源未完成")
+            input_data = self.visual_repair_input(previous, recovery_task, plan, source=source)
+        except ValueError as exc:
+            self._mark_recovery_blocked(recovery_task, reason=str(exc), action=plan.action)
+            return None
         self.invalidate_visual_plan(
             content.id, include_review_tasks=True, reason="recovery-visual-repair"
         )

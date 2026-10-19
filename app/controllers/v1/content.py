@@ -17,10 +17,11 @@ from glance_core.models import (
 from glance_core.task_service import TaskConflictError
 from glance_core.workflow import DuplicateTopicError
 from glance_media.executor import NonRetryableMediaError
+from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
 from app.business.auth import require_admin
-from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest
+from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest, ExpectedHostBinding
 from app.business.runtime import get_runtime, get_session
 from app.business.bundles import sha256_file
 from app.business.quarantine import quarantine_records, task_projection
@@ -29,6 +30,26 @@ from app.controllers.v1.agent import content_root
 router = APIRouter(
     prefix="/api/v1", tags=["Content"], dependencies=[Depends(require_admin)]
 )
+
+
+class VisualRepairInputBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_id: str = Field(min_length=1, max_length=100)
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class VisualRepairResultBinding(VisualRepairInputBinding):
+    result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class VisualRepairContextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run: ExpectedHostBinding
+    recovery: VisualRepairResultBinding
+    plan: VisualRepairResultBinding
+    qc: VisualRepairInputBinding
 
 
 @router.post("/content-runs/{run_id}/host/attach")
@@ -321,6 +342,20 @@ def restore_visual_plan(*, content_id: str, request: Request):
     try:
         return runtime.restore_consumed_visual_plan(content_id)
     except (ValueError, OSError, KeyError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/reconcile-visual-repair-context")
+def reconcile_visual_repair_context(*, content_id: str, payload: VisualRepairContextRequest, request: Request):
+    runtime = get_runtime(request)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Content not found")
+        content_root(content, runtime)
+    try:
+        return runtime.reconcile_visual_repair_context(content_id, payload.model_dump())
+    except (ValueError, OSError, KeyError, TypeError, TaskConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 

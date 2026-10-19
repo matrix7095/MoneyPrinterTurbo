@@ -36,6 +36,15 @@ from test.business.test_agent_failure_recovery import registered_client
         ("assets[8].request.subject", 8, 8, None),
         ("assets[7].request.unknown", 7, 8, None),
         ("assets[0].request.subject", 7, 8, None),
+        ("continuity", 2, 7, {2}),
+        ("continuity", None, 7, None),
+        ("continuity", True, 7, None),
+        ("continuity", "2", 7, None),
+        ("continuity", -1, 7, None),
+        ("continuity", 7, 7, None),
+        ("unknown", 2, 7, None),
+        ("segments[1].continuity", 2, 7, None),
+        ("segments[1].purpose", 2, 7, None),
     ],
 )
 def test_failed_segment_indexes_accepts_only_exact_asset_request_indexes(
@@ -54,14 +63,25 @@ def test_failed_segment_indexes_preserves_legacy_segment_and_plain_asset_fields(
     ) == {1}
 
 
-def test_recovery_reuses_only_qc_good_generated_segments(image_contract):
+def test_failed_segment_indexes_rejects_unindexed_or_ambiguous_continuity():
+    issue = {"severity": "error", "field": "continuity", "message": "inconsistent image"}
+    assert _failed_segment_indexes([issue], 7) is None
+    assert _failed_segment_indexes(
+        [{**issue, "segment_index": 2}, {**issue, "field": "unknown", "segment_index": 3}], 7
+    ) is None
+
+
+@pytest.fixture
+def failed_image_contract(image_contract, request):
     runtime, content_id, plan_id, generation_id, qc_id, first_image_id, _ = image_contract
+    field, segment_count, failed_index = getattr(request, "param", ("continuity", 7, 2))
     issue = {
         "severity": "error",
-        "field": "assets[1].request.subject",
-        "message": "second image subject is incorrect",
-        "segment_index": 1,
+        "field": field,
+        "message": "image subject is inconsistent",
+        "segment_index": failed_index,
     }
+    image_ids = [first_image_id]
     with Session(runtime.engine) as session:
         plan = session.get(AgentTask, plan_id)
         generation = session.get(AgentTask, generation_id)
@@ -69,45 +89,43 @@ def test_recovery_reuses_only_qc_good_generated_segments(image_contract):
         content = session.get(Content, content_id)
         flow = runtime.workflow_service(session)
 
-        second_path = Path(content.content_dir) / "second-image.png"
-        second_path.write_bytes(b"second-generated-image")
-        second = Artifact(
-            content_id=content_id,
-            artifact_type="agent_generated_image",
-            relative_path=second_path.name,
-            sha256=sha256_file(second_path),
-            size_bytes=second_path.stat().st_size,
-            mime_type="image/png",
-            producer_stage=generation_id,
-        )
-        session.add(second)
-        session.flush()
-        second_image_id = second.id
-
         request = deepcopy(generation.input_data["requests"][0]["asset_request"])
-        generation.input_data = deepcopy(generation.input_data)
-        generation.input_data["requests"].append({"segment_index": 1, "asset_request": request})
+        generation_inputs = deepcopy(generation.input_data)
+        generation_result = deepcopy(generation.result_data)
+        first_segment = deepcopy(plan.result_data["segments"][0])
+        first_segment["asset_id"] = first_image_id
+        segments = [first_segment]
+        for index in range(1, segment_count):
+            image_path = Path(content.content_dir) / f"image-{index}.png"
+            image_path.write_bytes(f"generated-image-{index}".encode())
+            artifact = Artifact(
+                content_id=content_id,
+                artifact_type="agent_generated_image",
+                relative_path=image_path.name,
+                sha256=sha256_file(image_path),
+                size_bytes=image_path.stat().st_size,
+                mime_type="image/png",
+                producer_stage=generation_id,
+            )
+            session.add(artifact)
+            session.flush()
+            image_ids.append(artifact.id)
+            generation_inputs["requests"].append({"segment_index": index, "asset_request": request})
+            generation_result["images"].append({"segment_index": index, "artifact_id": artifact.id})
+            segments.append({
+                **deepcopy(first_segment),
+                "asset_id": artifact.id,
+                "narration_start_sec": index * 3.0,
+                "narration_end_sec": (index + 1) * 3.0,
+            })
+        generation.input_data = generation_inputs
+        generation.result_data = generation_result
         generation.input_hash = stable_hash(generation.input_data)
         owned = session.exec(
             select(AuditEvent).where(AuditEvent.entity_id == generation_id, AuditEvent.action == OWNED)
         ).one()
         owned.metadata_json = {"input_hash": generation.input_hash}
-        generation.result_data = {
-            "images": [
-                *generation.result_data["images"],
-                {"segment_index": 1, "artifact_id": second.id},
-            ]
-        }
-
-        first_segment = deepcopy(plan.result_data["segments"][0])
-        first_segment["asset_id"] = first_image_id
-        second_segment = {
-            **deepcopy(first_segment),
-            "asset_id": second.id,
-            "narration_start_sec": 3.0,
-            "narration_end_sec": 6.0,
-        }
-        plan.result_data = {"segments": [first_segment, second_segment]}
+        plan.result_data = {"segments": segments}
 
         def refresh_accepted_result(task):
             accepted = session.exec(
@@ -146,16 +164,162 @@ def test_recovery_reuses_only_qc_good_generated_segments(image_contract):
         ).one()
         qc_owned.metadata_json = {"input_hash": qc.input_hash}
         refresh_accepted_result(qc)
-        session.add_all([second, generation, plan, qc, owned, qc_owned])
+        session.add_all([generation, plan, qc, owned, qc_owned])
         session.commit()
+    return runtime, content_id, plan_id, generation_id, qc_id, issue, image_ids
 
+
+@pytest.mark.parametrize("failed_image_contract", [
+    ("assets[1].request.subject", 2, 1), ("continuity", 7, 2),
+], indirect=True)
+def test_recovery_reuses_only_qc_good_generated_segments(failed_image_contract):
+    runtime, _, plan_id, generation_id, _, issue, image_ids = failed_image_contract
+    with Session(runtime.engine) as session:
+        flow = runtime.workflow_service(session)
+        plan = session.get(AgentTask, plan_id)
         reusable, gaps, excluded = flow._visual_repair_generated_assets(
             plan, {"validation_errors": [issue]}
         )
+        generation = session.get(AgentTask, generation_id)
+        for material in reusable:
+            index = image_ids.index(material["artifact_id"])
+            artifact = session.get(Artifact, material["artifact_id"])
+            assert material["generation_task_id"] == generation_id
+            assert material["generation_plan_id"] == plan_id
+            assert material["generation_segment_index"] == index
+            assert material["generation_input_sha256"] == generation.input_hash
+            assert material["generation_result_sha256"] == stable_hash(generation.result_data)
+            assert material["artifact_sha256"] == artifact.sha256
+            assert material["request"] == generation.input_data["requests"][index]["asset_request"]
+            assert material["generation"] == generation.result_data["images"][index]
 
-    assert [material["artifact_id"] for material in reusable] == [first_image_id]
-    assert excluded == {second_image_id}
+    assert [material["artifact_id"] for material in reusable] == [
+        image_id for index, image_id in enumerate(image_ids) if index != issue["segment_index"]
+    ]
+    assert excluded == {image_ids[issue["segment_index"]]}
     assert gaps == []
+
+
+@pytest.mark.parametrize("tamper", ["origin", "bytes", "content", "segment"])
+def test_indexed_continuity_reuse_requires_exact_material_evidence(failed_image_contract, tamper):
+    runtime, content_id, plan_id, generation_id, qc_id, issue, image_ids = failed_image_contract
+    with Session(runtime.engine) as session:
+        artifact = session.get(Artifact, image_ids[0])
+        if tamper == "origin":
+            artifact.producer_stage = plan_id
+        elif tamper == "bytes":
+            content = session.get(Content, content_id)
+            (Path(content.content_dir) / artifact.relative_path).write_bytes(b"changed-image-bytes")
+        elif tamper == "content":
+            content = session.get(Content, content_id)
+            candidate = Candidate(source_type="agent", source_id="other", original_title="Other",
+                                  source_url="https://example.org/other")
+            session.add(candidate)
+            session.flush()
+            other = Content(candidate_id=candidate.id, title="Other", content_dir=content.content_dir)
+            session.add(other)
+            session.flush()
+            artifact.content_id = other.id
+        else:
+            qc = session.get(AgentTask, qc_id)
+            qc.input_data = deepcopy(qc.input_data)
+            qc.input_data["assets"][0]["segment_index"] = 6
+            qc.input_hash = stable_hash(qc.input_data)
+            session.add(qc)
+        session.add(artifact)
+        session.commit()
+        flow = runtime.workflow_service(session)
+        reusable, gaps, excluded = flow._visual_repair_generated_assets(
+            session.get(AgentTask, plan_id), {"validation_errors": [issue]}
+        )
+        assert {material["artifact_id"] for material in reusable} == set(image_ids) - {
+            image_ids[0], image_ids[2],
+        }
+        assert excluded == {image_ids[2]}
+        assert gaps == [
+            "reuse: QC generation/request mismatch" if tamper == "segment"
+            else "reuse: asset origin/bytes unavailable"
+        ]
+        assert all(material["generation_task_id"] == generation_id for material in reusable)
+
+
+@pytest.mark.parametrize("damage", [None, "source_type", "issues", "status", "passed", "malformed_issues"])
+def test_visual_repair_binds_current_asset_qc_instead_of_old_content_qc(failed_image_contract, damage):
+    from glance_core.task_schemas import RecoveryPlan
+
+    runtime, content_id, plan_id, generation_id, qc_id, issue, image_ids = failed_image_contract
+    with Session(runtime.engine) as session:
+        flow = runtime.workflow_service(session)
+        previous = session.get(AgentTask, plan_id)
+        old_issues = [{"severity": "error", "field": "audio", "message": "old audio failure"}]
+        old_qc = flow.create_agent_task(content_id, TaskType.CONTENT_QC, {}, allow_multiple=True)
+        record_accepted_completion(session, runtime, old_qc, {"passed": False, "issues": old_issues})
+        previous.input_data = {
+            **previous.input_data, "previous_qc_task_id": old_qc.id, "qc_issues": old_issues,
+        }
+        previous.input_hash = stable_hash(previous.input_data)
+        owned = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_id == previous.id, AuditEvent.action == OWNED,
+        )).one()
+        owned.metadata_json = {"input_hash": previous.input_hash}
+        recovery = flow.create_agent_task(content_id, TaskType.RECOVERY, {
+            "failure": {"failure_class": "BUSINESS_QC", "source_task_id": qc_id,
+                        "source_task_type": "asset_qc", "validation_errors": [issue]},
+            "lineage": {"repair_target_task_id": plan_id, "target_task_type": "visual_plan"},
+        }, allow_multiple=True)
+        recovery.result_data = {
+            "failure_class": "BUSINESS_QC", "action": "create_repair_task",
+            "target_task_type": "visual_plan", "reason": "repair inconsistent image",
+        }
+        source = session.get(AgentTask, qc_id)
+        if damage == "source_type":
+            recovery.input_data = deepcopy(recovery.input_data)
+            recovery.input_data["failure"]["source_task_type"] = "content_qc"
+        elif damage == "issues":
+            source.result_data = {"passed": False, "issues": old_issues}
+        elif damage == "status":
+            source.status = TaskStatus.CANCELLED
+        elif damage == "passed":
+            source.result_data = {"passed": True, "issues": [issue]}
+        elif damage == "malformed_issues":
+            recovery.input_data = deepcopy(recovery.input_data)
+            recovery.input_data["failure"]["validation_errors"] = {"unexpected": issue}
+        content = session.get(Content, content_id)
+        content.business_status, content.current_stage = ContentStatus.WAITING_AGENT, "recovery"
+        session.add_all([previous, owned, recovery, content, source])
+        session.commit()
+        frozen = {
+            task_id: deepcopy((task.input_data, task.input_hash, task.result_data, task.attempt))
+            for task_id in (plan_id, generation_id, qc_id, old_qc.id)
+            if (task := session.get(AgentTask, task_id)) is not None
+        }
+        repair = flow._create_visual_repair_from_recovery(
+            recovery, RecoveryPlan.model_validate(recovery.result_data), target_task=previous,
+        )
+        if damage:
+            assert repair is None
+            assert content.current_stage == "recovery_blocked"
+            assert session.exec(select(AgentTask).where(
+                AgentTask.task_type == TaskType.VISUAL_PLAN,
+                AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
+            )).all() == []
+            for task_id, snapshot in frozen.items():
+                task = session.get(AgentTask, task_id)
+                assert (task.input_data, task.input_hash, task.result_data, task.attempt) == snapshot
+            return
+        assert repair is not None
+        assert repair.input_data["previous_qc_task_id"] == qc_id
+        assert repair.input_data["qc_issues"] == [issue]
+        assert repair.input_data["previous_plan_task_id"] == plan_id
+        assert repair.input_data["recovery_task_id"] == recovery.id
+        assert repair.input_data["original_reuse"] is True
+        assert repair.input_data["excluded_generated_asset_ids"] == [image_ids[2]]
+        assert repair.input_data["allowed_asset_ids"] == [
+            image_id for index, image_id in enumerate(image_ids) if index != 2
+        ]
+        for task_id, snapshot in frozen.items():
+            task = session.get(AgentTask, task_id)
+            assert (task.input_data, task.input_hash, task.result_data, task.attempt) == snapshot
 
 
 def record_accepted_completion(session, runtime, task, result):

@@ -38,6 +38,7 @@ QC_RECOVERY = "mpt_content_qc_recovery_created"
 QC_PLAN_REJECTED = "mpt_content_qc_recovery_plan_rejected"
 QC_TARGET_REJECTION = "RECOVERY_QC_TARGET_CHANGED"
 QC_REINSPECTION = "mpt_content_qc_reinspection_created"
+VISUAL_REPAIR_CONTEXT = "mpt_visual_repair_context_reconciled"
 QC_REINSPECTION_CHECKS = frozenset({
     "CONTENT_QC_SAME_SUBJECT_FULL_REVIEW_V1", "CONTENT_QC_ALL_NINE_HARD_GATES",
 })
@@ -1253,6 +1254,302 @@ class BusinessRuntime:
                 pass
             except Exception:
                 logger.exception("Agent consumption pending for %s", task_id)
+
+    def _visual_repair_history(self, session, task, content_id):
+        from glance_core.content_acceptance import _unchanged_material_task, completed_image_origin
+
+        if task is None or task.content_id != content_id or not completed_image_origin(session, task):
+            raise TaskConflictError("VISUAL_REPAIR_HISTORY_NOT_ACCEPTED")
+        _require_owned_input(session, task)
+        _unchanged_material_task(session, task, owned=True, consumed=True)
+        submissions = session.exec(select(AgentSubmission).where(
+            AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+            AgentSubmission.validation_status == "ACCEPTED",
+        )).all()
+        raw = (self.settings.agent_submission_dir / task.id / str(task.attempt) / "result.json").resolve()
+        if (len(submissions) != 1 or not raw.is_relative_to(self.settings.agent_submission_dir.resolve())
+                or Path(submissions[0].raw_result_path).resolve() != raw
+                or stable_hash(json.loads(raw.read_text(encoding="utf-8"))) != stable_hash(task.result_data)):
+            raise TaskConflictError("VISUAL_REPAIR_HISTORY_RESULT_CHANGED")
+        cancellations = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+            AuditEvent.action == "cancelled",
+        )).all()
+        if cancellations and (task.status != TaskStatus.CANCELLED or any(
+            row.actor_type != "system" or row.actor_id != "recovery-visual-repair"
+            or row.metadata_json != {"reason": "recovery-visual-repair"}
+            for row in cancellations
+        )):
+            raise TaskConflictError("VISUAL_REPAIR_HISTORY_CANCELLATION_CHANGED")
+
+    def reconcile_visual_repair_context(self, content_id: str, expected: dict) -> dict:
+        """Supersede only the proven indexed-continuity context defect, without a new Recovery."""
+        from glance_core.content_acceptance import generated_image_material
+        from glance_core.models import ProductionMode, PublicationRecord
+        from glance_core.task_schemas import RecoveryFailureEnvelope, RecoveryPlan
+        from glance_core.task_service import _normalize_content_task_input
+        from glance_core.workflow import _failed_segment_indexes
+        from app.business.content_host import child_work_unresolved, host_live
+        from app.business.content_run import load_run
+        from app.business.pipeline import _ensure_image_only_asset_requests
+
+        with content_operation_lock(self.settings, content_id):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    assert_allowed(session, content_id=content_id)
+                    content = session.get(Content, content_id)
+                    if content is None:
+                        raise KeyError(content_id)
+                    bound = {}
+                    for name, kind in (("recovery", TaskType.RECOVERY), ("plan", TaskType.VISUAL_PLAN),
+                                       ("qc", TaskType.VISUAL_PLAN_QC)):
+                        binding = expected[name]
+                        task = session.get(AgentTask, binding["task_id"])
+                        if (task is None or task.content_id != content_id or task.task_type != kind
+                                or task.input_hash != binding["input_hash"]
+                                or stable_hash(task.input_data) != binding["input_hash"]
+                                or (name != "qc" and stable_hash(task.result_data) != binding["result_hash"])):
+                            raise TaskConflictError("VISUAL_REPAIR_EXPECTED_BINDING_CHANGED")
+                        bound[name] = task
+                    recovery, bad, qc = (bound[name] for name in ("recovery", "plan", "qc"))
+                    key = stable_hash({"content_id": content_id, "recovery_id": recovery.id,
+                                       "superseded_plan_id": bad.id, "version": 1})
+                    receipts = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "content", AuditEvent.entity_id == content_id,
+                        AuditEvent.action == VISUAL_REPAIR_CONTEXT,
+                    )).all()
+                    matches = [row for row in receipts if row.metadata_json.get("key") == key]
+                    if matches:
+                        if len(matches) != 1 or matches[0].metadata_json.get("expected") != expected:
+                            raise TaskConflictError("VISUAL_REPAIR_REPLAY_BINDING_CHANGED")
+                        receipt = matches[0]
+                        replacement = session.get(AgentTask, receipt.metadata_json.get("replacement_task_id"))
+                        if (receipt.actor_type != "admin" or receipt.actor_id != "mpt-admin-api"
+                                or replacement is None or replacement.content_id != content_id
+                                or replacement.task_type != TaskType.VISUAL_PLAN
+                                or replacement.input_hash != receipt.metadata_json.get("replacement_input_hash")
+                                or stable_hash(replacement.input_data) != replacement.input_hash
+                                or replacement.input_data.get("recovery_task_id") != recovery.id
+                                or replacement.input_data.get("supersedes_task_id") != bad.id
+                                or replacement.input_data.get("visual_repair_context_version") != 1):
+                            raise TaskConflictError("VISUAL_REPAIR_REPLAY_CHANGED")
+                        _require_owned_input(session, replacement)
+                        return {**receipt.metadata_json["response"], "replayed": True}
+                    run = load_run(session)
+                    if (run is None or run.content_id != content_id
+                            or {field: getattr(run, field) for field in expected["run"]} != expected["run"]
+                            or run.state != "stopped" or not run.stop_requested
+                            or host_live(run) or child_work_unresolved(run)):
+                        raise TaskConflictError("VISUAL_REPAIR_RUN_NOT_DRAINED_OR_CHANGED")
+                    if (content.production_mode != ProductionMode.IMAGE_ONLY
+                            or (content.business_status, content.current_stage)
+                            != (ContentStatus.WAITING_AGENT, "visual_plan_qc")):
+                        raise TaskConflictError("VISUAL_REPAIR_CONTENT_NOT_CURRENT")
+                    tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content_id)).all()
+                    if (any(task.status in {TaskStatus.LEASED, TaskStatus.SUBMITTED}
+                            or (task.status == TaskStatus.PENDING and task.id != qc.id) for task in tasks)
+                            or session.exec(select(SchedulerOffer.request_id).where(
+                                SchedulerOffer.task_id.in_([task.id for task in tasks]),
+                                SchedulerOffer.expires_at > utc_now(),
+                            )).first()):
+                        raise TaskConflictError("VISUAL_REPAIR_CONTENT_IN_FLIGHT")
+                    if (session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first()
+                            or session.exec(select(AuditEvent.id).where(
+                                AuditEvent.entity_type == "publish_intent",
+                                AuditEvent.metadata_json["content_id"].as_string() == content_id,
+                            )).first()):
+                        raise TaskConflictError("VISUAL_REPAIR_PUBLISH_HISTORY_PRESENT")
+                    _require_reconciled_content(session, content_id)
+                    _require_current_revision(session, bad)
+                    if (recovery.status != TaskStatus.COMPLETED or bad.status != TaskStatus.COMPLETED
+                            or any(task.task_type == TaskType.RECOVERY and task.id != recovery.id
+                                   and as_utc(task.created_at) >= as_utc(recovery.created_at) for task in tasks)
+                            or [task.id for task in tasks if task.input_data.get("recovery_task_id") == recovery.id
+                                and task.task_type == TaskType.VISUAL_PLAN] != [bad.id]):
+                        raise TaskConflictError("VISUAL_REPAIR_RECOVERY_SUPERSEDED")
+                    assert_allowed(session, task_id=qc.id)
+                    qc_events = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == qc.id,
+                    )).all()
+                    created = [row for row in qc_events if row.action == "created"]
+                    if (len(created) != 1 or created[0].actor_type != "system"
+                            or created[0].actor_id != "task-service" or created[0].metadata_json != {}
+                            or any(row.action not in {"created", OWNED} for row in qc_events)):
+                        raise TaskConflictError("VISUAL_REPAIR_QC_CREATION_OR_EXECUTION_CHANGED")
+                    if any(row.action == OWNED for row in qc_events):
+                        _require_owned_input(session, qc)
+                    if (qc.status != TaskStatus.PENDING or qc.attempt != 0 or qc.assigned_agent_id
+                            or qc.lease_token_hash or qc.lease_expires_at or qc.started_at or qc.completed_at
+                            or qc.attempt_started_at or qc.last_heartbeat_at or qc.result_data
+                            or session.exec(select(AgentSubmission.id).where(AgentSubmission.task_id == qc.id)).first()
+                            or qc.input_data.get("upstream_task_ids", {}).get("visual_plan") != bad.id):
+                        raise TaskConflictError("VISUAL_REPAIR_QC_ALREADY_EXECUTED_OR_CHANGED")
+                    descendants = {bad.id, qc.id}
+                    for task in tasks:
+                        if task.id in descendants:
+                            continue
+                        references = task.input_data.get("upstream_task_ids", {})
+                        ids = {item for value in references.values() for item in
+                               (value if isinstance(value, list) else [value]) if isinstance(item, str)}
+                        if ids & descendants or task.input_data.get("previous_plan_task_id") == bad.id:
+                            raise TaskConflictError("VISUAL_REPAIR_DESCENDANT_ALREADY_CREATED")
+                    envelope = RecoveryFailureEnvelope.model_validate(recovery.input_data.get("failure"))
+                    plan = RecoveryPlan.model_validate(recovery.result_data)
+                    source = session.get(AgentTask, envelope.source_task_id)
+                    lineage = recovery.input_data.get("lineage") or {}
+                    previous = session.get(AgentTask, lineage.get("repair_target_task_id"))
+                    if (source is None or source.task_type != TaskType.ASSET_QC
+                            or previous is None or previous.task_type != TaskType.VISUAL_PLAN
+                            or envelope.failure_class != plan.failure_class or plan.failure_class != "BUSINESS_QC"
+                            or plan.action != "create_repair_task" or plan.target_task_type != "visual_plan"
+                            or envelope.source_task_type != "asset_qc" or envelope.source_attempt != source.attempt
+                            or envelope.code != "ASSET_QC_FAILED" or envelope.retryable
+                            or envelope.validation_errors != (source.result_data or {}).get("issues")
+                            or (source.result_data or {}).get("passed") is not False
+                            or len(envelope.validation_errors) != 1
+                            or envelope.validation_errors[0].get("field") != "continuity"
+                            or envelope.validation_errors[0].get("severity") != "error"
+                            or bad.input_data.get("previous_plan_task_id") != previous.id
+                            or bad.input_data.get("recovery_task_id") != recovery.id
+                            or lineage.get("parent_task_id") != source.id or lineage.get("content_id") != content_id
+                            or lineage.get("source_attempt") != source.attempt
+                            or lineage.get("root_task_id") != source.input_data.get("lineage", {}).get("root_task_id", source.id)
+                            or type(lineage.get("same_task_retries")) is not int or lineage["same_task_retries"] != 0
+                            or lineage.get("target_task_type") != "visual_plan"):
+                        raise TaskConflictError("VISUAL_REPAIR_RECOVERY_INTENT_CHANGED")
+                    flow = self.workflow_service(session)
+                    signature = flow._root_cause_signature("BUSINESS_QC", envelope.code)
+                    policy = recovery.input_data.get("policy") or {}
+                    current = effective_settings(session, self.settings)
+                    limits = [lineage.get("max_rounds"), policy.get("max_rounds"), current.recovery_max_rounds]
+                    if (policy.get("enabled") is not True or not current.recovery_enabled
+                            or any(type(limit) is not int or limit < 1 for limit in limits)
+                            or type(lineage.get("round")) is not int or not 1 <= lineage["round"] <= min(limits)
+                            or lineage["round"] != sum(item["root_cause_signature"] == signature
+                                                       for item in flow._recovery_history(content_id))
+                            or lineage.get("root_cause_signature") != signature
+                            or lineage.get("repair_fingerprint") != flow._repair_fingerprint(
+                                source, failure_class="BUSINESS_QC", code=envelope.code)
+                            or any("create_repair_task" not in actions for actions in (
+                                policy.get("allowed_actions", []), recovery.input_data.get("allowed_actions", [])))):
+                        raise TaskConflictError("VISUAL_REPAIR_RECOVERY_AUTHORITY_CHANGED")
+                    origins = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                        AuditEvent.action == "recovery_task_created",
+                    )).all()
+                    origin = {"source_task_id": source.id, "failure_class": "BUSINESS_QC", "code": envelope.code,
+                              "root_cause_signature": signature, "round": lineage["round"], "target_task_id": previous.id}
+                    if len(origins) != 1 or origins[0].actor_type != "system" or origins[0].metadata_json != origin:
+                        raise TaskConflictError("VISUAL_REPAIR_RECOVERY_ORIGIN_CHANGED")
+                    generation = session.get(AgentTask, source.input_data.get("upstream_task_ids", {}).get("asset_generate_image"))
+                    if (generation is None or generation.task_type != TaskType.ASSET_GENERATE_IMAGE
+                            or source.input_data.get("upstream_task_ids") != {
+                                "visual_plan": previous.id, "asset_generate_image": generation.id}
+                            or generation.input_data.get("upstream_task_ids") != {"visual_plan": previous.id}):
+                        raise TaskConflictError("VISUAL_REPAIR_ORIGINAL_LINEAGE_CHANGED")
+                    script = session.get(AgentTask, previous.input_data.get("upstream_task_ids", {}).get("script"))
+                    if (script is None or script.task_type != TaskType.SHORT_SCRIPT or script.status != TaskStatus.COMPLETED
+                            or bad.input_data.get("upstream_task_ids") != previous.input_data.get("upstream_task_ids")
+                            or qc.input_data.get("upstream_task_ids", {}).get("script") != script.id):
+                        raise TaskConflictError("VISUAL_REPAIR_SCRIPT_LINEAGE_CHANGED")
+                    _require_current_revision(session, script)
+                    for task in (recovery, bad, previous, source, generation, script):
+                        self._visual_repair_history(session, task, content_id)
+                    prepared, _ = _ensure_image_only_asset_requests(
+                        content=content, settings=self.settings, plan_task=bad, script=script.result_data,
+                    )
+                    expected_qc_input = {
+                        "upstream_task_ids": {"visual_plan": bad.id, "script": script.id},
+                        "scenes": bad.input_data.get("scenes", []),
+                        "voice_duration_sec": bad.input_data.get("voice_duration_sec"),
+                        "allowed_layouts": bad.input_data.get("allowed_layouts", []),
+                        "allowed_asset_ids": bad.input_data.get("allowed_asset_ids", []),
+                        "context_files": bad.input_data.get("context_files", []),
+                    }
+                    if prepared != bad.result_data:
+                        expected_qc_input.update(prepared_visual_plan=prepared,
+                                                 visual_plan_result_sha256=stable_hash(bad.result_data))
+                    expected_qc_input = flow._visual_qc_generation_policy(content_id, expected_qc_input)
+                    expected_qc_input.pop("opening_identity_overlay", None)
+                    overlay = flow.opening_identity_input(content_id, TaskType.VISUAL_PLAN_QC, expected_qc_input)
+                    if overlay:
+                        expected_qc_input["opening_identity_overlay"] = overlay
+                    expected_qc_input, _ = _normalize_content_task_input(
+                        session, TaskType.VISUAL_PLAN_QC, content_id, expected_qc_input,
+                    )
+                    if qc.input_data != expected_qc_input:
+                        raise TaskConflictError("VISUAL_REPAIR_QC_NOT_EXACT_DERIVED_INPUT")
+                    corrected = flow.visual_repair_input(previous, recovery, plan, source=source)
+                    segments = previous.result_data.get("segments", [])
+                    indexes = _failed_segment_indexes(envelope.validation_errors, len(segments))
+                    assets = source.input_data.get("assets", [])
+                    materials = [generated_image_material(session, content, row["artifact_id"]) for row in assets]
+                    good_ids = {row["artifact_id"] for row in assets if row.get("segment_index") not in (indexes or set())}
+                    failed_ids = {row["artifact_id"] for row in assets if row.get("segment_index") in (indexes or set())}
+                    if (indexes is None or len(indexes) != 1 or len(segments) < 2 or len(assets) != len(segments)
+                            or {row.get("segment_index") for row in assets} != set(range(len(segments)))
+                            or any(type(row.get("segment_index")) is not int for row in assets)
+                            or any(material["generation_task_id"] != generation.id
+                                   or material["generation_segment_index"] != row["segment_index"]
+                                   or material["request"] != row.get("request")
+                                   or material["generation"] != row.get("generation")
+                                   for material, row in zip(materials, assets, strict=True))
+                            or corrected["reusable_assets_evidence_gaps"] or not corrected["original_reuse"]
+                            or len(good_ids) != len(segments) - 1 or len(failed_ids) != 1
+                            or {row["artifact_id"] for row in corrected["reusable_generated_assets"]} != good_ids
+                            or set(corrected["allowed_asset_ids"]) != good_ids
+                            or not failed_ids.issubset(corrected["excluded_generated_asset_ids"])):
+                        raise TaskConflictError("VISUAL_REPAIR_EXACT_REUSE_NOT_PROVEN")
+                    legacy = deepcopy(corrected)
+                    legacy.update(reusable_generated_assets=[], original_reuse=False,
+                                  reusable_assets_evidence_gaps=["reuse: failed segment has no exact index"],
+                                  excluded_generated_asset_ids=sorted(
+                                      item for item in previous.input_data.get("excluded_generated_asset_ids", [])
+                                      if isinstance(item, str)),
+                                  allowed_asset_ids=[], context_files=list(dict.fromkeys(previous.input_data.get("context_files", []))))
+                    for field in ("qc_issues", "previous_qc_task_id"):
+                        if field in previous.input_data:
+                            legacy[field] = deepcopy(previous.input_data[field])
+                        else:
+                            legacy.pop(field, None)
+                    if (legacy != bad.input_data or bad.input_data.get("previous_qc_task_id") == source.id
+                            or bad.input_data.get("qc_issues") == envelope.validation_errors):
+                        raise TaskConflictError("VISUAL_REPAIR_NOT_KNOWN_CONTEXT_DEFECT")
+                    corrected.update(supersedes_task_id=bad.id, visual_repair_context_version=1)
+                    replacement = flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, corrected,
+                                                         priority=52, allow_multiple=True)
+                    session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                           entity_id=replacement.id, action=OWNED,
+                                           metadata_json={"input_hash": replacement.input_hash}))
+                    flow.tasks.cancel(qc.id, actor_id="visual-repair-context-reconciliation", actor_type="system")
+                    bad.status, bad.dedup_key = TaskStatus.CANCELLED, None
+                    session.add(bad)
+                    session.add(AuditEvent(actor_type="system", actor_id="visual-repair-context-reconciliation",
+                                           entity_type="agent_task", entity_id=bad.id, action="cancelled",
+                                           metadata_json={"superseded_by": replacement.id, "version": 1}))
+                    content.business_status, content.current_stage = ContentStatus.WAITING_AGENT, "visual_plan"
+                    content.error_code, content.error_message = "VISUAL_REPAIR_CONTEXT_RECONCILED", "已从原始证据重建视觉修复上下文"
+                    content.updated_at = utc_now()
+                    session.add(content)
+                    response = {"reconciled": True, "replayed": False, "visual_plan_task_id": replacement.id,
+                                "superseded_visual_plan_task_id": bad.id, "cancelled_qc_task_id": qc.id}
+                    session.add(AuditEvent(actor_type="admin", actor_id="mpt-admin-api", entity_type="content",
+                                           entity_id=content_id, action=VISUAL_REPAIR_CONTEXT, metadata_json={
+                                               "key": key, "version": 1, "expected": deepcopy(expected),
+                                               "replacement_task_id": replacement.id, "replacement_input_hash": replacement.input_hash,
+                                               "source_task_id": source.id, "source_input_hash": source.input_hash,
+                                               "source_result_hash": stable_hash(source.result_data),
+                                               "original_plan_id": previous.id, "original_plan_input_hash": previous.input_hash,
+                                               "original_plan_result_hash": stable_hash(previous.result_data),
+                                               "generation_id": generation.id, "generation_input_hash": generation.input_hash,
+                                               "generation_result_hash": stable_hash(generation.result_data),
+                                               "response": response,
+                                           }))
+                    Session.commit(session)
+                    return response
+                finally:
+                    session.rollback()
 
     def restore_consumed_visual_plan(self, content_id: str) -> dict:
         """Restore ONLY a proven historical asset backfill, superseding an unexecuted QC offer."""
