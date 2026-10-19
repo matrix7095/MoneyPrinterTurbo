@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -797,6 +798,17 @@ class WorkflowService:
             "cover_image_url": f"/media/artifacts/{cover.id}" if cover else "",
             "context_files": context_files,
         }
+        # Older packages keep their frozen payload and dedup identity during maintenance.
+        if (content.production_mode == ProductionMode.IMAGE_ONLY and cover
+                and cover.relative_path.replace("\\", "/").startswith("publish/cover-revisions/")
+                and self._is_ai_cover_artifact(content.id, cover.id)):
+            from glance_core.runtime_config import effective_settings
+
+            evidence_base = settings if settings is not None else self.base_settings
+            evidence_settings = effective_settings(self.session, evidence_base) if evidence_base is not None else None
+            payload["production_evidence"] = self._publish_production_evidence(
+                content, publish_artifact, cover, context_files, evidence_settings
+            )
         if publish_policy is not None and publish_policy.get("initiated_by") == "handsfree":
             from glance_core.content_acceptance import is_handsfree_content
             from glance_core.runtime_config import effective_settings
@@ -811,6 +823,258 @@ class WorkflowService:
         if publish_policy is not None:
             payload["publish_policy"] = dict(publish_policy)
         return payload
+
+    def _publish_production_evidence(
+        self, content: Content, publish: Artifact | None, cover: Artifact, context_files: list[str],
+        settings: Settings | None,
+    ) -> dict:
+        """Actual package receipts for independent review; provenance never grants a license."""
+        from glance_core.content_acceptance import generated_image_material, resolved_visual_plan, source_context
+
+        root = Path(content.content_dir).resolve()
+        context_files.clear()  # Only verified, content-contained files enter the new package bundle.
+        gaps: list[str] = []
+        evidence: dict = {"version": 1, "license_assessed": False, "evidence_gaps": gaps}
+
+        def file_record(path: Path, label: str) -> dict | None:
+            path = path.resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                gaps.append(f"{label}: file unavailable")
+                return None
+            return {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size_bytes": path.stat().st_size}
+
+        def json_record(path: Path, label: str) -> tuple[dict, dict | None]:
+            path = path.resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                gaps.append(f"{label}: receipt unavailable/unsafe")
+                return {}, None
+            try:
+                raw = path.read_bytes()
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("object required")
+                return data, {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+            except (OSError, ValueError, UnicodeError):
+                gaps.append(f"{label}: receipt invalid")
+                return {}, None
+
+        context_names: dict[str, str] = {}
+
+        def add_context(relative_path: str, sha256: str) -> None:
+            # The CLI downloads into one flat directory on Windows, even for distinct source paths.
+            name = Path(relative_path).name.casefold()
+            existing_sha = context_names.get(name)
+            if existing_sha is not None:
+                if existing_sha != sha256:
+                    raise ValueError("Publish review context filename collision with different bytes")
+                return
+            context_names[name] = sha256
+            context_files.append(relative_path)
+
+        def artifact_record(artifact: Artifact | None, label: str) -> dict | None:
+            if artifact is None or artifact.content_id != content.id:
+                gaps.append(f"{label}: artifact unavailable")
+                return None
+            actual = file_record(root / artifact.relative_path, label)
+            valid = actual == {"sha256": artifact.sha256, "size_bytes": artifact.size_bytes}
+            if not valid:
+                gaps.append(f"{label}: registered bytes changed/unavailable")
+            else:
+                add_context(artifact.relative_path, artifact.sha256)
+            return {"artifact_id": artifact.id, "sha256": artifact.sha256,
+                    "size_bytes": artifact.size_bytes, "artifact_type": artifact.artifact_type,
+                    "bytes_verified": valid}
+
+        def task_record(task: AgentTask | None, label: str) -> dict | None:
+            if task is None or task.content_id != content.id:
+                gaps.append(f"{label}: task unavailable")
+                return None
+            records = self.session.exec(select(AgentSubmission).where(
+                AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+                AgentSubmission.validation_status == "ACCEPTED",
+            )).all()
+            accepted = False
+            raw_sha = None
+            if len(records) == 1:
+                submission = records[0]
+                raw = Path(submission.raw_result_path)
+                if not raw.is_absolute():
+                    raw = self.data_dir.parent / raw
+                expected = (self.tasks.submission_root / task.id / str(task.attempt) / "result.json").resolve()
+                try:
+                    if raw.resolve() == expected and expected.is_relative_to(self.tasks.submission_root.resolve()):
+                        data = expected.read_bytes()
+                        accepted = (stable_hash(json.loads(data)) == submission.result_hash
+                                    == stable_hash(task.result_data))
+                        if accepted:
+                            raw_sha = hashlib.sha256(data).hexdigest()
+                except (OSError, ValueError, UnicodeError):
+                    pass
+            unchanged = stable_hash(task.input_data) == task.input_hash
+            if not accepted or not unchanged:
+                gaps.append(f"{label}: accepted raw result/input verification unavailable")
+            return {"task_id": task.id, "task_type": task.task_type.value, "status": task.status.value,
+                    "attempt": task.attempt, "input_sha256": task.input_hash,
+                    "result_sha256": stable_hash(task.result_data), "accepted_raw_verified": accepted,
+                    "raw_file_sha256": raw_sha, "input_verified": unchanged,
+                    "upstream_task_ids": deepcopy(task.input_data.get("upstream_task_ids", {})),
+                    "result": (deepcopy({key: value for key, value in (task.result_data or {}).items()
+                                         if key in {"passed", "checks", "issues", "summary", "confidence"}})
+                               if task.task_type == TaskType.CONTENT_QC else deepcopy(task.result_data))}
+
+        evidence["publish_video"] = artifact_record(publish, "publish_video")
+        evidence["cover"] = artifact_record(cover, "cover")
+        composition_path = root / cover.relative_path
+        composition_path = composition_path.with_name("composition.json")
+        composition, composition_file = json_record(composition_path, "cover_composition")
+        if (composition.get("cover_sha256") != cover.sha256
+                or composition.get("cover_size_bytes") != cover.size_bytes):
+            composition = {}
+            gaps.append("cover_composition: receipt missing/invalid/unbound")
+        elif composition_file:
+            add_context(composition_path.resolve().relative_to(root).as_posix(), composition_file["sha256"])
+        composition = {key: value for key, value in composition.items() if key in {
+            "version", "source_sha256", "source_size_bytes", "title_lines", "disclosure", "source_binding",
+            "cover_sha256", "cover_size_bytes", "composer", "crop_safe_center",
+        }}
+        if isinstance(composition.get("source_binding"), dict):
+            composition["source_binding"] = {key: value for key, value in composition["source_binding"].items()
+                                             if key in {"artifact_id", "generation_task_id", "generation_input_sha256", "generation_result_sha256"}}
+        evidence["cover_composition"] = {**(composition_file or {}), "data": composition}
+        binding = composition.get("source_binding") or {}
+        base = self.session.get(Artifact, binding.get("artifact_id", ""))
+        generation = self.session.get(AgentTask, binding.get("generation_task_id", ""))
+        if (base is None or base.content_id != content.id
+                or base.artifact_type != "agent_generated_image"
+                or base.sha256 != composition.get("source_sha256")
+                or base.size_bytes != composition.get("source_size_bytes")
+                or generation is None or generation.content_id != content.id
+                or generation.task_type != TaskType.ASSET_GENERATE_IMAGE
+                or generation.id != base.producer_stage
+                or generation.input_hash != binding.get("generation_input_sha256")
+                or stable_hash(generation.result_data) != binding.get("generation_result_sha256")
+                or not any(item.get("artifact_id") == base.id for item in (generation.result_data or {}).get("images", []))):
+            base = generation = None
+            gaps.append("cover_base: exact artifact/generation identity unavailable")
+        evidence["cover_base"] = artifact_record(base, "cover_base")
+        evidence["cover_generation"] = task_record(generation, "cover_generation")
+        if generation:
+            evidence["cover_generation"]["requests"] = deepcopy(generation.input_data.get("requests", []))
+
+        script = self.completed_task_for(content.id, TaskType.SHORT_SCRIPT)
+        plan = self.completed_task_for(content.id, TaskType.VISUAL_PLAN)
+        qc = self.completed_task_for(content.id, TaskType.CONTENT_QC)
+        evidence["script"] = task_record(script, "script")
+        evidence["visual_plan"] = task_record(plan, "visual_plan")
+        evidence["content_qc"] = task_record(qc, "content_qc")
+        final = self.session.get(Artifact, qc.input_data.get("video_artifact_id")) if qc else None
+        evidence["final_video"] = artifact_record(final, "final_video")
+        latest_final = self.session.exec(select(Artifact).where(
+            Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
+        ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+        subject_matches = bool(
+            qc and qc.status == TaskStatus.COMPLETED and (qc.result_data or {}).get("passed") is True
+            and final and latest_final and final.id == latest_final.id and publish and final.sha256 == publish.sha256
+            and qc.input_data.get("upstream_task_ids", {}).get("script") == (script.id if script else None)
+            and qc.input_data.get("upstream_task_ids", {}).get("visual_plan") == (plan.id if plan else None)
+        )
+        evidence["current_final_qc_subject_matches"] = subject_matches
+        if not subject_matches:
+            gaps.append("content_qc: passed current script/plan/final binding unavailable")
+        if qc:
+            evidence["acceptance_subject"] = deepcopy(qc.input_data.get("acceptance_subject", {}))
+            evidence["source_context_at_acceptance"] = deepcopy(qc.input_data.get("source_context", {}))
+        refs = {"script": script.id if script else None, "visual_plan": plan.id if plan else None}
+        evidence["registered_source_context"] = source_context(self.session, content.id, refs)
+        evidence["images"] = []
+        evidence["local_adaptation"] = {
+            "receipt_status": "not_registered_as_content_artifact",
+            "limitation": "Generation results describe uploaded images; original-to-prepared adaptation is not proved by those results or QC.",
+        }
+        if plan:
+            try:
+                segments = resolved_visual_plan(self.session, plan).get("segments", [])
+            except ValueError:
+                segments = []
+                gaps.append("images: resolved current plan unavailable")
+            for index, segment in enumerate(segments):
+                asset = self.session.get(Artifact, segment.get("asset_id", ""))
+                item = {"segment_index": index, "artifact": artifact_record(asset, f"image_{index}")}
+                if asset and asset.artifact_type == "agent_generated_image":
+                    try:
+                        material = generated_image_material(self.session, content, asset.id)
+                        item["generation"] = material
+                        item["generation_receipt"] = task_record(
+                            self.session.get(AgentTask, material["generation_task_id"]), f"image_{index}_generation"
+                        )
+                    except ValueError:
+                        gaps.append(f"image_{index}: exact generation lineage unavailable")
+                evidence["images"].append(item)
+        evidence["plan_qc"] = task_record(self.completed_task_for(content.id, TaskType.VISUAL_PLAN_QC), "plan_qc")
+        image_qcs = self.session.exec(select(AgentTask).where(
+            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
+            AgentTask.status == TaskStatus.COMPLETED,
+        ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
+        evidence["asset_qc"] = [task_record(item, "asset_qc") for item in image_qcs
+                                 if plan and item.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id]
+        voice_binding = plan.input_data.get("voice_artifact", {}) if plan else {}
+        voice = self.session.get(Artifact, voice_binding.get("id", ""))
+        voice_record = artifact_record(voice, "voice")
+        evidence["voice"] = {"artifact": voice_record, "provider": "unknown",
+                             "provider_evidence": "historical voice has no persisted provider receipt",
+                             "plan_binding_matches": bool(voice and voice.sha256 == voice_binding.get("sha256"))}
+        # A matching signed historical request proves requested options, not the provider's response or rights.
+        if settings is not None and script and voice and voice_record and voice_record["bytes_verified"]:
+            approvals = self.session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "content", AuditEvent.entity_id == content.id,
+                AuditEvent.action == "manual_script_approved", AuditEvent.actor_type == "human",
+                AuditEvent.actor_id == "admin-api",
+            )).all()
+            options = {"voice": settings.tts_voice, "rate": settings.tts_rate, "volume": settings.tts_volume,
+                       "provider": settings.tts_provider, "provider_endpoint": stable_hash(settings.tts_provider_endpoint),
+                       "target_duration_sec": float((script.result_data or {}).get("estimated_duration_sec") or 0) or None}
+            proof = {"id": script.id, "input_hash": script.input_hash, "result_hash": stable_hash(script.result_data),
+                     "status": script.status.value, "attempt": script.attempt}
+            for approval in approvals:
+                receipt = approval.metadata_json
+                unsigned = {key: value for key, value in receipt.items() if key != "signature"}
+                recorded_signature = receipt.get("signature")
+                if not isinstance(recorded_signature, str) or len(recorded_signature) != 64 or not recorded_signature.isascii():
+                    continue
+                signature = hmac.new(settings.admin_token.get_secret_value().encode(),
+                    stable_hash({"event_id": approval.id, "content_id": content.id, "receipt": unsigned}).encode("ascii"),
+                    hashlib.sha256).hexdigest()
+                if (not hmac.compare_digest(recorded_signature, signature)
+                        or receipt.get("contract_version") != 1 or receipt.get("producer") != "mpt-admin-approve-script"
+                        or (receipt.get("tasks") or {}).get("short_script") != proof
+                        or receipt.get("voice_artifact") != voice_binding):
+                    continue
+                requested_hash = stable_hash({"version": 1, "script": proof, "approval": receipt["tasks"],
+                                              "voice_options": options, "automatic_scope": None})
+                stages = self.session.exec(select(StageRun).where(
+                    StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.status == StageStatus.SUCCESS,
+                    StageRun.input_hash == requested_hash,
+                )).all()
+                if len(stages) == 1:
+                    evidence["voice"]["historical_request"] = {"options": options, "stage_id": stages[0].id,
+                        "input_sha256": requested_hash, "approval_event_id": approval.id,
+                        "approval_signature_verified": True, "actual_provider_verified": False, "license_verified": False}
+                    break
+        evidence["bgm"] = {"usage": "unknown", "license": "unknown"}
+        request, request_file = json_record(root / "render" / "mpt-render-request.json", "render")
+        outputs, _ = json_record((root / final.relative_path).with_name("outputs.json"), "render_outputs") if final else ({}, None)
+        if (request_file and final and request.get("revision_id") == Path(final.relative_path).parent.name
+                and outputs.get("final.mp4") == final.sha256
+                and voice and request.get("voice_sha256") == voice.sha256):
+            evidence["render_receipt"] = {**request_file, "revision_id": request["revision_id"],
+                                          "voice_sha256": voice.sha256,
+                                          "bgm_sha256": request.get("bgm_sha256"), "bgm_volume": request.get("bgm_volume")}
+            evidence["bgm"] = {"usage": "used" if request.get("bgm_sha256") else "none",
+                               "sha256": request.get("bgm_sha256"), "license": "unknown" if request.get("bgm_sha256") else "not_applicable"}
+        else:
+            gaps.append("render: exact voice/BGM receipt unavailable")
+        # Generation tools and QC results are evidence for review, never legal permission.
+        return evidence
 
     def schedule_manual_assist_tasks(
         self, *, publish_policy: dict | None = None, settings: Settings | None = None

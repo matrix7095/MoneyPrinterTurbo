@@ -330,6 +330,29 @@ def approve_final(*, content_id: str, request: Request):
     return run_stage(request, content_id, approve_final, {ContentStatus.FINAL_REVIEW})
 
 
+class RebuildCoverRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: str | None = Field(default=None, min_length=1, max_length=12)
+
+
+@router.post("/contents/{content_id}/rebuild-cover")
+def rebuild_cover(*, content_id: str, payload: RebuildCoverRequest, request: Request):
+    from app.business.pipeline import rebuild_cover
+
+    runtime = get_runtime(request)
+
+    def rebuild(engine, settings, target_id):
+        with Session(engine) as session:
+            content = session.get(Content, target_id)
+            if content is None:
+                raise KeyError(target_id)
+            content_root(content, runtime)
+        return rebuild_cover(engine, settings, target_id, actor_id="mpt-admin-api", title=payload.title)
+
+    return run_stage(request, content_id, rebuild, {ContentStatus.PACKAGED, ContentStatus.PUBLISHED})
+
+
 @router.post("/contents/{content_id}/resume-acceptance")
 def resume_acceptance(*, content_id: str, request: Request):
     from app.business.pipeline import resume_content_acceptance

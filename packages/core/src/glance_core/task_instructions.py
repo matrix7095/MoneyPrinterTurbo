@@ -224,9 +224,15 @@ _PUBLISH_REVIEW_ASSIST = """\
 
 ## 输入
 读取 `script`、`research`、`publish_prepare`、`publish_artifact_id`、`publish_video_url`、
-`cover_artifact_id`、`cover_image_url`、可选的 `publish_policy` 和 `context_files`。
+`cover_artifact_id`、`cover_image_url`、可选的 `publish_policy`、`production_evidence` 和 `context_files`。
 先检查 `context/` 下实际下发的成片和封面；
 `cover_artifact_id` 是服务端登记的权威封面，不能把脚本里的封面视觉描述当作封面文件。
+
+若提供 `production_evidence`，逐项核对当前发布视频/封面/音轨的 ArtifactID、SHA、实际生成来源、
+封面合成披露、当前脚本/画面计划/成片 QC 的精确绑定及证据缺项。已接受的生成结果记录来源陈述，
+QC 通过记录说明对应审核结果；两者都不是许可证。研究中的制作计划不能替代实际生成凭据。
+历史音轨 provider、BGM 使用或本机适配凭据未知时，按明确限制独立判断，不从当前配置反推历史事实。
+核对实际封面的“AI概念示意·非实拍”披露及标题在平台裁切预览中可读；不能用简介中的披露替代封面。
 
 ## 输出
 在 `result.json` 给出 `READY`、`BLOCKED` 或 `HUMAN` 结论及理由、问题和检查清单。

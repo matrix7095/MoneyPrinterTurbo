@@ -1165,6 +1165,7 @@ INPUT_FIELDS: dict[TaskType, frozenset[str]] = {
             "cover_artifact_id",
             "cover_image_url",
             "context_files",
+            "production_evidence",
         }
     ),
     TaskType.MEDIA_SOURCE_ASSIST: frozenset(

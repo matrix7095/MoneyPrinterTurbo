@@ -540,26 +540,60 @@ def _build_and_register_cover(
     content: Content,
     *,
     base_image: Path | None = None,
+    base_artifact_id: str | None = None,
+    cover_title: str | None = None,
     actor_id: str = "pipeline",
     action: str = "cover_built",
 ) -> Artifact:
     flow = workflow(session, settings)
     script = flow.result_for(content.id, TaskType.SHORT_SCRIPT) or {}
     executor = MediaExecutor(Path(content.content_dir).resolve())
+    cover_title = _effective_cover_title(content, script) if cover_title is None else cover_title
     source, fallback_stage = (
         (base_image, "generated_image")
         if base_image is not None
         else _fallback_cover_base(session, content, executor)
     )
-    cover = executor.build_cover(source, _effective_cover_title(content, script))
-    artifact = register_artifact(
-        session,
-        content=content,
-        executor=executor,
-        path=cover,
-        artifact_type="cover",
-        stage="package",
-        deduplicate=False,
+    source_binding = None
+    if base_image is not None:
+        root = executor.root.resolve()
+        source = source.resolve()
+        generated = session.get(Artifact, base_artifact_id) if base_artifact_id else None
+        if (generated is None or generated.content_id != content.id
+                or generated.artifact_type != "agent_generated_image" or not source.is_relative_to(root)
+                or source != (root / generated.relative_path).resolve()
+                or not source.is_file() or source.stat().st_size != generated.size_bytes
+                or sha256_file(source) != generated.sha256):
+            raise NonRetryableMediaError("Cover base failed registered file-integrity validation")
+        generation = session.get(AgentTask, generated.producer_stage)
+        images = (generation.result_data or {}).get("images", []) if generation else []
+        if (generation is None or generation.content_id != content.id
+                or generation.task_type != TaskType.ASSET_GENERATE_IMAGE
+                or generation.status != TaskStatus.COMPLETED
+                or stable_hash(generation.input_data) != generation.input_hash
+                or generation.input_data.get("asset_purpose") != "cover"
+                or len(images) != 1 or images[0].get("artifact_id") != generated.id):
+            raise NonRetryableMediaError("Cover base generation identity failed validation")
+        source_binding = {"artifact_id": generated.id, "generation_task_id": generation.id,
+                          "generation_input_sha256": generation.input_hash,
+                          "generation_result_sha256": stable_hash(generation.result_data)}
+    cover = executor.build_cover(
+        source, cover_title,
+        ai_generated=fallback_stage == "generated_image" or content.production_mode == ProductionMode.IMAGE_ONLY,
+        source_binding=source_binding,
+    )
+    latest_cover = session.exec(select(Artifact).where(
+        Artifact.content_id == content.id, Artifact.artifact_type == "cover",
+    ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+    same_selection = bool(latest_cover and latest_cover.relative_path == cover.relative_to(executor.root).as_posix()
+                          and latest_cover.sha256 == sha256_file(cover))
+    artifact = latest_cover if same_selection else register_artifact(
+        session, content=content, executor=executor, path=cover,
+        artifact_type="cover", stage="package", deduplicate=False,
+    )
+    composition = register_artifact(
+        session, content=content, executor=executor, path=cover.with_name("composition.json"),
+        artifact_type="cover_composition", stage="package",
     )
     session.add(
         AuditEvent(
@@ -570,8 +604,9 @@ def _build_and_register_cover(
             action=action,
             metadata_json={
                 "artifact_id": artifact.id,
-                "cover_title": _effective_cover_title(content, script),
+                "cover_title": cover_title,
                 "base_source": fallback_stage,
+                "composition_artifact_id": composition.id,
             },
         )
     )
@@ -2065,6 +2100,15 @@ def _advance_after_agent(
                     flow.mark_status(content_id, ContentStatus.PRODUCING, "render_ready")
         elif task.task_type == TaskType.ASSET_GENERATE_IMAGE:
             if task.input_data.get("asset_purpose") == "cover":
+                generations = session.exec(select(AgentTask).where(
+                    AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
+                    AgentTask.status != TaskStatus.CANCELLED,
+                ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
+                current_cover = next((item for item in generations if item.input_data.get("asset_purpose") == "cover"), None)
+                if current_cover is None or current_cover.id != task.id:
+                    _audit_stale_lineage(session, task, reason="cover generation superseded",
+                                         current_task_ids={"cover_generation": current_cover.id if current_cover else None})
+                    return
                 images = (task.result_data or {}).get("images", [])
                 artifact_id = str((images[0].get("artifact_id") if images else "") or "")
                 generated = session.get(Artifact, artifact_id) if artifact_id else None
@@ -2079,6 +2123,7 @@ def _advance_after_agent(
                     settings,
                     content,
                     base_image=base_image,
+                    base_artifact_id=generated.id,
                     action="cover_ai_upgraded",
                 )
                 _queue_post_package_tasks(
@@ -3680,7 +3725,7 @@ def rebuild_cover(
     title: str | None = None,
     use_source_frame: bool = False,
 ) -> Artifact:
-    """Rebuild a packaged cover immediately; this path never creates an Agent task."""
+    """Compose an immutable cover and idempotently refresh this packaged content's review inputs."""
     with Session(engine) as session:
         settings = effective_settings(session, settings)
         content = session.get(Content, content_id)
@@ -3688,39 +3733,40 @@ def rebuild_cover(
             raise KeyError(content_id)
         if content.business_status not in {ContentStatus.PACKAGED, ContentStatus.PUBLISHED}:
             raise ValueError("只有待发布或已发布内容可以重建封面")
-        if title is not None:
-            normalized = "".join(title.split())
-            if not 1 <= len(normalized) <= 12:
-                raise ValueError("封面文案需为 1-12 个字")
-            content.cover_title_override = normalized
-            content.updated_at = utc_now()
-            session.add(content)
-            session.commit()
+        normalized = None if title is None else "".join(title.split())
+        if normalized is not None and not 1 <= len(normalized) <= 12:
+            raise ValueError("封面文案需为 1-12 个字")
+        old_cover = session.exec(select(Artifact).where(
+            Artifact.content_id == content_id, Artifact.artifact_type == "cover",
+        ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+        if old_cover:
+            root = Path(content.content_dir).resolve()
+            old_path = (root / old_cover.relative_path).resolve()
+            if (not old_path.is_relative_to(root) or not old_path.is_file()
+                    or old_path.stat().st_size != old_cover.size_bytes or sha256_file(old_path) != old_cover.sha256):
+                raise NonRetryableMediaError("Previous cover failed file-integrity validation")
         base_image: Path | None = None
+        base_artifact_id: str | None = None
         if not use_source_frame:
-            completed = session.exec(
-                select(AgentTask)
-                .where(
+            generations = session.exec(
+                select(AgentTask).where(
                     AgentTask.content_id == content_id,
                     AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
-                    AgentTask.status == TaskStatus.COMPLETED,
-                )
-                .order_by(AgentTask.completed_at.desc())
+                    AgentTask.status != TaskStatus.CANCELLED,
+                ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
             ).all()
-            for task in completed:
-                if task.input_data.get("asset_purpose") != "cover":
-                    continue
+            task = next((item for item in generations if item.input_data.get("asset_purpose") == "cover"), None)
+            if task is not None:
                 images = (task.result_data or {}).get("images", [])
-                artifact_id = str((images[0].get("artifact_id") if images else "") or "")
-                artifact = session.get(Artifact, artifact_id) if artifact_id else None
-                candidate = (
-                    Path(content.content_dir).resolve() / artifact.relative_path
-                    if artifact
-                    else None
-                )
-                if candidate and candidate.is_file():
-                    base_image = candidate
-                    break
+                if (task.status != TaskStatus.COMPLETED or stable_hash(task.input_data) != task.input_hash
+                        or len(images) != 1):
+                    raise NonRetryableMediaError("Current cover generation is incomplete or changed")
+                artifact = session.get(Artifact, images[0].get("artifact_id", ""))
+                if (artifact is None or artifact.content_id != content_id
+                        or artifact.artifact_type != "agent_generated_image" or artifact.producer_stage != task.id):
+                    raise NonRetryableMediaError("Current cover generation artifact binding changed")
+                base_image = Path(content.content_dir).resolve() / artifact.relative_path
+                base_artifact_id = artifact.id
         if _cover_ai_required(settings) and base_image is None:
             raise ValueError("AI 封面尚未生成完成，不能使用实拍帧或渐变封面")
         artifact = _build_and_register_cover(
@@ -3728,12 +3774,30 @@ def rebuild_cover(
             settings,
             content,
             base_image=base_image,
+            base_artifact_id=base_artifact_id,
+            cover_title=normalized,
             actor_id=actor_id,
             action="cover_source_frame_selected" if use_source_frame else "cover_title_rebuilt",
         )
+        if normalized is not None:
+            content.cover_title_override = normalized
+            content.updated_at = utc_now()
+            session.add(content)
+        if content.business_status == ContentStatus.PACKAGED:
+            flow = workflow(session, settings)
+            _queue_post_package_tasks(
+                session, flow, content, settings,
+                flow.result_for(content_id, TaskType.SHORT_SCRIPT) or {},
+                flow.result_for(content_id, TaskType.CONTENT_RESEARCH) or {},
+                cover_artifact_id=artifact.id,
+            )
+        elif normalized is not None:
+            session.commit()
         if settings.archive_enabled:
             with suppress(Exception):
                 ArchiveService(session, settings).snapshot(content_id)
+        session.refresh(artifact)
+        session.expunge(artifact)
         return artifact
 
 

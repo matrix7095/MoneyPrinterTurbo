@@ -1739,67 +1739,84 @@ class MediaExecutor:
                 handle.write(color * width)
         return output
 
-    def build_cover(self, base_image: Path, title: str) -> Path:
-        """Overlay deterministic Chinese cover copy using bundled fonts and libass."""
+    def build_cover(
+        self, base_image: Path, title: str, *, ai_generated: bool = False,
+        source_binding: dict[str, str] | None = None,
+    ) -> Path:
+        """Compose a crop-safe cover once; published revisions never share writable bytes."""
         ensure_ass_filter()
         cover_title = "".join(title.split())[:12]
         if not cover_title:
             raise ValueError("cover title cannot be empty")
-        wrapped = hard_wrap(cover_title, 6)
-        temp_dir = self.root / "temp" / "cover"
-        publish_dir = self.root / "publish"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        publish_dir.mkdir(parents=True, exist_ok=True)
-        ass_path = temp_dir / "cover.ass"
-        subs = pysubs2.SSAFile()
-        subs.info["PlayResX"] = "1080"
-        subs.info["PlayResY"] = "1920"
-        subs.info["WrapStyle"] = "0"
-        subs.styles["Default"] = pysubs2.SSAStyle(
-            fontname="Noto Sans SC",
-            fontsize=96,
-            bold=True,
-            primarycolor=pysubs2.Color(255, 255, 255),
-            backcolor=pysubs2.Color(0, 0, 0, 153),
-            borderstyle=3,
-            outline=8,
-            shadow=0,
-            alignment=8,
-            # Keep both title lines inside the centered 1080 x 1440 platform preview.
-            marginv=360,
-        )
-        subs.append(
-            pysubs2.SSAEvent(
-                start=0,
-                end=1000,
-                text=wrapped,
-                style="Default",
+        width = math.ceil(len(cover_title) / 2) if len(cover_title) > 6 else 6
+        lines = [cover_title[i:i + width] for i in range(0, len(cover_title), width)]
+        disclosure = "AI概念示意·非实拍" if ai_generated else ""
+        request = {"version": 1, "source_sha256": sha256_file(base_image),
+                   "source_size_bytes": base_image.stat().st_size, "title_lines": lines,
+                   "disclosure": disclosure, "source_binding": source_binding}
+        key = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        content_root = self.root.resolve()
+        revisions = (content_root / "publish" / "cover-revisions").resolve()
+        if not revisions.is_relative_to(content_root):
+            raise NonRetryableMediaError("Cover revision directory escapes content root")
+        revisions.mkdir(parents=True, exist_ok=True)
+        destination = (revisions / key).resolve()
+        if destination.parent != revisions or destination.name != key:
+            raise NonRetryableMediaError("Cover revision destination escapes its immutable directory")
+
+        def existing() -> Path:
+            output = destination / "cover.jpg"
+            composition = destination / "composition.json"
+            if output.resolve() != output or composition.resolve() != composition:
+                raise NonRetryableMediaError("Immutable cover revision contains redirected files")
+            try:
+                receipt = json.loads(composition.read_text(encoding="utf-8"))
+                valid = (all(receipt.get(k) == v for k, v in request.items())
+                         and receipt.get("cover_sha256") == sha256_file(output)
+                         and receipt.get("cover_size_bytes") == output.stat().st_size)
+            except (OSError, ValueError):
+                valid = False
+            if not valid:
+                raise NonRetryableMediaError("Immutable cover revision failed integrity validation")
+            return output
+
+        if destination.exists():
+            return existing()
+        with TemporaryDirectory(prefix=".cover-", dir=revisions) as directory:
+            staging = Path(directory)
+            ass_path = staging / "cover.ass"
+            subs = pysubs2.SSAFile()
+            subs.info.update(PlayResX="1080", PlayResY="1920", WrapStyle="0")
+            subs.styles["Default"] = pysubs2.SSAStyle(
+                fontname="Noto Sans SC", fontsize=96, bold=True,
+                primarycolor=pysubs2.Color(255, 255, 255), backcolor=pysubs2.Color(0, 0, 0, 153),
+                borderstyle=3, outline=8, shadow=0, alignment=8, marginv=720,
             )
-        )
-        subs.save(str(ass_path))
-        output = publish_dir / "cover.jpg"
-        filter_chain = (
-            f"{layout_filter('center_crop')},"
-            f"ass=filename='{ffmpeg_filter_path(ass_path)}':"
-            f"fontsdir='{ffmpeg_filter_path(FONT_ASSET_DIR)}'"
-        )
-        run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(base_image),
-                "-vf",
-                filter_chain,
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                str(output),
-            ],
-            cwd=self.root,
-        )
-        return output
+            subs.append(pysubs2.SSAEvent(start=0, end=1000, text=r"\N".join(lines), style="Default"))
+            if disclosure:
+                subs.styles["Disclosure"] = pysubs2.SSAStyle(
+                    fontname="Noto Sans SC", fontsize=48, bold=True,
+                    primarycolor=pysubs2.Color(255, 255, 255), backcolor=pysubs2.Color(0, 0, 0, 0),
+                    borderstyle=3, outline=10, shadow=0, alignment=8, marginv=1090,
+                )
+                subs.append(pysubs2.SSAEvent(start=0, end=1000, text=disclosure, style="Disclosure"))
+            subs.save(str(ass_path))
+            output = staging / "cover.jpg"
+            run_command([
+                "ffmpeg", "-y", "-i", str(base_image), "-vf",
+                f"{layout_filter('center_crop')},ass=filename='{ffmpeg_filter_path(ass_path)}':"
+                f"fontsdir='{ffmpeg_filter_path(FONT_ASSET_DIR)}'",
+                "-frames:v", "1", "-q:v", "2", str(output),
+            ], cwd=self.root)
+            (staging / "composition.json").write_text(json.dumps({
+                **request, "cover_sha256": sha256_file(output), "cover_size_bytes": output.stat().st_size,
+                "composer": "ffmpeg-libass", "crop_safe_center": {"width": 1080, "height": 608},
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                staging.rename(destination)
+            except FileExistsError:
+                pass  # A concurrent identical request may have published the complete directory first.
+        return existing()
 
     def _local_asr(
         self,
