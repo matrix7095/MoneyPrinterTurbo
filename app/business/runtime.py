@@ -39,6 +39,9 @@ QC_PLAN_REJECTED = "mpt_content_qc_recovery_plan_rejected"
 QC_TARGET_REJECTION = "RECOVERY_QC_TARGET_CHANGED"
 QC_REINSPECTION = "mpt_content_qc_reinspection_created"
 VISUAL_REPAIR_CONTEXT = "mpt_visual_repair_context_reconciled"
+VISUAL_REVIEW_CONTEXT = "mpt_visual_plan_review_context_reconciled"
+# Version 1 recognizes this audited legacy derivation, never an arbitrary failed rights review.
+VISUAL_REVIEW_LEGACY_SOURCE = "ca87d146dbc700990f54e2460332c36b233cb96eb897a7f10003efbef3cb6a3c"
 QC_REINSPECTION_CHECKS = frozenset({
     "CONTENT_QC_SAME_SUBJECT_FULL_REVIEW_V1", "CONTENT_QC_ALL_NINE_HARD_GATES",
 })
@@ -1546,6 +1549,314 @@ class BusinessRuntime:
                                                "generation_result_hash": stable_hash(generation.result_data),
                                                "response": response,
                                            }))
+                    Session.commit(session)
+                    return response
+                finally:
+                    session.rollback()
+
+    def reconcile_visual_plan_review_context(self, content_id: str, expected: dict) -> dict:
+        """Issue one fresh review after a proved pre-review self-approval defect; never pass QC."""
+        from datetime import datetime
+        from glance_core.content_acceptance import _unchanged_material_task, completed_image_origin, source_context, visual_review_source_context
+        from glance_core.models import Candidate, ProductionMode, PublicationRecord, RightsStatus
+        from glance_core.task_schemas import RecoveryFailureEnvelope, RecoveryPlan
+        from app.business.bundles import sha256_file
+        from app.business.content_host import CLAIM, child_work_unresolved, host_live, offer_receipt
+        from app.business.content_run import load_run
+
+        with content_operation_lock(self.settings, content_id):
+            with _ConsumptionSession(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    assert_allowed(session, content_id=content_id)
+                    content = session.get(Content, content_id)
+                    if content is None:
+                        raise KeyError(content_id)
+                    if (expected.get("version") != 1
+                            or expected.get("evidence_mode") != "accepted_failure_plus_deployed_derivation_v1"):
+                        raise TaskConflictError("VISUAL_REVIEW_CONTEXT_VERSION_CHANGED")
+                    bound = {}
+                    for name, kind in (("plan", TaskType.VISUAL_PLAN), ("qc", TaskType.VISUAL_PLAN_QC),
+                                       ("recovery", TaskType.RECOVERY)):
+                        binding = expected[name]
+                        task = session.get(AgentTask, binding["task_id"])
+                        if (task is None or task.content_id != content_id or task.task_type != kind
+                                or task.input_hash != binding["input_hash"]
+                                or stable_hash(task.input_data) != task.input_hash
+                                or stable_hash(task.result_data) != binding["result_hash"]
+                                or task.attempt != binding["attempt"]):
+                            raise TaskConflictError("VISUAL_REVIEW_EXPECTED_BINDING_CHANGED")
+                        self._require_accepted_native_task(session, task, consumed=True)
+                        raw = self.settings.agent_submission_dir / task.id / str(task.attempt) / "result.json"
+                        if sha256_file(raw) != binding["raw_file_sha256"]:
+                            raise TaskConflictError("VISUAL_REVIEW_ACCEPTED_RAW_CHANGED")
+                        bound[name] = task
+                    plan, qc, recovery = (bound[name] for name in ("plan", "qc", "recovery"))
+                    key = stable_hash({"content_id": content_id, "qc_id": qc.id, "recovery_id": recovery.id, "version": 1})
+                    receipts = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "content", AuditEvent.entity_id == content_id,
+                        AuditEvent.action == VISUAL_REVIEW_CONTEXT,
+                    )).all()
+                    matches = [row for row in receipts if row.metadata_json.get("key") == key]
+                    if matches:
+                        if len(matches) != 1:
+                            raise TaskConflictError("VISUAL_REVIEW_REPLAY_AMBIGUOUS")
+                        receipt = matches[0]
+                        data = receipt.metadata_json
+                        replacement = session.get(AgentTask, data.get("replacement_task_id"))
+                        if (receipt.actor_type != "admin" or receipt.actor_id != "mpt-admin-api"
+                                or data.get("expected") != expected or replacement is None
+                                or replacement.content_id != content_id or replacement.task_type != TaskType.VISUAL_PLAN_QC
+                                or replacement.input_hash != data.get("replacement_input_hash")
+                                or stable_hash(replacement.input_data) != replacement.input_hash
+                                or replacement.input_data.get("review_context_compensation") != data.get("compensation")):
+                            raise TaskConflictError("VISUAL_REVIEW_REPLAY_CHANGED")
+                        _require_owned_input(session, replacement)
+                        return {**data["response"], "replayed": True}
+                    run = load_run(session)
+                    if (run is None or run.content_id != content_id
+                            or {field: getattr(run, field) for field in expected["run"]} != expected["run"]
+                            or run.state != "stopped" or not run.stop_requested
+                            or host_live(run) or child_work_unresolved(run)):
+                        raise TaskConflictError("VISUAL_REVIEW_RUN_NOT_DRAINED_OR_CHANGED")
+                    if (content.production_mode != ProductionMode.IMAGE_ONLY
+                            or (content.business_status, content.current_stage) != (ContentStatus.FAILED, "recovery_blocked")
+                            or content.error_code != "RECOVERY_BLOCKED"
+                            or content.error_message != "角色路由动作与失败分类不匹配"):
+                        raise TaskConflictError("VISUAL_REVIEW_CONTENT_NOT_CURRENT")
+                    _require_idle_bundle_recovery(session, content_id)
+                    tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content_id)).all()
+                    for task in (plan, qc, recovery):
+                        _require_current_revision(session, task)
+                    if (any("visual_review_context_version" in task.input_data for task in (qc, plan))
+                            or "source_context_version" in qc.input_data or qc.schema_version != "1"
+                            or qc.input_data.get("upstream_task_ids") != {"visual_plan": plan.id,
+                                "script": plan.input_data.get("upstream_task_ids", {}).get("script")}):
+                        raise TaskConflictError("VISUAL_REVIEW_NOT_LEGACY_PRE_REVIEW")
+                    if (session.exec(select(AuditEvent.id).where(
+                            AuditEvent.entity_type == "publish_intent",
+                            AuditEvent.metadata_json["content_id"].as_string() == content_id,
+                        )).first() or session.exec(select(PublicationRecord.id).where(
+                            PublicationRecord.content_id == content_id)).first()):
+                        raise TaskConflictError("VISUAL_REVIEW_PUBLISH_HISTORY_PRESENT")
+                    for task in tasks:
+                        refs = task.input_data.get("upstream_task_ids", {})
+                        if task.id not in {qc.id, recovery.id} and (refs.get("visual_plan") == plan.id
+                                or task.input_data.get("supersedes_qc_id") == qc.id):
+                            raise TaskConflictError("VISUAL_REVIEW_DESCENDANT_PRESENT")
+                    claims = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == qc.id,
+                        AuditEvent.action == CLAIM,
+                    )).all()
+                    served = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == qc.id,
+                        AuditEvent.action == "bundle_served",
+                    )).all()
+                    if len(claims) != 1 or len(served) != 1:
+                        raise TaskConflictError("VISUAL_REVIEW_NATIVE_DELIVERY_UNPROVEN")
+                    claim, delivery = claims[0], served[0]
+                    claim_data = claim.metadata_json
+                    worker, offer_hash = offer_receipt(session, claim_data["request_id"])
+                    offer_event = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "scheduler_offer", AuditEvent.entity_id == claim_data["request_id"],
+                        AuditEvent.action == "mpt_content_run_offer",
+                    )).one()
+                    intent = run.intents.get(claim_data["request_id"], {})
+                    if (claim.actor_type != "system" or claim.actor_id != "mpt-content-host"
+                            or delivery.actor_type != "agent" or delivery.actor_id != qc.assigned_agent_id
+                            or delivery.metadata_json != {"served_prompt_hash": stable_hash(qc.instructions),
+                                                          "schema_version": qc.schema_version}
+                            or qc.started_at is None or qc.completed_at is None
+                            or not as_utc(qc.started_at) <= as_utc(claim.created_at) <= as_utc(delivery.created_at) <= as_utc(qc.completed_at)
+                            or claim_data.get("task_id") != qc.id or claim_data.get("agent_id") != qc.assigned_agent_id
+                            or claim_data.get("lease_token_hash") != qc.lease_token_hash
+                            or claim_data.get("started_at") != as_utc(qc.started_at).isoformat()
+                            or claim_data.get("run_id") != run.run_id or claim_data.get("generation") != run.generation
+                            or claim_data.get("host_epoch") != run.host_epoch
+                            or claim_data.get("parent_thread_id") != run.parent_thread_id
+                            or worker.get("task_id") != qc.id or worker.get("agent_id") != qc.assigned_agent_id
+                            or worker.get("input_hash") != qc.input_hash or worker.get("content_id") != content_id
+                            or worker.get("task_type") != qc.task_type.value or worker.get("role_id") != "visual"
+                            or offer_event.actor_type != "scheduler" or offer_event.actor_id != worker.get("scheduler_id")
+                            or worker.get("run_id") != run.run_id or worker.get("run_generation") != run.generation
+                            or worker.get("host_epoch") != run.host_epoch or claim_data.get("offer_hash") != offer_hash
+                            or intent.get("state") != "TERMINAL" or intent.get("claim_id") != claim_data.get("claim_id")
+                            or intent.get("offer_hash") != offer_hash
+                            or (intent.get("child") or {}).get("child_id") != claim_data.get("child_id")):
+                        raise TaskConflictError("VISUAL_REVIEW_NATIVE_DELIVERY_CHANGED")
+                    deployment = expected["historical_deployment"]
+                    relative = Path(deployment["relative_path"])
+                    proof = (self.workspace_root / relative).resolve()
+                    smoke = (self.workspace_root / "storage" / "smoke").resolve()
+                    if relative.is_absolute() or ".." in relative.parts or not proof.is_relative_to(smoke) or sha256_file(proof) != deployment["sha256"]:
+                        raise TaskConflictError("VISUAL_REVIEW_DEPLOYMENT_EVIDENCE_CHANGED")
+                    historical = json.loads(proof.read_text(encoding="utf-8"))
+                    source_sha = historical.get("source_sha256", {}).get("packages/core/src/glance_core/content_acceptance.py")
+                    if (historical.get("phase") != "after" or historical.get("head") != deployment["revision"]
+                            or historical.get("target_commit") != deployment["revision"]
+                            or historical.get("database_media_and_negatives_unchanged") is not True
+                            or source_sha != VISUAL_REVIEW_LEGACY_SOURCE
+                            or datetime.fromisoformat(historical["at"]).tzinfo is None
+                            or as_utc(datetime.fromisoformat(historical["at"])) >= as_utc(delivery.created_at)):
+                        raise TaskConflictError("VISUAL_REVIEW_DEPLOYED_DERIVATION_UNPROVEN")
+                    refs = qc.input_data["upstream_task_ids"]
+                    legacy = source_context(session, content_id, refs)
+                    if (legacy.get("evidence_gaps") != ["Current VISUAL_PLAN_QC must be completed and passed"]
+                            or (qc.result_data or {}).get("passed") is not False):
+                        raise TaskConflictError("VISUAL_REVIEW_NOT_KNOWN_CIRCULAR_DEFECT")
+                    facts = visual_review_source_context(session, content_id, refs, review_task=qc, include_references=True)
+                    segments = facts.get("generation_provenance", {}).get("segments", [])
+                    selected = qc.input_data.get("prepared_visual_plan", plan.result_data).get("segments", [])
+                    asset_ids = [segment.get("asset_id") for segment in selected]
+                    errors = [issue for issue in qc.result_data.get("issues", []) if issue.get("severity") == "error"]
+                    message = errors[0].get("message", "") if len(errors) == 1 else ""
+                    positions = [message.find(asset_id) for asset_id in asset_ids if isinstance(asset_id, str)]
+                    if (len(asset_ids) != 7 or len(set(asset_ids)) != 7 or len(segments) != 7
+                            or any(segment.get("asset_request") or segment.get("scene_id") for segment in selected)
+                            or [row.get("artifact_id") for row in segments] != asset_ids
+                            or [row.get("segment_index") for row in segments] != list(range(7))
+                            or facts.get("scope") != "visual_plan_pre_review" or facts.get("evidence_gaps")
+                            or facts.get("generation_intents")
+                            or facts.get("generation_provenance", {}).get("license_assessed") is not False
+                            or facts.get("generation_provenance", {}).get("composition_qc_assessed") is not False
+                            or stable_hash(facts) != expected["corrected_context_sha256"]
+                            or len(errors) != 1 or errors[0].get("field") != "rights"
+                            or "source_context_read_only.evidence_gaps" not in message
+                            or "visual material accepted/consumed proof missing" not in message
+                            or len(positions) != 7 or any(pos < 0 for pos in positions) or positions != sorted(positions)
+                            or any(issue.get("severity") not in {"error", "warning"} for issue in qc.result_data.get("issues", []))):
+                        raise TaskConflictError("VISUAL_REVIEW_EXACT_PREEXISTING_FACTS_UNPROVEN")
+                    candidate = session.get(Candidate, content.candidate_id)
+                    if (candidate is None or candidate.rights_status == RightsStatus.REJECTED
+                            or as_utc(candidate.updated_at) > as_utc(delivery.created_at)):
+                        raise TaskConflictError("VISUAL_REVIEW_REGISTRATION_CHANGED")
+                    voice_data = plan.input_data.get("voice_artifact", {})
+                    voice = session.get(Artifact, voice_data.get("id"))
+                    latest_voice = session.exec(select(Artifact).where(
+                        Artifact.content_id == content_id, Artifact.artifact_type == "voice",
+                    ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+                    root = Path(content.content_dir).resolve()
+                    if (voice is None or voice.content_id != content_id or voice.artifact_type != "voice"
+                            or voice != latest_voice
+                            or {key: getattr(voice, key) for key in ("id", "relative_path", "sha256", "size_bytes")} != voice_data):
+                        raise TaskConflictError("VISUAL_REVIEW_VOICE_CHANGED")
+                    proof_tasks = {plan.id, refs["script"], facts["research_task_id"]}
+                    script_qc = self.workflow_service(session).completed_task_for(content_id, TaskType.SCRIPT_QC)
+                    proof_tasks.add(script_qc.id)
+                    for row in segments:
+                        proof_tasks.update((row["generation_task_id"], row["generation_plan_id"]))
+                        proof_tasks.update(item["task_id"] for item in row.get("prior_asset_qc", []))
+                    for task_id in proof_tasks:
+                        task = session.get(AgentTask, task_id)
+                        if task is None or task.content_id != content_id or not completed_image_origin(session, task):
+                            raise TaskConflictError("VISUAL_REVIEW_HISTORY_NOT_ACCEPTED")
+                        _require_owned_input(session, task)
+                        _unchanged_material_task(session, task, owned=True, consumed=True)
+                        accepted = session.exec(select(AgentSubmission).where(
+                            AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+                            AgentSubmission.validation_status == "ACCEPTED",
+                        )).one()
+                        raw = (self.settings.agent_submission_dir / task.id / str(task.attempt) / "result.json").resolve()
+                        cancellations = session.exec(select(AuditEvent).where(
+                            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+                            AuditEvent.action == "cancelled",
+                        )).all()
+                        if (not raw.is_relative_to(self.settings.agent_submission_dir.resolve())
+                                or Path(accepted.raw_result_path).resolve() != raw
+                                or stable_hash(json.loads(raw.read_text(encoding="utf-8"))) != accepted.result_hash
+                                or any(row.actor_type != "system" or row.actor_id not in {"voice_redub", "recovery-visual-repair"}
+                                       or row.metadata_json != {"reason": row.actor_id} for row in cancellations)):
+                            raise TaskConflictError("VISUAL_REVIEW_HISTORY_CHANGED")
+                        events = session.exec(select(AuditEvent).where(
+                            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task_id,
+                            AuditEvent.action.in_(["completed", AGENT_CONSUMED, OWNED]),
+                        )).all()
+                        submissions = session.exec(select(AgentSubmission).where(
+                            AgentSubmission.task_id == task_id, AgentSubmission.attempt == task.attempt,
+                            AgentSubmission.validation_status == "ACCEPTED",
+                        )).all()
+                        if (task.completed_at is None or as_utc(task.created_at) > as_utc(delivery.created_at)
+                                or as_utc(task.completed_at) > as_utc(delivery.created_at)
+                                or any(as_utc(event.created_at) > as_utc(delivery.created_at) for event in events)
+                                or any(as_utc(sub.created_at) > as_utc(delivery.created_at) for sub in submissions)):
+                            raise TaskConflictError("VISUAL_REVIEW_FACTS_POSTDATE_DELIVERY")
+                    for artifact_id in [*asset_ids, voice.id]:
+                        artifact = session.get(Artifact, artifact_id)
+                        path = (root / artifact.relative_path).resolve()
+                        if (as_utc(artifact.created_at) > as_utc(delivery.created_at)
+                                or not path.is_relative_to(root) or not path.is_file()
+                                or path.stat().st_size != artifact.size_bytes or sha256_file(path) != artifact.sha256):
+                            raise TaskConflictError("VISUAL_REVIEW_ARTIFACT_CHANGED_OR_LATE")
+                    envelope = RecoveryFailureEnvelope.model_validate(recovery.input_data.get("failure"))
+                    recovery_plan = RecoveryPlan.model_validate(recovery.result_data)
+                    lineage = recovery.input_data.get("lineage") or {}
+                    policy = recovery.input_data.get("policy") or {}
+                    flow = self.workflow_service(session)
+                    signature = flow._root_cause_signature("BUSINESS_QC", "VISUAL_PLAN_QC_FAILED")
+                    current = effective_settings(session, self.settings)
+                    if (envelope.source_task_id != qc.id or envelope.source_task_type != qc.task_type.value
+                            or envelope.source_attempt != qc.attempt or envelope.failure_class != "BUSINESS_QC"
+                            or envelope.code != "VISUAL_PLAN_QC_FAILED" or envelope.retryable
+                            or envelope.validation_errors != qc.result_data["issues"]
+                            or recovery_plan.failure_class != "BUSINESS_QC" or recovery_plan.action != "reroute_to_role"
+                            or recovery_plan.target_task_type != "content_research"
+                            or lineage.get("parent_task_id") != qc.id or lineage.get("repair_target_task_id") != plan.id
+                            or lineage.get("content_id") != content_id or lineage.get("source_attempt") != qc.attempt
+                            or lineage.get("root_task_id") != qc.input_data.get("lineage", {}).get("root_task_id", qc.id)
+                            or lineage.get("root_cause_signature") != signature
+                            or lineage.get("repair_fingerprint") != flow._repair_fingerprint(qc, failure_class="BUSINESS_QC", code=envelope.code)
+                            or type(lineage.get("round")) is not int or lineage["round"] != 1
+                            or sum(item["root_cause_signature"] == signature for item in flow._recovery_history(content_id)) != 1
+                            or not current.recovery_enabled or policy.get("enabled") is not True
+                            or any(type(limit) is not int or limit <= lineage["round"] for limit in
+                                   (lineage.get("max_rounds"), policy.get("max_rounds"), current.recovery_max_rounds))
+                            or any(task.input_data.get("recovery_task_id") == recovery.id for task in tasks)):
+                        raise TaskConflictError("VISUAL_REVIEW_ORIGINAL_RECOVERY_CHANGED")
+                    blocked = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                        AuditEvent.action.in_(["recovery_blocked", "recovery_escalated"]),
+                    )).all()
+                    origins = session.exec(select(AuditEvent).where(
+                        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == recovery.id,
+                        AuditEvent.action == "recovery_task_created",
+                    )).all()
+                    if (len(blocked) != 1 or blocked[0].actor_type != "system" or blocked[0].actor_id != "recovery-coordinator"
+                            or blocked[0].action != "recovery_escalated"
+                            or blocked[0].metadata_json != {"reason": "角色路由动作与失败分类不匹配", "action": "reroute_to_role"}
+                            or len(origins) != 1 or origins[0].actor_type != "system"
+                            or origins[0].metadata_json != {"source_task_id": qc.id, "failure_class": "BUSINESS_QC",
+                                "code": envelope.code, "root_cause_signature": signature, "round": 1, "target_task_id": plan.id}):
+                        raise TaskConflictError("VISUAL_REVIEW_RECOVERY_RECEIPT_CHANGED")
+                    compensation = {"version": 1, "supersedes_qc_task_id": qc.id,
+                        "previous_qc_input_hash": qc.input_hash, "previous_qc_result_hash": stable_hash(qc.result_data),
+                        "blocked_recovery_task_id": recovery.id, "blocked_recovery_input_hash": recovery.input_hash,
+                        "blocked_recovery_result_hash": stable_hash(recovery.result_data),
+                        "corrected_context_hash": stable_hash(facts)}
+                    inputs = {**deepcopy(qc.input_data), "supersedes_qc_id": qc.id, "visual_review_context_version": 1,
+                        "original_recovery_task_id": recovery.id, "original_recovery_lineage": deepcopy(lineage),
+                        "original_recovery_policy": deepcopy(policy), "lineage": {"root_task_id": lineage["root_task_id"]},
+                        "review_context_compensation": compensation, "visual_review_source_context": facts,
+                        "visual_review_source_context_sha256": stable_hash(facts)}
+                    replacement = flow.create_agent_task(content_id, TaskType.VISUAL_PLAN_QC, inputs, priority=55, allow_multiple=True)
+                    session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                                           entity_id=replacement.id, action=OWNED, metadata_json={"input_hash": replacement.input_hash}))
+                    content.business_status, content.current_stage = ContentStatus.WAITING_AGENT, "visual_plan_qc"
+                    content.error_code, content.error_message = "VISUAL_REVIEW_CONTEXT_RECONCILED", "已补充可核验的历史生成来源，等待新的独立视觉计划质检"
+                    content.updated_at = utc_now()
+                    session.add(content)
+                    response = {"reconciled": True, "replayed": False, "visual_plan_qc_task_id": replacement.id,
+                                "superseded_qc_task_id": qc.id}
+                    session.add(AuditEvent(actor_type="admin", actor_id="mpt-admin-api", entity_type="content", entity_id=content_id,
+                        action=VISUAL_REVIEW_CONTEXT, metadata_json={"key": key, "expected": deepcopy(expected),
+                            "replacement_task_id": replacement.id, "replacement_input_hash": replacement.input_hash,
+                            "compensation": compensation, "evidence_mode": expected["evidence_mode"],
+                            "original_bundle_retained": False, "delivery_body_verified": False,
+                            "historical_deployment_scope": "operator_deployment_evidence",
+                            "historical_source_sha256": source_sha, "historical_delivery_event_id": delivery.id,
+                            "historical_claim_event_id": claim.id, "corrected_context_hash": stable_hash(facts),
+                            "asset_selection_hash": stable_hash(asset_ids), "voice_artifact": deepcopy(voice_data),
+                            "original_recovery_lineage": deepcopy(lineage), "original_recovery_policy": deepcopy(policy),
+                            "response": response}))
                     Session.commit(session)
                     return response
                 finally:

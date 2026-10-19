@@ -14,6 +14,7 @@ from glance_core.content_acceptance import (
     _visual_parent_chain,
     generated_image_material,
     source_context,
+    visual_review_source_context,
     resolved_visual_plan,
     verify_visual_joint_evidence,
 )
@@ -704,10 +705,31 @@ def build_bundle(
                 )
         # A new frozen context stays untouched. Legacy tasks receive explicitly
         # read-only supplementary evidence, never an upgraded subject/snapshot.
+        review_fields = {"visual_review_context_version", "visual_review_source_context",
+                         "visual_review_source_context_sha256"}
+        frozen_review = bool(review_fields.intersection(task.input_data))
+        if task.task_type == TaskType.VISUAL_PLAN_QC and frozen_review and "source_context_version" in task.input_data:
+            raise HTTPException(status_code=409, detail="Pre-review and final source context versions conflict")
         if "source_context_version" not in task.input_data:
-            bundle_input["source_context_read_only"] = source_context(
-                session, task.content_id, refs
-            )
+            if task.task_type == TaskType.VISUAL_PLAN_QC and (frozen_review or (
+                    plan is not None and plan.input_data.get("production_mode") == ProductionMode.IMAGE_ONLY.value
+                    and _owned_visual_chain(session, plan))):
+                try:
+                    context = visual_review_source_context(
+                        session, task.content_id, refs, review_task=task, include_references=True
+                    )
+                    if frozen_review:
+                        frozen = task.input_data.get("visual_review_source_context")
+                        version = task.input_data.get("visual_review_context_version")
+                        if (type(version) is not int or version != 1 or not isinstance(frozen, dict)
+                                or stable_hash(frozen) != task.input_data.get("visual_review_source_context_sha256")
+                                or frozen != context):
+                            raise ValueError("Pre-review frozen source context changed")
+                    bundle_input["source_context_read_only"] = context
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
+            else:
+                bundle_input["source_context_read_only"] = source_context(session, task.content_id, refs)
     live_schema = schema_for(task.task_type, task.schema_version)
     if task.task_type == TaskType.SHORT_SCRIPT:
         duration = live_schema.get("properties", {}).get("estimated_duration_sec", {})

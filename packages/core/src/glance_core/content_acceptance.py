@@ -270,6 +270,40 @@ def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
     return result
 
 
+def _registered_material_source(session: Session, candidate: Candidate) -> dict:
+    """Finite registration facts shared by pre-review and final material checks."""
+    registered = {
+        "candidate_id": candidate.id,
+        "source_id": candidate.source_id,
+        "source_type": candidate.source_type,
+        "source_account": candidate.source_account,
+        "source_url": public_source_url(candidate.source_url),
+        "video_url": public_source_url(candidate.video_url),
+        "video_source_page_url": public_source_url(candidate.video_source_page_url),
+        "rights_status": candidate.rights_status.value,
+        "rights_note": candidate.rights_note,
+    }
+    context = {"version": 1, "registration": registered, "scenes": [], "artifacts": []}
+    source = session.get(Source, candidate.source_id)
+    if source:
+        context["source_registration"] = {
+            "source_id": source.id,
+            "source_type": source.source_type.value,
+            "url": public_source_url(source.url),
+            "default_rights_status": source.default_rights_status.value,
+        }
+    return context
+
+
+def _registered_research_images(research: AgentTask) -> list[dict]:
+    return [
+        {key: (image.get(key, "") if key == "caption" else public_source_url(image.get(key)))
+         for key in ("url", "caption", "source_page")}
+        for image in research.result_data.get("source_images", [])
+        if isinstance(image, dict) and public_source_url(image.get("url"))
+    ]
+
+
 def source_context(
     session: Session, content_id: str, refs: dict, *, include_references: bool = False
 ) -> dict:
@@ -302,26 +336,8 @@ def source_context(
     candidate = session.get(Candidate, content.candidate_id) if content else None
     if candidate is None:
         return {"version": 1, "evidence_gaps": ["candidate: source registration unavailable"]}
-    registered = {
-        "candidate_id": candidate.id,
-        "source_id": candidate.source_id,
-        "source_type": candidate.source_type,
-        "source_account": candidate.source_account,
-        "source_url": public_url(candidate.source_url),
-        "video_url": public_url(candidate.video_url),
-        "video_source_page_url": public_url(candidate.video_source_page_url),
-        "rights_status": candidate.rights_status.value,
-        "rights_note": candidate.rights_note,
-    }
-    context = {"version": 1, "registration": registered, "scenes": [], "artifacts": []}
-    source = session.get(Source, candidate.source_id)
-    if source:
-        context["source_registration"] = {
-            "source_id": source.id,
-            "source_type": source.source_type.value,
-            "url": public_url(source.url),
-            "default_rights_status": source.default_rights_status.value,
-        }
+    context = _registered_material_source(session, candidate)
+    registered = context["registration"]
     script = completed(refs.get("script"), TaskType.SHORT_SCRIPT)
     plan = completed(refs["visual_plan"], TaskType.VISUAL_PLAN) if "visual_plan" in refs else None
     if plan and (
@@ -345,14 +361,7 @@ def source_context(
             research = None
         if research:
             context["research_task_id"] = research.id
-            context["source_images"] = [
-                {
-                    key: (image.get(key, "") if key == "caption" else public_url(image.get(key)))
-                    for key in ("url", "caption", "source_page")
-                }
-                for image in research.result_data.get("source_images", [])
-                if isinstance(image, dict) and public_url(image.get("url"))
-            ]
+            context["source_images"] = _registered_research_images(research)
         scene_refs = upstream.get("scene_analysis", [])
         scene_refs = [scene_refs] if isinstance(scene_refs, str) else scene_refs
         if (
@@ -632,6 +641,170 @@ def generated_image_material(session: Session, content: Content, artifact_id: st
         "request": requests[0]["asset_request"],
         "generation": images[0],
     }
+
+
+def visual_review_source_context(
+    session: Session, content_id: str, refs: dict, *, review_task: AgentTask | None = None,
+    include_references: bool = False,
+) -> dict:
+    """Generation and planned-use facts before PlanQC; never a license or quality decision."""
+    from glance_core.task_service import stable_hash
+
+    content = session.get(Content, content_id)
+    plan = session.get(AgentTask, refs.get("visual_plan")) if isinstance(refs.get("visual_plan"), str) else None
+    current = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+    if (content is None or content.production_mode != ProductionMode.IMAGE_ONLY or plan is None
+            or plan != current or plan.task_type != TaskType.VISUAL_PLAN or plan.status != TaskStatus.COMPLETED
+            or refs.get("script") != plan.input_data.get("upstream_task_ids", {}).get("script")):
+        raise ValueError("pre-review current plan/script lineage unavailable")
+    _visual_parent_chain(session, plan, owned=True)
+    receipts = {}
+
+    def receipt(task, kind):
+        if (task is None or task.content_id != content_id or task.task_type != kind
+                or task.completed_at is None or not completed_image_origin(session, task)):
+            raise ValueError("pre-review accepted material origin unavailable")
+        if task.id not in receipts:
+            _unchanged_material_task(session, task, owned=True)
+            markers = session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
+                AuditEvent.action.in_(["mpt_task_owned", "mpt_agent_consumed"]),
+            )).all()
+            if any(event.actor_type != "system" for event in markers):
+                raise ValueError("pre-review ownership/consumption actor changed")
+            accepted = session.exec(select(AgentSubmission).where(
+                AgentSubmission.task_id == task.id, AgentSubmission.attempt == task.attempt,
+                AgentSubmission.validation_status == "ACCEPTED",
+            )).one()
+            raw = Path(accepted.raw_result_path)
+            try:
+                if stable_hash(json.loads(raw.read_text(encoding="utf-8"))) != accepted.result_hash:
+                    raise ValueError("pre-review accepted raw result changed")
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError("pre-review accepted raw result unavailable") from exc
+            receipts[task.id] = {"accepted": True, "owned": True, "consumed": True, "status": task.status.value,
+                                 "agent_id": accepted.agent_id, "attempt": accepted.attempt,
+                                 "input_sha256": task.input_hash, "result_sha256": accepted.result_hash,
+                                 "raw_file_sha256": _file_sha256(raw)}
+        return deepcopy(receipts[task.id])
+
+    receipt(plan, TaskType.VISUAL_PLAN)
+    script = session.get(AgentTask, refs["script"])
+    receipt(script, TaskType.SHORT_SCRIPT)
+    research = session.get(AgentTask, script.input_data.get("upstream_task_ids", {}).get("research"))
+    receipt(research, TaskType.CONTENT_RESEARCH)
+    script_qc = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SCRIPT_QC,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
+    receipt(script_qc, TaskType.SCRIPT_QC)
+    selected = deepcopy(plan.result_data)
+    if review_task is not None:
+        if (review_task.content_id != content_id or review_task.task_type != TaskType.VISUAL_PLAN_QC
+                or stable_hash(review_task.input_data) != review_task.input_hash
+                or review_task.input_data.get("upstream_task_ids", {}).get("visual_plan") != plan.id
+                or review_task.input_data.get("upstream_task_ids", {}).get("script") != script.id):
+            raise ValueError("pre-review QC selection lineage changed")
+        if "prepared_visual_plan" in review_task.input_data:
+            if review_task.input_data.get("visual_plan_result_sha256") != stable_hash(selected):
+                raise ValueError("pre-review prepared plan binding changed")
+            selected = deepcopy(review_task.input_data["prepared_visual_plan"])
+    if not isinstance(selected, dict) or not isinstance(selected.get("segments"), list):
+        raise ValueError("pre-review selected plan unavailable")
+    candidate = session.get(Candidate, content.candidate_id)
+    if candidate is None:
+        raise ValueError("pre-review candidate source registration unavailable")
+    context = _registered_material_source(session, candidate)
+    context["evidence_gaps"] = []
+    if refs.get("research") is not None and refs["research"] not in (research.id, [research.id]):
+        context["evidence_gaps"].append("research: declared QC/script source references conflict")
+    else:
+        context["research_task_id"] = research.id
+        context["source_images"] = _registered_research_images(research)
+    context.update(scope="visual_plan_pre_review", visual_plan={
+        "task_id": plan.id, "input_sha256": plan.input_hash, "result_sha256": stable_hash(plan.result_data),
+        "script_task_id": script.id, "script_input_sha256": script.input_hash,
+        "script_result_sha256": stable_hash(script.result_data), "selection_sha256": stable_hash(selected),
+    })
+    provenance = {"license_assessed": False, "composition_qc_assessed": False, "segments": []}
+    context["generation_provenance"], context["generation_intents"] = provenance, []
+    if include_references:
+        context["reference_uses"] = []
+    checks = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_QC,
+        AgentTask.status.in_([TaskStatus.COMPLETED, TaskStatus.CANCELLED]),
+        AgentTask.created_at < plan.created_at,
+    ).order_by(AgentTask.created_at, AgentTask.id)).all()
+    root, found = Path(content.content_dir).resolve(), set()
+
+    def image(artifact_id):
+        artifact = session.get(Artifact, artifact_id) if isinstance(artifact_id, str) else None
+        if (artifact is None or artifact.content_id != content_id
+                or artifact.artifact_type not in {"agent_generated_image", "source_image"}
+                or not artifact.mime_type.startswith("image/")):
+            raise ValueError("pre-review image ownership/type unavailable")
+        path = (root / artifact.relative_path).resolve()
+        if (not path.is_relative_to(root) or not path.is_file() or path.stat().st_size != artifact.size_bytes
+                or _file_sha256(path) != artifact.sha256):
+            raise ValueError("pre-review image bytes unavailable/changed")
+        if artifact.id not in found:
+            context["artifacts"].append({"artifact_id": artifact.id, "artifact_type": artifact.artifact_type,
+                                         "registered_sha256": artifact.sha256, "size_bytes": artifact.size_bytes})
+            found.add(artifact.id)
+        return artifact
+
+    for index, segment in enumerate(selected["segments"]):
+        if not isinstance(segment, dict):
+            raise ValueError("pre-review segment unavailable")
+        use = {"visual_plan_task_id": plan.id, "visual_plan_result_sha256": stable_hash(plan.result_data),
+               **{key: segment[key] for key in ("layout", "purpose", "narration_start_sec", "narration_end_sec")
+                  if key in segment}}
+        request = segment.get("asset_request")
+        if request:
+            if not isinstance(request, dict):
+                raise ValueError("pre-review generation intent invalid")
+            reference = request.get("reference_artifact_id")
+            if reference:
+                if reference not in plan.input_data.get("allowed_reference_artifact_ids", []):
+                    raise ValueError("pre-review reference is not declared")
+                image(reference)
+                if include_references:
+                    context.setdefault("reference_uses", []).append({"segment_index": index,
+                        "reference_artifact_id": reference, **use})
+            context["generation_intents"].append({"segment_index": index, "request": deepcopy(request), "use": use})
+            continue
+        asset_id = segment.get("asset_id")
+        if not asset_id or asset_id not in plan.input_data.get("allowed_asset_ids", []):
+            raise ValueError("pre-review selected image is not declared")
+        if review_task is not None and asset_id not in review_task.input_data.get("allowed_asset_ids", []):
+            raise ValueError("pre-review selected image is not declared by QC")
+        artifact = image(asset_id)
+        context.setdefault("asset_uses", []).append({"segment_index": index, "asset_id": asset_id, **use})
+        if artifact.artifact_type != "agent_generated_image":
+            continue
+        material = generated_image_material(session, content, asset_id)
+        generation = session.get(AgentTask, material["generation_task_id"])
+        origin = session.get(AgentTask, material["generation_plan_id"])
+        generation_receipt = receipt(generation, TaskType.ASSET_GENERATE_IMAGE)
+        origin_receipt = receipt(origin, TaskType.VISUAL_PLAN)
+        history = []
+        for qc in checks:
+            entries = [entry for entry in qc.input_data.get("assets", []) if entry.get("artifact_id") == asset_id]
+            if not entries or (qc.result_data or {}).get("passed") is not True:
+                continue
+            proof = receipt(qc, TaskType.ASSET_QC)
+            if (len(entries) != 1 or entries[0].get("request") != material["request"]
+                    or entries[0].get("generation") != material["generation"]):
+                raise ValueError("pre-review prior asset QC material changed")
+            history.append({"task_id": qc.id, "scope": "prior_composition", "passed": True, "receipt": proof})
+        provenance["segments"].append({"segment_index": index, **material, "size_bytes": artifact.size_bytes,
+            "generation_receipt": generation_receipt, "generation_plan_receipt": origin_receipt,
+            "use": use, "prior_asset_qc": history})
+    context["artifacts"].sort(key=lambda entry: entry["artifact_id"])
+    return context
 
 
 def _original_image_lineage(

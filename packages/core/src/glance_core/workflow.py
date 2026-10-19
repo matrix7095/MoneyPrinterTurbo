@@ -3852,7 +3852,9 @@ class WorkflowService:
             "BUSINESS_QC",
             "RIGHTS_OR_PUBLISHING",
         }:
-            from glance_core.content_acceptance import candidate_source_context, source_context
+            from glance_core.content_acceptance import (
+                _owned_visual_chain, candidate_source_context, source_context, visual_review_source_context,
+            )
 
             candidate = self.session.get(Candidate, content.candidate_id)
             if candidate:
@@ -3884,9 +3886,20 @@ class WorkflowService:
                     refs.setdefault(
                         "script", visual.input_data.get("upstream_task_ids", {}).get("script")
                     )
-                context.update(
-                    source_context(self.session, content.id, refs, include_references=True)
-                )
+                pre_review = (valid_visual and content.production_mode == ProductionMode.IMAGE_ONLY
+                              and _owned_visual_chain(self.session, visual))
+                if pre_review:
+                    try:
+                        context.update(visual_review_source_context(
+                            self.session, content.id, refs,
+                            review_task=target_task if target_task.task_type == TaskType.VISUAL_PLAN_QC else None,
+                            include_references=True,
+                        ))
+                    except ValueError as exc:
+                        self._mark_recovery_blocked(recovery_task, reason=str(exc), action=plan.action)
+                        return None
+                else:
+                    context.update(source_context(self.session, content.id, refs, include_references=True))
                 script = (
                     self.session.get(AgentTask, refs["script"])
                     if isinstance(refs.get("script"), str)
@@ -3907,39 +3920,40 @@ class WorkflowService:
                     context["script_task_id"] = script.id
                     context["script_input_sha256"] = script.input_hash
                     context["script_result_sha256"] = stable_hash(script.result_data)
-                    assets = {a["artifact_id"] for a in context["artifacts"]}
-                    context["asset_uses"] = [
-                        {
-                            "segment_index": index,
-                            **{
-                                key: segment[key]
-                                for key in (
-                                    "asset_id",
-                                    "layout",
-                                    "purpose",
-                                    "narration_start_sec",
-                                    "narration_end_sec",
-                                )
-                                if key in segment
-                            },
-                        }
-                        for index, segment in enumerate(visual.result_data.get("segments", []))
-                        if isinstance(segment, dict) and segment.get("asset_id") in assets
-                    ]
-                    for use in context["reference_uses"]:
-                        segment = visual.result_data["segments"][use["segment_index"]]
-                        use.update(
+                    if not pre_review:
+                        assets = {a["artifact_id"] for a in context["artifacts"]}
+                        context["asset_uses"] = [
                             {
-                                key: segment[key]
-                                for key in (
-                                    "layout",
-                                    "purpose",
-                                    "narration_start_sec",
-                                    "narration_end_sec",
-                                )
-                                if key in segment
+                                "segment_index": index,
+                                **{
+                                    key: segment[key]
+                                    for key in (
+                                        "asset_id",
+                                        "layout",
+                                        "purpose",
+                                        "narration_start_sec",
+                                        "narration_end_sec",
+                                    )
+                                    if key in segment
+                                },
                             }
-                        )
+                            for index, segment in enumerate(visual.result_data.get("segments", []))
+                            if isinstance(segment, dict) and segment.get("asset_id") in assets
+                        ]
+                        for use in context["reference_uses"]:
+                            segment = visual.result_data["segments"][use["segment_index"]]
+                            use.update(
+                                {
+                                    key: segment[key]
+                                    for key in (
+                                        "layout",
+                                        "purpose",
+                                        "narration_start_sec",
+                                        "narration_end_sec",
+                                    )
+                                    if key in segment
+                                }
+                            )
                 input_data["source_context_read_only"] = context
                 input_data["candidate"]["source_url"] = context["source_url"]
             input_data["recovery_plan"] = plan.model_dump(mode="json")

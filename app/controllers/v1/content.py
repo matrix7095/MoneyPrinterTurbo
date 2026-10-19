@@ -1,6 +1,6 @@
 """Authenticated content actions; original pipeline owns each stage and its gates."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -50,6 +50,32 @@ class VisualRepairContextRequest(BaseModel):
     recovery: VisualRepairResultBinding
     plan: VisualRepairResultBinding
     qc: VisualRepairInputBinding
+
+
+class VisualReviewAcceptedBinding(VisualRepairResultBinding):
+    attempt: int = Field(ge=1, strict=True)
+    raw_file_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class VisualReviewDeploymentEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    relative_path: str = Field(min_length=1, max_length=500)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class VisualReviewContextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1]
+    evidence_mode: Literal["accepted_failure_plus_deployed_derivation_v1"]
+    run: ExpectedHostBinding
+    plan: VisualReviewAcceptedBinding
+    qc: VisualReviewAcceptedBinding
+    recovery: VisualReviewAcceptedBinding
+    corrected_context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    historical_deployment: VisualReviewDeploymentEvidence
 
 
 @router.post("/content-runs/{run_id}/host/attach")
@@ -355,6 +381,20 @@ def reconcile_visual_repair_context(*, content_id: str, payload: VisualRepairCon
         content_root(content, runtime)
     try:
         return runtime.reconcile_visual_repair_context(content_id, payload.model_dump())
+    except (ValueError, OSError, KeyError, TypeError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/reconcile-visual-plan-review-context")
+def reconcile_visual_plan_review_context(*, content_id: str, payload: VisualReviewContextRequest, request: Request):
+    runtime = get_runtime(request)
+    with Session(runtime.engine) as session:
+        content = session.get(Content, content_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Content not found")
+        content_root(content, runtime)
+    try:
+        return runtime.reconcile_visual_plan_review_context(content_id, payload.model_dump())
     except (ValueError, OSError, KeyError, TypeError, TaskConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
