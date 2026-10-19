@@ -119,16 +119,6 @@ def pending(contract, monkeypatch):
         qc = flow.create_agent_task(
             cid, TaskType.CONTENT_QC, data, allow_multiple=True, schema_version="3"
         )
-        session.add(
-            AuditEvent(
-                actor_type="system",
-                actor_id="mpt-business",
-                entity_type="agent_task",
-                entity_id=qc.id,
-                action="mpt_task_owned",
-                metadata_json={"input_hash": qc.input_hash},
-            )
-        )
         content.business_status, content.current_stage = (
             ContentStatus.WAITING_AGENT,
             "content_qc",
@@ -237,11 +227,13 @@ def post(pending, expected=None):
     )
 
 
-def test_exact_cancellation_preserves_all_history_and_replays_after_later_render(
+def test_undispatched_pipeline_qc_preserves_all_history_and_replays_after_later_render(
     pending,
 ):
     runtime, _, cid, expected = pending
     before, files = snapshot(runtime)
+    assert [row["action"] for row in before["AuditEvent"].values()
+            if row["entity_type"] == "agent_task" and row["entity_id"] == expected["qc"]["task_id"]] == ["created"]
     response = post(pending)
     assert response.status_code == 200, response.text
     after, current_files = snapshot(runtime)
@@ -297,6 +289,38 @@ def test_concurrent_requests_have_one_atomic_cancellation(pending):
             )
             == 1
         )
+
+
+@pytest.mark.parametrize("boundary", ["valid-owned", "bad-owned", "task-quarantine", "rewritten-receipt"])
+def test_undispatched_qc_issuance_and_optional_ownership_boundaries(pending, boundary):
+    runtime, _, cid, expected = pending
+    with Session(runtime.engine) as session:
+        task = session.get(AgentTask, expected["qc"]["task_id"])
+        if boundary in {"valid-owned", "bad-owned"}:
+            session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task",
+                entity_id=task.id, action="mpt_task_owned",
+                metadata_json={"input_hash": task.input_hash if boundary == "valid-owned" else "f" * 64}))
+        elif boundary == "task-quarantine":
+            session.add(AuditEvent(actor_type="system", actor_id="migration", entity_type="agent_task",
+                entity_id=task.id, action="mpt_migration_quarantined_task"))
+        else:
+            artifact = session.get(Artifact, task.input_data["acceptance_receipt_artifact_id"])
+            raw = b"{}"
+            (Path(session.get(Content, cid).content_dir) / artifact.relative_path).write_bytes(raw)
+            artifact.sha256, artifact.size_bytes = sha(raw), len(raw)
+            session.add(artifact)
+        session.commit()
+    before = snapshot(runtime)
+    response = post(pending)
+    assert response.status_code == (200 if boundary == "valid-owned" else 409), response.text
+    if boundary != "valid-owned":
+        assert snapshot(runtime) == before
+        if boundary == "bad-owned":
+            assert response.json()["detail"] == "RECOVERY_SOURCE_CHANGED_OR_UNOWNED"
+        elif boundary == "task-quarantine":
+            assert response.json()["detail"].startswith("MPT_MIGRATION_QUARANTINED")
+        else:
+            assert response.json()["detail"] == "RERENDER_ACCEPTANCE_RECEIPT_CHANGED"
 
 
 @pytest.mark.parametrize("expired", [True, False])

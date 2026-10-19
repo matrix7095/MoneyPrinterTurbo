@@ -110,11 +110,13 @@ def request_rerender(runtime, session, content_id, expected):
                 "assigned_agent_id", "lease_token_hash", "lease_expires_at", "attempt_started_at",
                 "last_heartbeat_at", "started_at", "completed_at", "error_code", "error_message", "not_before"))):
         raise TaskConflictError("RERENDER_QC_NOT_PRISTINE_CURRENT_PENDING")
-    _require_owned_input(session, task)
+    assert_allowed(session, task_id=task.id)
     _require_current_revision(session, task)
     history = session.exec(select(AuditEvent).where(
         AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == task.id,
     )).all()
+    if any(row.action == "mpt_task_owned" for row in history):
+        _require_owned_input(session, task)
     created = [row for row in history if row.action == "created"]
     if (len(created) != 1 or created[0].actor_type != "system" or created[0].actor_id != "task-service"
             or created[0].metadata_json != {}):
