@@ -380,6 +380,29 @@ async def register_image_preparation(*, content_id: str, prepared_artifact_id: s
         raise HTTPException(status_code=409, detail="Image preparation evidence verification failed") from exc
 
 
+@router.post("/contents/{content_id}/image-use-evidence/{prepared_artifact_id}")
+async def register_image_use_evidence(*, content_id: str, prepared_artifact_id: str, request: Request):
+    from starlette.concurrency import run_in_threadpool
+    from app.business.image_use_evidence import MAX_BODY, register_image_use
+
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        raise HTTPException(status_code=415, detail="Image-use registration requires application/json")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_BODY:
+            raise HTTPException(status_code=413, detail="Image-use registration exceeds 4 KiB")
+        body.extend(chunk)
+    runtime = get_runtime(request)
+
+    def register(engine, settings, target_id):
+        return register_image_use(engine, settings, target_id, prepared_artifact_id, bytes(body))
+
+    try:
+        return await run_in_threadpool(runtime.run_content_stage, content_id, register)
+    except (ValueError, KeyError, OSError, TypeError, AttributeError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail="Image-use evidence verification failed") from exc
+
+
 class RebuildCoverRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

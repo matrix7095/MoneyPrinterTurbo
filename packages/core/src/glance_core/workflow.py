@@ -1057,6 +1057,60 @@ class WorkflowService:
             "missing_artifact_ids": missing_preparations, "records": preparation_records,
             "limitation": "Registered originals and processing replay do not establish vendor-native generation provenance or a license; historical workspace input bytes remain unverified.",
         }
+        # Additive registrations affect only freshly issued review inputs, never old task receipts.
+        use_records = []
+        registered_use_ids = set()
+        preparations = {row["prepared_artifact_id"]: row for row in preparation_records}
+        for prepared_id in sorted(expected_preparations):
+            registrations = self.session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "artifact", AuditEvent.entity_id == prepared_id,
+                AuditEvent.action == "image_use_evidence_registered",
+            )).all()
+            if not registrations:
+                continue
+            if (len(registrations) != 1 or registrations[0].actor_type != "admin"
+                    or registrations[0].actor_id != "mpt-admin-api" or prepared_id not in preparations):
+                raise ValueError("Image-use registration or current preparation binding changed")
+            metadata = registrations[0].metadata_json
+            prepared = self.session.get(Artifact, prepared_id)
+            files = {}
+            for key, kind in (("receipt", "image_use_receipt"), ("validator_report", "image_use_validator_report"),
+                              ("terms_document", "image_use_terms_document")):
+                asset = self.session.get(Artifact, metadata.get(f"{key}_artifact_id", ""))
+                if (asset is None or asset.content_id != content.id or asset.artifact_type != kind
+                        or asset.producer_stage != prepared.producer_stage):
+                    raise ValueError("Registered image-use evidence artifact association changed")
+                files[key] = artifact_record(asset, f"image_use_{key}")
+                if not files[key]["bytes_verified"]:
+                    raise ValueError("Registered image-use evidence bytes changed")
+            receipt_asset = self.session.get(Artifact, files["receipt"]["artifact_id"])
+            record, _ = json_record(root / receipt_asset.relative_path, "image_use_receipt")
+            preparation = preparations[prepared_id]
+            if (record.get("version") != 1 or record.get("prepared_artifact_id") != prepared_id
+                    or record.get("prepared_sha256") != prepared.sha256
+                    or record.get("original_artifact_id") != preparation["original"]["artifact_id"]
+                    or record.get("original_sha256") != preparation["original"]["sha256"]
+                    or record.get("preparation_receipt_artifact_id") != preparation["receipt"]["artifact_id"]
+                    or record.get("preparation_receipt_sha256") != preparation["receipt"]["sha256"]
+                    or record.get("task_id") != prepared.producer_stage
+                    or record.get("task_input_sha256") != preparation["processing"]["input_sha256"]
+                    or record.get("task_result_sha256") != preparation["processing"]["result_sha256"]
+                    or record.get("validator_report_sha256") != files["validator_report"]["sha256"]
+                    or record.get("terms_document_sha256") != files["terms_document"]["sha256"]
+                    or metadata.get("record_sha256") != files["receipt"]["sha256"]
+                    or metadata.get("prepared_sha256") != prepared.sha256
+                    or metadata.get("original_sha256") != record.get("original_sha256")
+                    or record.get("license_verified") is not False):
+                raise ValueError("Registered image-use receipt identities or limitations changed")
+            use_records.append({"prepared_artifact_id": prepared_id, **files, "data": record})
+            registered_use_ids.add(prepared_id)
+        if registered_use_ids:
+            evidence["image_use_evidence"] = {
+                "version": 1, "complete": registered_use_ids == expected_preparations,
+                "expected_artifact_ids": sorted(expected_preparations),
+                "missing_artifact_ids": sorted(expected_preparations - registered_use_ids), "records": use_records,
+                "limitation": "Supporting native tool/provenance observations and official output-use terms sources are separate from a verified account contract, prompt provenance, third-party rights clearance, and publication approval.",
+            }
         evidence["plan_qc"] = task_record(self.completed_task_for(content.id, TaskType.VISUAL_PLAN_QC), "plan_qc")
         image_qcs = self.session.exec(select(AgentTask).where(
             AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
