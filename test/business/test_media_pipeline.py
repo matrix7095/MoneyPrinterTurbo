@@ -296,6 +296,15 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
         pytest.fail("MPT adapter must use the actual MPT renderer")
 
     monkeypatch.setattr(MediaExecutor, "render", forbidden_legacy_render)
+    import app.business.media_executor as adapter
+    commands = []
+    original_command = adapter.run_command
+
+    def recording_command(command, *args, **kwargs):
+        commands.append(command)
+        return original_command(command, *args, **kwargs)
+
+    monkeypatch.setattr(adapter, "run_command", recording_command)
     final, preview = executor.render(video_path=root / "unused.mp4", voice_path=voice,
                                      narration="产品测试。", plan_data={"segments": segments}, scenes=[],
                                      assets=images, generated_image_ids=set(images),
@@ -311,6 +320,11 @@ def test_real_mpt_render_preserves_approved_images_audio_and_revision(tmp_path, 
     assert len(project.revision()["scenes"]) == 2
     receipt = json.loads((root / "render" / "mpt-render-request.json").read_text(encoding="utf-8"))
     assert len(receipt["prepared_sha256"]) == 2
+    assert receipt["request"]["settings"]["video_crf"] == 18
+    assert project.revision()["settings"]["video_crf"] == 18
+    preparations = [command for command in commands if "libx264" in command and "-frames:v" in command]
+    assert len(preparations) == 2
+    assert all(command[command.index("-crf") + 1] == "18" for command in preparations)
     assert "AI概念示意" in (root / "transcript" / "narration.ass").read_text(encoding="utf-8-sig")
 
     # Decode the actual outputs, rather than accepting only container metadata.

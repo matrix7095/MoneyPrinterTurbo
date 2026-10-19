@@ -322,6 +322,10 @@ def test_interrupted_status_requires_retry(native):
         {"fps": True},
         {"bgm_volume": float("nan")},
         {"height": -2},
+        {"video_crf": True},
+        {"video_crf": -1},
+        {"video_crf": 52},
+        {"video_crf": 18.0},
     ],
 )
 def test_settings_validation(settings):
@@ -452,6 +456,35 @@ def test_order_and_render_settings_invalidation(native):
         before["revision_id"], project.metadata()["current_revision"]
     )
     assert all(row["change"] == "unchanged" for row in changed)
+
+
+def test_video_crf_invalidates_only_video_and_reaches_encoder(native, monkeypatch):
+    project, request, _, root = native
+    assert RenderSettings.parse({}).video_crf == 23
+    commands = []
+    original = project._run
+
+    def recording_run(command, *args, **kwargs):
+        commands.append(command)
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(project, "_run", recording_run)
+    project.render()
+    encoded = [command for command in commands if "libx264" in command]
+    assert len(encoded) == 2
+    assert all(command[command.index("-crf") + 1] == "23" for command in encoded)
+    commands.clear()
+    quality = copy.deepcopy(request)
+    quality["settings"]["video_crf"] = 18
+    revision = project.create_revision(quality, relative_to=root)
+    assert revision["settings"]["video_crf"] == 18
+    assert _builds(project) == {"opening:scene", "closing:scene", "assembly", "export"}
+    project.render()
+    encoded = [command for command in commands if "libx264" in command]
+    assert len(encoded) == 2
+    assert all(command[command.index("-crf") + 1] == "18" for command in encoded)
+    project.create_revision(request, relative_to=root)
+    assert not _builds(project)
 
 
 def test_no_cross_project_artifact_reuse(native):

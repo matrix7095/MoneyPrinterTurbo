@@ -119,6 +119,7 @@ class RenderSettings:
     fps: int = 30
     narration_volume: float = 1.0
     bgm_volume: float = 0.15
+    video_crf: int = 23
 
     @classmethod
     def parse(cls, value: dict) -> RenderSettings:
@@ -133,6 +134,8 @@ class RenderSettings:
                 raise ProjectError(f"{name} must be an integer from 1 to {limit}")
         if result.width % 2 or result.height % 2:
             raise ProjectError("H.264 dimensions must be even")
+        if type(result.video_crf) is not int or not 0 <= result.video_crf <= 51:
+            raise ProjectError("video_crf must be an integer from 0 to 51")
         for name in ("narration_volume", "bgm_volume"):
             number = getattr(result, name)
             if (
@@ -205,6 +208,7 @@ def stage_graph(spec: dict) -> list[Stage]:
                 settings.width,
                 settings.height,
                 settings.fps,
+                settings.video_crf,
             ]
         )
         stages.extend(
@@ -768,6 +772,8 @@ class VideoProject:
                         "libx264",
                         "-preset",
                         "veryfast",
+                        "-crf",
+                        str(settings.video_crf),
                         "-pix_fmt",
                         "yuv420p",
                         "-movflags",

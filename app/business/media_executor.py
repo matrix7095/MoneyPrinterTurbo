@@ -171,6 +171,7 @@ class MptMediaExecutor(MediaExecutor):
             run_command(
                 ["ffmpeg", "-y", "-threads", "1", "-filter_threads", "1", *source_arguments,
                  "-frames:v", str(frame_count), "-an", "-vf", filters, *_encoder_args(encoder),
+                 *(["-crf", "18"] if segment.layout == "image_card" and encoder == "libx264" else []),
                  "-pix_fmt", "yuv420p", str(footage)],
                 cwd=self.root,
             )
@@ -185,6 +186,8 @@ class MptMediaExecutor(MediaExecutor):
 
         project = VideoProject(self.root / "render" / "mpt-project")
         request = {"project_id": self.root.name, "scenes": project_scenes}
+        if all(segment.layout == "image_card" for segment in plan.segments):
+            request["settings"] = {"video_crf": 18}
         if bgm_path is not None and not Path(bgm_path).is_file():
             raise NonRetryableMediaError("Requested BGM file is missing")
         request_receipt = {

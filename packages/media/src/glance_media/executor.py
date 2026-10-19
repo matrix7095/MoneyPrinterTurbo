@@ -713,44 +713,41 @@ def layout_filter(
             "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
         )
     if layout == "image_card":
-        # 图文模式不能把单张图当作静态背景整段循环。这里先裁成竖屏，再用
-        # zoompan 生成可见的缩放/平移；字幕仍在后续的 ASS 阶段统一烧录。
+        # 在 30fps 时间轴上计算浮点角点，避免整数裁剪造成慢速推拉跳动。
         safe_x = max(0.0, min(1.0, focus_x))
         safe_y = max(0.0, min(1.0, focus_y))
-        if motion == "ken_burns_out":
-            zoom = "max(1,1.14-on*0.0005)"
-            x_expr = f"(iw-iw/zoom)*{safe_x:.3f}"
-            y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
-        elif motion == "pan_left":
-            zoom = "1.10"
-            x_expr = "min(iw-iw/zoom,(iw-iw/zoom)*on/240)"
-            y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
-        elif motion == "pan_right":
-            zoom = "1.10"
-            x_expr = "max(0,(iw-iw/zoom)*(1-on/240))"
-            y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
-        elif motion == "focus_product":
-            zoom = "min(1.18,1+on*0.00075)"
-            x_expr = f"(iw-iw/zoom)*{safe_x:.3f}"
-            y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
-        elif motion == "hold":
-            zoom = "1"
-            x_expr = "(iw-iw/zoom)*0.5"
-            y_expr = "(ih-ih/zoom)*0.5"
-        else:
-            zoom = "min(1.14,1+on*0.0005)"
-            x_expr = f"(iw-iw/zoom)*{safe_x:.3f}"
-            y_expr = f"(ih-ih/zoom)*{safe_y:.3f}"
-        # zoompan 的整数裁剪会让慢速运动跳动；4:4:4 放大可减小取整步长。
-        return (
+        base = (
             "scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,"
-            + (
-                "scale=4320:7680:flags=lanczos,format=yuv444p,"
-                if motion != "hold"
-                else ""
-            )
-            + f"zoompan=z='{zoom}':x='{x_expr}':y='{y_expr}':d=1:s=1080x1920:fps=30"
+            "crop=1080:1920,fps=30,format=yuv444p"
+        )
+        if motion == "hold":
+            return base
+        if motion == "ken_burns_out":
+            zoom = "max(1,1.14-(on-1)*0.0005)"
+        elif motion in {"pan_left", "pan_right"}:
+            zoom = "1.10"
+        elif motion == "focus_product":
+            zoom = "min(1.18,1+(on-1)*0.00075)"
+        else:
+            zoom = "min(1.14,1+(on-1)*0.0005)"
+        if motion == "pan_left":
+            x_focus = "min(1,(on-1)/240)"
+        elif motion == "pan_right":
+            x_focus = "max(0,1-(on-1)/240)"
+        else:
+            x_focus = f"{safe_x:.3f}"
+        left = f"-({x_focus})*(({zoom})-1)*W"
+        right = f"W+(1-({x_focus}))*(({zoom})-1)*W"
+        top = f"-{safe_y:.3f}*(({zoom})-1)*H"
+        bottom = f"H+(1-{safe_y:.3f})*(({zoom})-1)*H"
+        corners = {
+            "x0": left, "y0": top, "x1": right, "y1": top,
+            "x2": left, "y2": bottom, "x3": right, "y3": bottom,
+        }
+        return (
+            base + ",perspective="
+            + ":".join(f"{key}='{value}'" for key, value in corners.items())
+            + ":sense=destination:eval=frame:interpolation=cubic"
         )
     if layout == "blur_background":
         return (
