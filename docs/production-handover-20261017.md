@@ -1,7 +1,9 @@
 # MoneyPrinterTurbo 生产交接
 
-更新：2026-10-20 02:24（Asia/Shanghai）。代码 285b76ffc36f110635daba2181306a971ae8063c 已双远端推送并部署到 Main。
-**新视频已真实发布。** 抖音作品 `7698443917590629670`，后台已显示“已发布”，公开页面已核对当前完整文案与 AI 声明；服务端发布任务完成并消费。
+更新：2026-10-21 17:52（Asia/Shanghai）。源码`8f68051970db593882ceb1271a25b411fb61167f`已提交、双分支推送并隐藏部署到Main，纯图片项目改用真实60fps、2倍空间采样、低量化误差及整片统一码率预算。新完整候选已生成，156项技术核验通过；真实图片仍有可测误差和压缩取舍，不能称为观感彻底解决或正式QC通过。当前公开作品仍是下述10月20日的30fps版本。新证据与限制见[图片运动采样复核](video-motion-sampling-20261021.md)。
+
+10月20日发布快照：02:24（Asia/Shanghai），当时的代码285b76ffc36f110635daba2181306a971ae8063c已双分支推送并部署。
+**10月20日的30fps版本已真实发布。** 抖音作品 `7698443917590629670`，后台已显示“已发布”，公开页面已核对完整文案与AI声明；服务端发布任务完成并消费。这不是10月21日候选的新发布回执。
 
 [打开本次公开作品](https://www.douyin.com/video/7698443917590629670)。本次修正版为1080×1920、30fps、32.27秒，使用Kokoro离线配音。按需生产链路已跑通；后续仍逐条通过质量、来源、登录与实际发布门禁，不承诺无人值守永不阻断。
 
@@ -9,8 +11,8 @@
 
 | 项目 | 已核实结果 |
 |---|---|
-| 服务 | API 8000，worker 21784 / launcher 13304；工作台 http://127.0.0.1:8510/ 返回 200 |
-| 切换保全 | 最新切换保全3135个任务、108份媒体及46份上下文；独立核验仅维护时间与恢复扫描游标两项正常运维变化，其余七表和runtime配置完整保全 |
+| 服务 | API 8000，worker 15108 / launcher 20044，均归属Main；工作台 http://127.0.0.1:8510/ 返回200，认证API200、匿名401 |
+| 切换保全 | 10月21日切换窗口的前后八表逐行哈希完全一致，含3137个任务；当前内容118份已登记媒体逐份核验相同。随后维护线程正常更新两项运维时间/游标，不能宣称运行中数据库永远不变 |
 | 工作流 | 原生 Agent 按需处理；不接 Gemini；业务周期任务暂停；隐藏 Watchdog 仅做基础服务恢复 |
 | 当前内容 | Framery One Work，共享专注工作舱；原创 AI 概念示意并标明“非实拍”，不冒充实物演示 |
 | 事实来源 | 以[官方公告](https://framery.com/en/framery-launches-one-work/)及已封存研究为准；概念画面不证明实物或实际性能 |
@@ -18,7 +20,8 @@
 | 脚本与素材 | S5 批准稿、脚本 QC、计划审核及七图素材 QC 已通过；历史八份登记保留，新封面另登记一份；当前发布使用七图加新封面的八份凭据 |
 | 配音 | asset_bb29a0b0469e43cea125ada6dd26f1aa；Kokoro 中文女声 3、原速，32.255667 秒；SHA 5a4954cca1474f69d3b5ac9f3b45254eb163aae0067b2ae836163b75531f09be |
 | 配音配置 | CPU 双线程、+0% 速率 / 音量、远端 endpoint 为空；本机 medium / cpu / int8 ASR 保留 |
-| 当前成片 | asset_6cdefc32359c44f4b04da3b0020d4da6；SHA 3f137051b87a616cfa1c2e533a05916ffcf723feabd3f3f26498630239f1900d；1080×1920、30fps、968帧、32.266667秒、16,499,736字节；独立技术预检通过 |
+| 当前公开成片 | asset_6cdefc32359c44f4b04da3b0020d4da6；SHA 3f137051b87a616cfa1c2e533a05916ffcf723feabd3f3f26498630239f1900d；1080×1920、30fps、968帧、32.266667秒、16,499,736字节；历史独立技术预检通过 |
+| 新隔离候选 | SHA1168d274e8d351977d21e5772234e6979367a92c6b28f39f60fdba96835f351b；1080×1920、60fps、1936帧、32.266667秒、83,447,180字节。尚无新正式QC/平台发布；不覆盖旧成片 |
 | 正式审核 | 第38代 run_73440fa6f48c7a63ba9744bf1c6b4bd8；任务 agt_f824c55a5f93494fbe0f27b47f8caaa4 完成242页审核，九项全部通过、high、issues=[]，结果已接受并消费；Native 正常退出 |
 | 当前封面 | asset_004f4cfe9a0844e69ee23fb2735886d2；SHA 417d52c2e3a33ccf7bd1c23afb5c066f23fa2d8f393a5eac2cc505a6d6da066d；标题“专注空间／怎么借”，标注“AI概念示意·非实拍”；原图、处理与构图凭据已绑定登记 |
 | 首个 S5 成片 | asset_b92bfaaf6b6c4d7e8b5daba6f5dc392c；SHA 5be3ff9ccfef454954bc028bf19cd7e18a8a2e6004bb86ab987f1c4502155863；32.266667 秒、968 帧，运动技术检查 FAIL，保留为失败证据 |
@@ -26,6 +29,8 @@
 | 发布 | 新文案及八图补证完成；第41代已认可图片使用依据，但因manual误继承Handsfree和平台检查相位冲突为BLOCKED。285b76f修复后第42代为READY/medium、3条info且无blocker，置信度未改；按用户显式授权的operator路径发布成功，真实ID 7698443917590629670；后台已发布、公开页面已核验 |
 
 ## 真实发布与归档
+
+以下记录对应10月20日公开版本。现有业务流程拒绝PUBLISHED内容直接重渲染或重复排队发布；10月21日隔离候选没有绕过该限制，也没有继承旧审核。
 
 发布任务 `agt_0eaa0a4d7b0a454582b0093677a836ba` 正常签发和领取一次，attempt=1。实际Chrome账号为“歪果玩意儿”（抖音号43674775675），下发成片和封面SHA与当前版本一致。保存后分别检查竖版3:4及横版4:3的真实预览，标题、主体和“AI概念示意·非实拍”完整；页面的AI自主声明已保存。
 
@@ -89,6 +94,9 @@ Kokoro 冻结包仅增加 sherpa-onnx==1.13.8 与 sherpa-onnx-core==1.13.8；部
 
 | 证据 | 文件 |
 |---|---|
+| 10月21日运动与码率源码独审 | [14文件冻结、五种运动及独立门禁](../storage/smoke/stable-production-20261013/motion-global-vbv-source-independent-20261021.json) |
+| 10月21日真实候选与取舍 | [完整候选156项技术检查](../storage/smoke/stable-production-20261013/motion-production-global-vbv-independent-20261021.json)、[真实图片对照及保留回退](../storage/smoke/stable-production-20261013/motion-real-image-global-vbv-comparison-independent-20261021.json) |
+| 10月21日实际源码部署 | [隐藏切换回执](../storage/smoke/stable-production-20261013/motion-sampling-service-cutover-v5-20261021.json)、[切换后八表与媒体保全](../storage/smoke/stable-production-20261013/motion-sampling-cutover-after-v5-global-release-20261021.json)、[独立30项部署验收](../storage/smoke/stable-production-20261013/motion-sampling-deployment-independent-20261021.json) |
 | S5 批准脚本与正式配音 | [批准及配音记录](../storage/smoke/stable-production-20261013/framery-script5-approval-and-voice-20261019.json) |
 | 原图及处理凭据登记 | [八份登记](../storage/smoke/stable-production-20261013/framery-image-preparation-registration-20261019.json) |
 | 新封面原图及处理凭据 | [HTTP 200 登记及旧状态保全](../storage/smoke/stable-production-20261013/framery-script5-new-cover-preparation-registration-20261020.json) |
