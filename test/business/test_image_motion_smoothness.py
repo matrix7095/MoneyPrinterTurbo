@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -10,6 +11,63 @@ from PIL import Image
 
 from glance_media.executor import layout_filter
 from app.business.media_executor import MptMediaExecutor
+
+
+@pytest.mark.parametrize(("motion", "digest"), [
+    ("hold", "a2fe4f85fc27ecc414f929d6232c5f000848ee54f151490f03e5d5a08c91fddb"),
+    ("ken_burns_in", "c1b5c4457715b04b8b1cc822feec15dd87415f1985edd626351a9dd113f7b0e1"),
+    ("ken_burns_out", "bb06a21a439ca6deeb2d6a57633225306977c9d7638ded5d857b641a8063a480"),
+    ("pan_left", "25f04c5a2c0a8655a621461165036b7b0fe03b0463dd030a7f64d48e06a3bb68"),
+    ("pan_right", "f3f0f15ff8b7e622bc633bb1fbea31bdaac4b15b8f6cb0d0e83b3ca3d59c7a22"),
+    ("focus_product", "556f6db0a85e2c8d294b47ae9e7a5ef3533fd408bb4e4b4b335528f5effb61fb"),
+])
+def test_default_image_filter_is_byte_compatible(motion, digest):
+    # Frozen from 61d7fb5, before adding native temporal/spatial sampling.
+    assert hashlib.sha256(layout_filter("image_card", motion=motion).encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("fps", [True, 0, 25, 120, 30.0, "60"])
+def test_layout_rejects_unsupported_sampling_fps(fps):
+    with pytest.raises(ValueError, match="fps"):
+        layout_filter("image_card", fps=fps)
+
+
+@pytest.mark.parametrize("sampling", [True, 0, 3, 2.0, "2"])
+def test_layout_rejects_unsupported_spatial_sampling(sampling):
+    with pytest.raises(ValueError, match="spatial_sampling"):
+        layout_filter("image_card", spatial_sampling=sampling)
+
+
+def test_spatial_sampling_surrounds_only_the_dynamic_transform():
+    assert layout_filter("image_card", motion="hold", fps=60, spatial_sampling=2) == layout_filter(
+        "image_card", motion="hold", fps=60)
+    filters = layout_filter("image_card", motion="pan_right", fps=60, spatial_sampling=2)
+    assert filters.index("fps=60") < filters.index("scale=2160:3840") < filters.index("perspective=")
+    assert filters.endswith("scale=1080:1920:flags=lanczos")
+
+
+@pytest.mark.parametrize("motion", ["ken_burns_in", "ken_burns_out", "focus_product", "pan_left", "pan_right"])
+def test_native_sixty_fps_has_new_half_steps_at_the_same_camera_speed(tmp_path, motion):
+    source = tmp_path / "bars.png"
+    image = Image.new("RGB", (1080, 1920), "white")
+    image.paste("black", (200, 0, 400, 1920))
+    image.paste("black", (0, 300, 1080, 500))
+    image.save(source)
+    rows = {}
+    for fps in (30, 60):
+        rows[fps] = _ffmpeg(
+            "-threads", "1", "-filter_complex_threads", "1", "-loop", "1", "-i", str(source),
+            "-filter_complex", _strip_graph(layout_filter("image_card", motion=motion, fps=fps, focus_y=.48)),
+            "-map", "[out]", "-frames:v", str(fps + 1), "-threads", "1",
+            "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1")
+    baseline, native = _centers(rows[30], 31), _centers(rows[60], 61)
+    for old, new in zip(baseline, native):
+        assert np.allclose(old, new[::2], atol=.001)  # Same real-time endpoints, including t=1s.
+        old_step = np.polyfit(np.arange(31), old, 1)[0]
+        new_step = np.polyfit(np.arange(61), new, 1)[0]
+        assert abs(new_step - old_step / 2) < .001
+    decoded = np.frombuffer(rows[60], dtype=np.uint8).reshape(61, 6000)
+    assert all(not np.array_equal(decoded[index], decoded[index - 1]) for index in range(1, 61, 2))
 
 
 def test_image_card_hold_does_not_upsample():
@@ -168,7 +226,7 @@ def _camera_geometry(points, motion, frame_index):
     return points * scale + shift
 
 
-def _encoded_geometric_steps(video, motion):
+def _encoded_geometric_steps(video, motion, fps=60):
     """Track the same source corners; aggregate only within fixed quadrants."""
     probe = shutil.which("ffprobe")
     assert probe
@@ -192,11 +250,11 @@ def _encoded_geometric_steps(video, motion):
     assert metadata["streams"][0] == {
         "width": 1080,
         "height": 1920,
-        "r_frame_rate": "30/1",
+        "r_frame_rate": f"{fps}/1",
     }
     assert np.allclose(
         [float(frame["best_effort_timestamp_time"]) for frame in metadata["frames"]],
-        np.arange(180) / 30,
+        np.arange(6 * fps) / fps,
         atol=0.000001,
     )
     _ffmpeg("-xerror", "-i", str(video), "-map", "0:v:0", "-an", "-f", "null", "-")
@@ -216,7 +274,7 @@ def _encoded_geometric_steps(video, motion):
     quadrants = (source[:, 0] > 540).astype(int) + 2 * (source[:, 1] > 921.6)
     measured_steps, ideal_steps = [[] for _ in range(4)], [[] for _ in range(4)]
     feature_error, counts = [], []
-    for index in range(1, 180):
+    for index in range(1, 6 * fps):
         ok, frame = capture.read()
         assert ok
         current = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[400:1350, 100:980]
@@ -227,8 +285,8 @@ def _encoded_geometric_steps(video, motion):
         good = status.ravel().astype(bool) & np.isfinite(next_points).all(axis=(1, 2))
         actual = next_points[good].reshape(-1, 2) - tracked[good].reshape(-1, 2)
         source, quadrants = source[good], quadrants[good]
-        ideal = _camera_geometry(source, motion, index) - _camera_geometry(
-            source, motion, index - 1
+        ideal = _camera_geometry(source, motion, index * 30 / fps) - _camera_geometry(
+            source, motion, (index - 1) * 30 / fps
         )
         feature_error.extend(np.linalg.norm(actual - ideal, axis=1).tolist())
         counts.append(len(source))
@@ -243,7 +301,8 @@ def _encoded_geometric_steps(video, motion):
     assert not ok
     capture.release()
     actual, ideal = np.array(measured_steps), np.array(ideal_steps)
-    eligible = np.abs(ideal) >= 0.05
+    # Preserve the original minimum camera speed when the per-frame step is halved.
+    eligible = np.abs(ideal) >= 0.05 * 30 / fps
     ratios = actual[eligible] / ideal[eligible]
     all_ratios = np.divide(
         actual, ideal, out=np.full_like(actual, np.nan), where=eligible

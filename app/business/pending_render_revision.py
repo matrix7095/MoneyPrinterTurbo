@@ -53,7 +53,10 @@ def _material(session, content, expected):
     directory = path.parent
     outputs = directory / "outputs.json"
     frozen = json.loads(outputs.read_bytes())
-    if (set(frozen) != {"final.mp4", "preview.mp4"} or frozen["final.mp4"] != artifact.sha256
+    if (not isinstance(frozen, dict)
+            or set(frozen) not in ({"final.mp4", "preview.mp4"},
+                                   {"final.mp4", "preview.mp4", "render-parameters.json"})
+            or frozen["final.mp4"] != artifact.sha256
             or any(not (directory / name).is_file()
                    or sha256_file(directory / name) != sha
                    for name, sha in frozen.items())):

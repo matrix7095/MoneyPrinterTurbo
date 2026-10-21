@@ -291,6 +291,36 @@ def test_concurrent_requests_have_one_atomic_cancellation(pending):
         )
 
 
+@pytest.mark.parametrize("fault", [None, "changed", "missing", "extra_key"])
+def test_native_render_receipt_accepts_exact_three_keys_and_verifies_each(pending, fault):
+    runtime, _, cid, _ = pending
+    with Session(runtime.engine) as session:
+        root = Path(session.get(Content, cid).content_dir)
+        directory = root / "render/revisions/current"
+        parameters = directory / "render-parameters.json"
+        parameters.write_text(json.dumps({"revision_id": "current", "fps": 60, "spatial_sampling": 2}), encoding="utf-8")
+        outputs = directory / "outputs.json"
+        frozen = json.loads(outputs.read_bytes())
+        frozen[parameters.name] = sha(parameters.read_bytes())
+        if fault == "extra_key":
+            extra = directory / "extra.json"
+            extra.write_bytes(b"not a render output")
+            frozen[extra.name] = sha(extra.read_bytes())
+        outputs.write_text(json.dumps(frozen), encoding="utf-8")
+        if fault == "changed":
+            parameters.write_bytes(b"changed")
+        elif fault == "missing":
+            parameters.unlink()
+    before = snapshot(runtime)
+    response = post(pending)
+    assert response.status_code == (200 if fault is None else 409), response.text
+    if fault is None:
+        assert snapshot(runtime)[1] == before[1]
+    else:
+        assert response.json()["detail"] == "RERENDER_OUTPUTS_CHANGED"
+        assert snapshot(runtime) == before
+
+
 @pytest.mark.parametrize("boundary", ["valid-owned", "bad-owned", "task-quarantine", "rewritten-receipt"])
 def test_undispatched_qc_issuance_and_optional_ownership_boundaries(pending, boundary):
     runtime, _, cid, expected = pending

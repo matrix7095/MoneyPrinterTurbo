@@ -3429,7 +3429,8 @@ def _issue_acceptance(
 def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> dict:
     """A new immutable pack for a new offer; never upgrade any prior task or result."""
     import pysubs2
-    from glance_media.executor import _with_transition, layout_filter
+    from fractions import Fraction
+    from glance_media.executor import _with_transition, layout_filter, probe
     from glance_media.frame_evidence import generate_frame_evidence
 
     root = Path(content.content_dir).resolve()
@@ -3446,16 +3447,63 @@ def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> 
                    event for event in pysubs2.load(str(subtitle)) if event.style == "Default" and not event.is_comment)]
     if not events:
         raise ValueError("VISUAL_EVIDENCE_SUBTITLES_MISSING")
-    manifest_path = generate_frame_evidence(root / artifact.relative_path, artifact.sha256,
+    final = (root / artifact.relative_path).resolve()
+    parameter_receipt = final.with_name("render-parameters.json")
+    output_receipt = final.with_name("outputs.json")
+    canonical_revision = final.parent.parent == root / "render" / "revisions" and final.name == "final.mp4"
+    try:
+        stream = next(stream for stream in probe(final)["streams"] if stream.get("codec_type") == "video")
+        actual_fps = Fraction(stream["avg_frame_rate"])
+        if actual_fps != Fraction(stream["r_frame_rate"]) or actual_fps not in (30, 60):
+            raise ValueError("Unsupported video clock")
+        outputs = json.loads(output_receipt.read_text(encoding="utf-8")) if output_receipt.is_file() else {}
+        if canonical_revision and outputs.get("final.mp4") != artifact.sha256:
+            raise ValueError("Registered revision output receipt mismatch")
+        if parameter_receipt.is_file():
+            parameters = json.loads(parameter_receipt.read_text(encoding="utf-8"))
+            revision_id = final.parent.name
+            spec = json.loads((root / "render" / "mpt-project" / "revisions" / revision_id / "spec.json").read_text(
+                encoding="utf-8"))
+            if (
+                not canonical_revision or parameters["revision_id"] != revision_id or spec["revision_id"] != revision_id
+                or parameters["renderer_version"] != "local-ffmpeg-v5-global-vbv"
+                or type(parameters["fps"]) is not int or parameters["fps"] != actual_fps
+                or spec["settings"]["fps"] != parameters["fps"]
+                or type(parameters["video_crf"]) is not int
+                or spec["settings"]["video_crf"] != parameters["video_crf"]
+                or (actual_fps == 60 and parameters["video_crf"] != 10)
+                or type(parameters["video_maxrate_kbps"]) is not int
+                or type(parameters["video_bufsize_kbits"]) is not int
+                or spec["settings"].get("video_maxrate_kbps", 0) != parameters["video_maxrate_kbps"]
+                or spec["settings"].get("video_bufsize_kbits", 0) != parameters["video_bufsize_kbits"]
+                or (parameters["video_maxrate_kbps"], parameters["video_bufsize_kbits"]) != (
+                    (20000, 40000) if actual_fps == 60 else (0, 0))
+                or type(parameters["spatial_sampling"]) is not int
+                or parameters["spatial_sampling"] != (2 if actual_fps == 60 else 1)
+                or outputs.get(parameter_receipt.name) != sha256_file(parameter_receipt)
+            ):
+                raise ValueError("Frozen revision transform mismatch")
+            provenance = {**parameters, "receipt_path": parameter_receipt.relative_to(root).as_posix(),
+                          "receipt_sha256": sha256_file(parameter_receipt)}
+        else:
+            if actual_fps != 30 or "render-parameters.json" in outputs:
+                raise ValueError("Native render transform receipt missing")
+            parameters = {"fps": 30, "spatial_sampling": 1}
+            provenance = {**parameters, "source": "legacy_30fps_video"}
+    except (KeyError, OSError, TypeError, ValueError, ZeroDivisionError, StopIteration) as exc:
+        raise ValueError("VISUAL_EVIDENCE_RENDER_PARAMETERS_INVALID") from exc
+    manifest_path = generate_frame_evidence(final, artifact.sha256,
                                           root / "render" / f"visual-evidence-{uuid4().hex}", timed=True)
     copied = manifest_path.parent / "narration.ass"
     copied.write_bytes(subtitle_bytes)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["input_video"].pop("path", None)
-    manifest.update(visual_plan=plan, subtitles={"path": copied.name, "sha256": sha256_file(copied), "events": events},
+    manifest.update(visual_plan=plan, render_parameters=provenance,
+                    subtitles={"path": copied.name, "sha256": sha256_file(copied), "events": events},
                     render_templates=[_with_transition(layout_filter(
                         "image_card", motion=segment.get("motion", "ken_burns_in"),
-                        focus_x=segment.get("focus_x", .5), focus_y=segment.get("focus_y", .5)),
+                        focus_x=segment.get("focus_x", .5), focus_y=segment.get("focus_y", .5),
+                        fps=parameters["fps"], spatial_sampling=parameters["spatial_sampling"]),
                         segment.get("transition", "hard_cut")) for segment in plan["segments"]])
     # Keep the generator's original manifest immutable; enriched issuance has its own file.
     issued_path = manifest_path.parent / "joint-manifest.json"

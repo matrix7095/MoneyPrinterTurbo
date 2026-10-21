@@ -578,8 +578,16 @@ def test_old_task_cannot_adopt_new_method_and_pages(tmp_path, joint_pack):
                 verify_acceptance(session, old, {"passed": False, "subject": bare["acceptance_subject"]})
 
 
-def test_real_visual_collection_creates_new_full_packs_without_claiming_observation(tmp_path, joint_pack, synthetic_clip):
+@pytest.mark.parametrize(("native_sampling", "fault"), [
+    (False, None), (True, None), (True, "missing_sidecar"), (True, "missing_sidecar30"),
+    (True, "wrong_version"), (True, "wrong_revision"), (True, "wrong_actual_fps"),
+    (True, "wrong_spec"), (True, "wrong_digest"), (True, "wrong_video_crf"), (True, "wrong_spec_crf"),
+    (True, "wrong_budget"), (True, "wrong_spec_budget"),
+])
+def test_real_visual_collection_creates_new_full_packs_without_claiming_observation(
+        tmp_path, joint_pack, synthetic_clip, native_sampling, fault):
     import pysubs2
+    from glance_media.executor import _with_transition, layout_filter
 
     runtime = make_runtime(tmp_path / "http")
     with TestClient(content_app(runtime)):
@@ -589,8 +597,47 @@ def test_real_visual_collection_creates_new_full_packs_without_claiming_observat
             root = Path(content.content_dir)
             artifact = session.get(Artifact, bare["video_artifact_id"])
             final = root / artifact.relative_path
-            final.write_bytes(synthetic_clip.read_bytes())
+            fps = 60 if native_sampling and fault != "missing_sidecar30" else 30
+            if native_sampling:
+                final = root / "render/revisions/new-60/final.mp4"
+                final.parent.mkdir(parents=True)
+                artifact.relative_path = final.relative_to(root).as_posix()
+            # Evidence plumbing only; genuine intermediate motion is tested in the media regressions.
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(synthetic_clip), "-vf", f"fps={fps}",
+                            "-c:v", "libx264", str(final)], check=True, capture_output=True, timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             artifact.sha256, artifact.size_bytes = digest(final), final.stat().st_size
+            if native_sampling:
+                parameters = {"renderer_version": "local-ffmpeg-v5-global-vbv",
+                              "revision_id": final.parent.name, "fps": fps,
+                              "spatial_sampling": 2 if fps == 60 else 1, "video_crf": 10 if fps == 60 else 23,
+                              "video_maxrate_kbps": 20000 if fps == 60 else 0,
+                              "video_bufsize_kbits": 40000 if fps == 60 else 0}
+                if fault == "wrong_version":
+                    parameters["renderer_version"] = "BOGUS"
+                if fault == "wrong_revision":
+                    parameters["revision_id"] = "different"
+                if fault == "wrong_actual_fps":
+                    parameters.update(fps=30, spatial_sampling=1)
+                if fault == "wrong_video_crf":
+                    parameters["video_crf"] = 18
+                if fault == "wrong_budget":
+                    parameters.update(video_maxrate_kbps=18000, video_bufsize_kbits=36000)
+                sidecar = final.with_name("render-parameters.json")
+                sidecar.write_text(json.dumps(parameters), encoding="utf-8")
+                output_hashes = {"final.mp4": artifact.sha256, sidecar.name: digest(sidecar)}
+                if fault == "wrong_digest":
+                    output_hashes[sidecar.name] = "c" * 64
+                final.with_name("outputs.json").write_text(json.dumps(output_hashes), encoding="utf-8")
+                spec = root / "render/mpt-project/revisions" / final.parent.name / "spec.json"
+                spec.parent.mkdir(parents=True)
+                spec.write_text(json.dumps({"revision_id": final.parent.name,
+                    "settings": {"fps": 30 if fault in {"wrong_spec", "wrong_actual_fps"} else fps,
+                                 "video_crf": 18 if fault == "wrong_spec_crf" else parameters["video_crf"],
+                                 "video_maxrate_kbps": 18000 if fault == "wrong_spec_budget" else parameters["video_maxrate_kbps"],
+                                 "video_bufsize_kbits": parameters["video_bufsize_kbits"]}}), encoding="utf-8")
+                if fault in {"missing_sidecar", "missing_sidecar30"}:
+                    sidecar.unlink()
             plan = session.get(AgentTask, bare["upstream_task_ids"]["visual_plan"])
             plan.result_data = deepcopy(plan.result_data)
             for index, segment in enumerate(plan.result_data["segments"]):
@@ -604,13 +651,36 @@ def test_real_visual_collection_creates_new_full_packs_without_claiming_observat
             (root / "transcript").mkdir()
             subs.save(str(root / "transcript" / "narration.ass"))
             refs = {**bare["upstream_task_ids"], "video_artifact_id": artifact.id}
+            if fault:
+                with pytest.raises(ValueError, match="VISUAL_EVIDENCE_RENDER_PARAMETERS_INVALID"):
+                    pipeline._collect_visual_evidence(session, content, refs)
+                assert not list((root / "render").glob("visual-evidence-*"))
+                return
             first = pipeline._collect_visual_evidence(session, content, refs)
+            frozen = (root / first["manifest_path"]).read_bytes()
+            # A later project's mutable current receipt must not change the registered revision's template.
+            (root / "render" / "mpt-render-request.json").write_text(
+                json.dumps({"request": {"settings": {"fps": 30}}}), encoding="utf-8")
             second = pipeline._collect_visual_evidence(session, content, refs)
             assert first["manifest_path"] != second["manifest_path"]
-            assert len(first["manifest"]["frames"]) == 7
-            assert len(first["manifest"]["pages"]) == 2
+            assert (root / first["manifest_path"]).read_bytes() == frozen
+            assert len(first["manifest"]["frames"]) == (60 if native_sampling else 30)
+            assert len(first["manifest"]["pages"]) == (15 if native_sampling else 8)
             assert first["manifest"]["subtitles"]["events"][1]["start_sec"] == .5
             assert len(first["manifest"]["render_templates"]) == 2
+            expected = [_with_transition(layout_filter(
+                "image_card", motion=segment["motion"], fps=60 if native_sampling else 30,
+                spatial_sampling=2 if native_sampling else 1), segment["transition"])
+                for segment in resolved_visual_plan(session, plan)["segments"]]
+            assert first["manifest"]["render_templates"] == second["manifest"]["render_templates"] == expected
+            if native_sampling:
+                assert first["manifest"]["render_parameters"]["receipt_sha256"] == digest(sidecar)
+                assert first["manifest"]["render_parameters"]["revision_id"] == final.parent.name
+                assert first["manifest"]["render_parameters"]["video_crf"] == 10
+                assert first["manifest"]["render_parameters"]["video_maxrate_kbps"] == 20000
+                assert first["manifest"]["render_parameters"]["video_bufsize_kbits"] == 40000
+            else:
+                assert first["manifest"]["render_parameters"]["source"] == "legacy_30fps_video"
             assert first["manifest"]["review"]["observed_by_reviewer"] is False
             audio["video_sha256"] = artifact.sha256
             verify_visual_joint_evidence(root, first, None, audio, resolved_visual_plan(session, plan), passed=False)

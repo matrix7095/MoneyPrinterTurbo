@@ -25,6 +25,29 @@ network filesystems with unreliable locking are unsupported. Reserve enough disk
 for source snapshots, retained revisions and exports. There is no automatic
 artifact pruning or deletion of older successful exports.
 
+## Business image-card rendering
+
+The MPT business adapter uses a CPU `libx264` profile for projects made entirely
+from local image cards: 60 fps sampled before camera motion, 2x spatial sampling
+for moving cards, and CRF 10 with `mbtree=0` for prepared footage and scenes. Hold shots
+skip spatial upsampling. This profile uses CPU encoding even when NVENC is
+selected; mixed and original-video projects retain their requested first-stage
+encoder and 30 fps. The standalone CLI still defaults to 30 fps.
+
+The final export alone applies one global 20,000 kbps / 40,000 kbit VBV budget,
+using CPU `libx264`, CRF 10 and `mbtree=0`. Applying independent VBV buffers to
+each scene and then concatenating them does not enforce a whole-video budget.
+No-BGM export copies assembly audio; BGM export keeps the existing audio mix.
+
+Generic projects can opt in with `video_maxrate_kbps` and `video_bufsize_kbits`.
+Both default to zero (disabled), or must be positive integers at most 1,000,000.
+Changing only these fields rebuilds export and reuses scene/audio/assembly caches.
+
+The extra samples and lower CRF increase rendering work and intermediate file size. Each new
+business revision records its frame rate, spatial sampling, CRF and VBV budget in a frozen
+`render-parameters.json`, whose hash is included in `outputs.json`. Historical
+two-file output receipts remain supported.
+
 ## Create, inspect and render
 
 Save `episode.json` beside your prepared assets:

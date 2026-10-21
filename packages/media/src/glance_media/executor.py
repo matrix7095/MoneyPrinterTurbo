@@ -809,34 +809,43 @@ def layout_filter(
     motion: str = "hold",
     focus_x: float = 0.5,
     focus_y: float = 0.5,
+    fps: int = 30,
+    spatial_sampling: int = 1,
 ) -> str:
+    if type(fps) is not int or fps not in (30, 60):
+        raise ValueError("Layout fps must be 30 or 60")
+    if type(spatial_sampling) is not int or spatial_sampling not in (1, 2):
+        raise ValueError("Layout spatial_sampling must be 1 or 2")
     if layout == "fit":
         return (
             "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
+            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps={fps}"
         )
     if layout == "image_card":
-        # 在 30fps 时间轴上计算浮点角点，避免整数裁剪造成慢速推拉跳动。
+        # Sample before transforming; preserve camera speed on the original 30fps clock.
         safe_x = max(0.0, min(1.0, focus_x))
         safe_y = max(0.0, min(1.0, focus_y))
         base = (
             "scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,fps=30,format=yuv444p"
+            f"crop=1080:1920,fps={fps},format=yuv444p"
         )
         if motion == "hold":
             return base
+        if spatial_sampling == 2:
+            base += ",scale=2160:3840:flags=lanczos"
+        tick = "(on-1)" if fps == 30 else f"((on-1)*30/{fps})"
         if motion == "ken_burns_out":
-            zoom = "max(1,1.14-(on-1)*0.0005)"
+            zoom = f"max(1,1.14-{tick}*0.0005)"
         elif motion in {"pan_left", "pan_right"}:
             zoom = "1.10"
         elif motion == "focus_product":
-            zoom = "min(1.18,1+(on-1)*0.00075)"
+            zoom = f"min(1.18,1+{tick}*0.00075)"
         else:
-            zoom = "min(1.14,1+(on-1)*0.0005)"
+            zoom = f"min(1.14,1+{tick}*0.0005)"
         if motion == "pan_left":
-            x_focus = "min(1,(on-1)/240)"
+            x_focus = f"min(1,{tick}/240)"
         elif motion == "pan_right":
-            x_focus = "max(0,1-(on-1)/240)"
+            x_focus = f"max(0,1-{tick}/240)"
         else:
             x_focus = f"{safe_x:.3f}"
         left = f"-({x_focus})*(({zoom})-1)*W"
@@ -851,6 +860,7 @@ def layout_filter(
             base + ",perspective="
             + ":".join(f"{key}='{value}'" for key, value in corners.items())
             + ":sense=destination:eval=frame:interpolation=cubic"
+            + (",scale=1080:1920:flags=lanczos" if spatial_sampling == 2 else "")
         )
     if layout == "blur_background":
         return (
@@ -859,9 +869,9 @@ def layout_filter(
             "crop=1080:1920,boxblur=24:12[background];"
             "[foreground]scale=1080:1920:force_original_aspect_ratio=decrease"
             "[foreground];"
-            "[background][foreground]overlay=(W-w)/2:(H-h)/2,fps=30"
+            f"[background][foreground]overlay=(W-w)/2:(H-h)/2,fps={fps}"
         )
-    return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30"
+    return f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps={fps}"
 
 
 def source_redaction_filter(

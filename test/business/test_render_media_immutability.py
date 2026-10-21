@@ -137,7 +137,7 @@ def test_interrupted_render_same_bytes_resume_and_changed_bytes_fail(render_fixt
     resumed = executor.render(**arguments)
     assert resumed[0] == final and final.read_bytes() == before and resumed[1].is_file()
     assert json.loads(final.with_name("outputs.json").read_text()) == {
-        path.name: sha256_file(path) for path in resumed
+        path.name: sha256_file(path) for path in (*resumed, final.with_name("render-parameters.json"))
     }
 
 

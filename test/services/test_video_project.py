@@ -35,6 +35,7 @@ def _media(arguments):
             *arguments,
         ],
         check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
@@ -484,6 +485,84 @@ def test_video_crf_invalidates_only_video_and_reaches_encoder(native, monkeypatc
     assert len(encoded) == 2
     assert all(command[command.index("-crf") + 1] == "18" for command in encoded)
     project.create_revision(request, relative_to=root)
+    assert not _builds(project)
+
+
+@pytest.mark.parametrize("name", ["video_maxrate_kbps", "video_bufsize_kbits"])
+@pytest.mark.parametrize("value", [True, 0.5, "20000", -1, 1_000_001])
+def test_vbv_settings_require_bounded_integers(name, value):
+    settings = {"video_maxrate_kbps": 20000, "video_bufsize_kbits": 40000, name: value}
+    with pytest.raises(ProjectError, match=name):
+        RenderSettings.parse(settings)
+
+
+@pytest.mark.parametrize("settings", [
+    {"video_maxrate_kbps": 20000}, {"video_bufsize_kbits": 40000},
+    {"video_maxrate_kbps": 0, "video_bufsize_kbits": 40000},
+])
+def test_vbv_settings_require_both_enabled_or_disabled(settings):
+    with pytest.raises(ProjectError, match="both be zero or positive"):
+        RenderSettings.parse(settings)
+
+
+def test_vbv_defaults_are_disabled_and_maximum_is_inclusive():
+    defaults = RenderSettings.parse({})
+    assert (defaults.video_maxrate_kbps, defaults.video_bufsize_kbits) == (0, 0)
+    maximum = RenderSettings.parse({"video_maxrate_kbps": 1_000_000, "video_bufsize_kbits": 1_000_000})
+    assert maximum.video_maxrate_kbps == maximum.video_bufsize_kbits == 1_000_000
+
+
+@pytest.mark.parametrize("with_bgm", [False, True])
+def test_vbv_only_rebuilds_one_global_export_and_preserves_audio_policy(native, monkeypatch, with_bgm):
+    project, request, _, root = native
+    if not with_bgm:
+        request.pop("bgm")
+        project.create_revision(request, relative_to=root)
+    commands = []
+    original_run = project._run
+    def recording(command, *args, **kwargs):
+        commands.append(command)
+        return original_run(command, *args, **kwargs)
+    monkeypatch.setattr(project, "_run", recording)
+    original = Path(project.render()["export"]["path"])
+    original_bytes = original.read_bytes()
+    assert len([command for command in commands if "libx264" in command]) == 2
+    assert all("-maxrate" not in command and "-bufsize" not in command for command in commands)
+    commands.clear()
+    bounded = copy.deepcopy(request)
+    bounded["settings"].update(video_maxrate_kbps=20000, video_bufsize_kbits=40000)
+    revision = project.create_revision(bounded, relative_to=root)
+    assert revision["settings"]["video_maxrate_kbps"] == 20000
+    assert revision["settings"]["video_bufsize_kbits"] == 40000
+    assert _builds(project) == {"export"}
+    final = Path(project.render()["export"]["path"])
+    encoded = [command for command in commands if "libx264" in command]
+    assert len(encoded) == 1
+    command = encoded[0]
+    assert "-vf" not in command and "-r" not in command and "-frames:v" not in command
+    assert command[command.index("-maxrate") + 1] == "20000k"
+    assert command[command.index("-bufsize") + 1] == "40000k"
+    assert command[command.index("-crf") + 1] == "23"
+    assert command[command.index("-x264-params") + 1] == "mbtree=0"
+    assert command[command.index("-c:a") + 1] == ("aac" if with_bgm else "copy")
+    assert ("-filter_complex" in command) is with_bgm
+    assert b"vbv_maxrate=20000" in final.read_bytes() and b"vbv_bufsize=40000" in final.read_bytes()
+    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(final), "-f", "null", "-"],
+                   check=True, capture_output=True, timeout=30,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if not with_bgm:
+        def audio_packets(path):
+            return json.loads(subprocess.check_output([
+                "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_packets",
+                "-show_entries", "packet=size,data_hash", "-show_data_hash", "sha256", "-of", "json", str(path)],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))["packets"]
+        assert audio_packets(final) == audio_packets(original)
+    assert original.read_bytes() == original_bytes
+    changed_budget = copy.deepcopy(bounded)
+    changed_budget["settings"].update(video_maxrate_kbps=18000, video_bufsize_kbits=36000)
+    project.create_revision(changed_budget, relative_to=root)
+    assert _builds(project) == {"export"}
+    project.create_revision(bounded, relative_to=root)
     assert not _builds(project)
 
 

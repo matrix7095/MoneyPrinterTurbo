@@ -101,6 +101,11 @@ class MptMediaExecutor(MediaExecutor):
         if abs(previous - voice_duration) > 0.05:
             raise NonRetryableMediaError("Render timeline does not cover the actual narration")
 
+        image_only = all(segment.layout == "image_card" and segment.scene_id is None for segment in plan.segments)
+        fps = 60 if image_only else 30
+        if image_only:
+            # Both encoding stages must use the CPU profile validated for subpixel image motion.
+            encoder = "libx264"
         ensure_ass_filter()
         subtitle_path = self._build_subtitles(
             narration,
@@ -131,7 +136,7 @@ class MptMediaExecutor(MediaExecutor):
             start, end = segment.narration_start_sec, segment.narration_end_sec
             duration = end - start
             # Quantize cumulative edges once, rather than rounding every WAV duration again.
-            end_frame = math.ceil(end * 30 - 1e-9)
+            end_frame = math.ceil(end * fps - 1e-9)
             frame_count = end_frame - previous_frame
             if frame_count <= 0:
                 raise NonRetryableMediaError("Render segment is shorter than one video frame")
@@ -168,17 +173,18 @@ class MptMediaExecutor(MediaExecutor):
                     segment.source_redactions, source_width=width, source_height=height
                 )
             filters += "," + layout_filter(
-                segment.layout, motion=segment.motion, focus_x=segment.focus_x, focus_y=segment.focus_y
+                segment.layout, motion=segment.motion, focus_x=segment.focus_x, focus_y=segment.focus_y,
+                fps=fps, spatial_sampling=2 if image_only else 1,
             )
             filters = _with_transition(filters, segment.transition)
-            filters += f",settb=1/30,setpts=PTS+{start_frame},{subtitle_filter},setpts=PTS-STARTPTS"
+            filters += f",settb=1/{fps},setpts=PTS+{start_frame},{subtitle_filter},setpts=PTS-STARTPTS"
             footage = prepared / f"scene-{index:03d}.mp4"
             audio = prepared / f"scene-{index:03d}.wav"
             run_command(
                 ["ffmpeg", "-y", "-threads", "1", "-filter_threads", "1", *source_arguments,
                  "-frames:v", str(frame_count), "-an", "-vf", filters, *_encoder_args(encoder),
                  # Temporal bit allocation can erase the last subpixel image-motion step.
-                 *(["-crf", "18", "-x264-params", "mbtree=0"]
+                 *(["-crf", "10" if image_only else "18", "-x264-params", "mbtree=0"]
                    if segment.layout == "image_card" and encoder == "libx264" else []),
                  "-pix_fmt", "yuv420p", str(footage)],
                 cwd=self.root,
@@ -193,9 +199,11 @@ class MptMediaExecutor(MediaExecutor):
                                    "audio": str(audio), "frame_count": frame_count})
 
         project = VideoProject(self.root / "render" / "mpt-project")
-        request = {"project_id": self.root.name, "scenes": project_scenes}
+        request = {"project_id": self.root.name, "scenes": project_scenes, "settings": {"fps": fps}}
         if all(segment.layout == "image_card" for segment in plan.segments):
-            request["settings"] = {"video_crf": 18}
+            request["settings"]["video_crf"] = 10 if image_only else 18
+        if image_only:
+            request["settings"].update(video_maxrate_kbps=20000, video_bufsize_kbits=40000)
         if bgm_path is not None and not Path(bgm_path).is_file():
             raise NonRetryableMediaError("Requested BGM file is missing")
         request_receipt = {
@@ -239,6 +247,19 @@ class MptMediaExecutor(MediaExecutor):
         )
         # A failed QC still owns these bytes; a retry may verify them, never replace them.
         with _lock(output_dir / ".outputs.lock"):
+            render_parameters = {"renderer_version": RENDERER_VERSION, "revision_id": revision["revision_id"], "fps": fps,
+                                 "spatial_sampling": 2 if image_only else 1,
+                                 "video_crf": request["settings"].get("video_crf", 23),
+                                 "video_maxrate_kbps": request["settings"].get("video_maxrate_kbps", 0),
+                                 "video_bufsize_kbits": request["settings"].get("video_bufsize_kbits", 0)}
+            parameter_receipt = output_dir / "render-parameters.json"
+            if parameter_receipt.exists():
+                if json.loads(parameter_receipt.read_text(encoding="utf-8")) != render_parameters:
+                    raise NonRetryableMediaError("Immutable render parameters changed")
+            else:
+                if output_receipt.exists() or final.exists() or preview.exists():
+                    raise NonRetryableMediaError("Cannot add render parameters to a frozen render output")
+                _atomic_json(parameter_receipt, render_parameters)
             if subtitle_alignment is not None:
                 alignment_receipt = output_dir / "subtitle-alignment.json"
                 if alignment_receipt.exists():
@@ -251,7 +272,7 @@ class MptMediaExecutor(MediaExecutor):
             if output_receipt.is_file():
                 expected = json.loads(output_receipt.read_text(encoding="utf-8"))
                 if expected != {
-                    path.name: sha256_file(self._local_asset(path)) for path in (final, preview)
+                    path.name: sha256_file(self._local_asset(path)) for path in (final, preview, parameter_receipt)
                 }:
                     raise NonRetryableMediaError("Committed render output failed integrity validation")
                 return final, preview
@@ -283,7 +304,9 @@ class MptMediaExecutor(MediaExecutor):
                 self._promote_immutable_output(preview_temporary, preview)
             if bgm_path:
                 self._write_bgm_receipt(Path(bgm_path), bgm_meta)
-            _atomic_json(output_receipt, {path.name: sha256_file(path) for path in (final, preview)})
+            _atomic_json(output_receipt, {
+                path.name: sha256_file(path) for path in (final, preview, parameter_receipt)
+            })
         return final, preview
 
     def _promote_immutable_output(self, temporary: Path, destination: Path) -> None:

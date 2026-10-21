@@ -111,9 +111,9 @@ def test_final_mux_preserves_noninteger_cfr_frames_and_bgm(tmp_path):
     for path in (plain, mixed):
         timeline = video_timeline(path)
         times = [float(frame["best_effort_timestamp_time"]) for frame in timeline["frames"]]
-        assert len(times) == 13 and times[0] == 0
-        assert np.allclose(np.diff(times), 1 / 30, atol=1e-6, rtol=0)
-        assert abs(float(timeline["streams"][0]["duration"]) - 13 / 30) < 1e-6
+        assert len(times) == 25 and times[0] == 0
+        assert np.allclose(np.diff(times), 1 / 60, atol=1e-6, rtol=0)
+        assert abs(float(timeline["streams"][0]["duration"]) - 25 / 60) < 1e-6
     pcm = []
     for path in (plain, mixed):
         raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0",
@@ -153,7 +153,7 @@ def test_default_scene_keeps_its_stereo_48khz_preview_audio(native):
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="native FFmpeg required")
-def test_cumulative_ass_clock_uses_exact_integer_frame_526(render_fixture, monkeypatch):
+def test_cumulative_ass_clock_uses_exact_integer_frame_1052(render_fixture, monkeypatch):
     executor, arguments = render_fixture
     monkeypatch.setattr(media_executor, "probe", lambda _: {"format": {"duration": 35.976}})
     arguments["plan_data"] = {"segments": [{"asset_id": "image", "layout": "image_card", "motion": "hold",
@@ -167,11 +167,11 @@ def test_cumulative_ass_clock_uses_exact_integer_frame_526(render_fixture, monke
         return actual_command(arguments, **kwargs)
     monkeypatch.setattr(media_executor, "run_command", command)
     executor.render(**arguments)
-    assert [int(c[c.index("-frames:v") + 1]) for c in captured] == [87, 170, 142, 127, 106, 143, 188, 117]
+    assert [int(c[c.index("-frames:v") + 1]) for c in captured] == [174, 340, 284, 254, 212, 286, 375, 234]
     filters = captured[4][captured[4].index("-vf") + 1]
-    clock = filters[filters.index("settb=1/30"):].split(",ass=", 1)[0]
-    actual = subprocess.run(["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=s=64x64:r=30:d=0.1",
+    clock = filters[filters.index("settb=1/60"):].split(",ass=", 1)[0]
+    actual = subprocess.run(["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=s=64x64:r=60:d=0.1",
         "-vf", clock + ",showinfo", "-frames:v", "1", "-fps_mode", "passthrough", "-f", "null", "-"],
         capture_output=True, text=True)
     assert actual.returncode == 0, actual.stderr
-    assert re.search(r"n:\s*0\s+pts:\s*526\s+pts_time:17\.5333", actual.stderr)
+    assert re.search(r"n:\s*0\s+pts:\s*1052\s+pts_time:17\.5333", actual.stderr)

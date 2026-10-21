@@ -24,7 +24,7 @@ from uuid import uuid4
 
 PREPARED_FORMATS = "mov,matroska,avi,mpegts,mpegvideo,ogg,flv,wav,mp3,flac,aac"
 SCHEMA_VERSION = 1
-RENDERER_VERSION = "local-ffmpeg-v3-cfr-pcm-no-mbtree"
+RENDERER_VERSION = "local-ffmpeg-v5-global-vbv"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -120,6 +120,8 @@ class RenderSettings:
     narration_volume: float = 1.0
     bgm_volume: float = 0.15
     video_crf: int = 23
+    video_maxrate_kbps: int = 0
+    video_bufsize_kbits: int = 0
 
     @classmethod
     def parse(cls, value: dict) -> RenderSettings:
@@ -136,6 +138,12 @@ class RenderSettings:
             raise ProjectError("H.264 dimensions must be even")
         if type(result.video_crf) is not int or not 0 <= result.video_crf <= 51:
             raise ProjectError("video_crf must be an integer from 0 to 51")
+        for name in ("video_maxrate_kbps", "video_bufsize_kbits"):
+            number = getattr(result, name)
+            if type(number) is not int or not 0 <= number <= 1_000_000:
+                raise ProjectError(f"{name} must be an integer from 0 to 1000000")
+        if bool(result.video_maxrate_kbps) != bool(result.video_bufsize_kbits):
+            raise ProjectError("video_maxrate_kbps and video_bufsize_kbits must both be zero or positive")
         for name in ("narration_volume", "bgm_volume"):
             number = getattr(result, name)
             if (
@@ -233,7 +241,8 @@ def stage_graph(spec: dict) -> list[Stage]:
         scene_fingerprints.append(render)
     assembly = _fingerprint([transform, "assembly", scene_fingerprints])
     final = _fingerprint(
-        [transform, "export", assembly, spec.get("bgm"), settings.bgm_volume]
+        [transform, "export", assembly, spec.get("bgm"), settings.bgm_volume,
+         settings.video_maxrate_kbps, settings.video_bufsize_kbits]
     )
     stages.extend(
         [
@@ -680,6 +689,13 @@ class VideoProject:
                 "-filter_threads",
                 "1",
             ]
+            export_video_args = ["-c:v", "copy"]
+            if settings.video_maxrate_kbps:
+                export_video_args = [
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", str(settings.video_crf),
+                    "-x264-params", "mbtree=0", "-maxrate", f"{settings.video_maxrate_kbps}k",
+                    "-bufsize", f"{settings.video_bufsize_kbits}k",
+                ]
             if stage.kind == "audio":
                 if scene["audio"]:
                     source = [
@@ -870,8 +886,7 @@ class VideoProject:
                         "0:v:0",
                         "-map",
                         "[a]",
-                        "-c:v",
-                        "copy",
+                        *export_video_args,
                         "-c:a",
                         "aac",
                         "-movflags",
@@ -880,6 +895,12 @@ class VideoProject:
                     ],
                     cancel,
                     timeout,
+                )
+            elif settings.video_maxrate_kbps:
+                self._run(
+                    base + ["-i", results["assembly"]["path"], "-map", "0:v:0", "-map", "0:a:0",
+                            *export_video_args, "-c:a", "copy", "-movflags", "+faststart", str(output)],
+                    cancel, timeout,
                 )
             else:
                 shutil.copyfile(results["assembly"]["path"], output)
