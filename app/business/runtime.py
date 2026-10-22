@@ -1,5 +1,7 @@
 """MPT-owned storage and consumption boundary around portable Glance services."""
 
+from glance_core.content_revision import current_revision_clause
+
 import logging
 import json
 import os
@@ -76,7 +78,7 @@ def _require_owned_input(session, task, *, consumed=False):
 
 def _require_current_revision(session, task):
     revisions = session.exec(select(AgentTask).where(
-        AgentTask.content_id == task.content_id, AgentTask.task_type == task.task_type,
+        current_revision_clause(AgentTask), AgentTask.content_id == task.content_id, AgentTask.task_type == task.task_type,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
     if task.task_type == TaskType.SCENE_ANALYZE:
@@ -96,6 +98,11 @@ def _failure_hash(task):
 
 
 def _require_reconciled_content(session, content_id):
+    if (content := session.get(Content, content_id)) is not None and content.current_revision_id:
+        from glance_core.content_revision import require_reconciled_publish_intents
+
+        require_reconciled_publish_intents(session, content_id)
+        return
     # Intent keys span revisions/artifacts. A different task may already have clicked.
     latest = {}
     for event in session.exec(select(AuditEvent).where(AuditEvent.entity_type == "publish_intent")).all():
@@ -127,14 +134,14 @@ def _require_idle_bundle_recovery(session, content_id):
     if run is not None and run.content_id == content_id and run.state not in {"stopped", "expired"}:
         raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
     if (session.exec(select(AgentTask.id).where(
-            AgentTask.content_id == content_id,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id,
             AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
         )).first() or session.exec(select(SchedulerOffer.request_id).where(
-            SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == content_id)),
+            SchedulerOffer.task_id.in_(select(AgentTask.id).where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)),
             SchedulerOffer.expires_at > utc_now(),
         )).first()):
         raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
-    if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first():
+    if session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id)).first():
         raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
     _require_reconciled_content(session, content_id)
 
@@ -494,7 +501,7 @@ class BusinessRuntime:
                                 Session.commit(session)
                             return {"recovery_status": recovery.status.value, "recovery_task_id": recovery.id}
                     if task.content_id and session.exec(select(AgentTask.id).where(
-                        AgentTask.content_id == task.content_id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == task.content_id,
                         AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
                     )).first():
                         raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
@@ -576,7 +583,8 @@ class BusinessRuntime:
         self._require_accepted_native_task(session, task, consumed=consumed)
         _require_current_revision(session, task)
         _require_reconciled_content(session, task.content_id)
-        if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == task.content_id)).first():
+        if session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord),
+                                                         PublicationRecord.content_id == task.content_id)).first():
             raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
         content = session.get(Content, task.content_id)
         if content is None or (content.business_status == ContentStatus.ARCHIVED and not archived_receipt) or content.business_status in {
@@ -584,10 +592,10 @@ class BusinessRuntime:
         }:
             raise TaskConflictError("RECOVERY_CONTENT_NOT_CURRENT")
         if session.exec(select(AgentTask.id).where(
-            AgentTask.content_id == task.content_id, AgentTask.id != recovery_id,
+            current_revision_clause(AgentTask), AgentTask.content_id == task.content_id, AgentTask.id != recovery_id,
             AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
         )).first() or session.exec(select(SchedulerOffer.request_id).where(
-            SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == task.content_id)),
+            SchedulerOffer.task_id.in_(select(AgentTask.id).where(current_revision_clause(AgentTask), AgentTask.content_id == task.content_id)),
             SchedulerOffer.task_id != recovery_id, SchedulerOffer.expires_at > utc_now(),
         )).first():
             raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
@@ -605,7 +613,7 @@ class BusinessRuntime:
         frozen = deepcopy(task.input_data)
         receipt_id = frozen.get("acceptance_receipt_artifact_id")
         receipts = session.exec(select(Artifact).where(
-            Artifact.content_id == content.id, Artifact.artifact_type == "acceptance_input",
+            current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "acceptance_input",
             Artifact.id == receipt_id if receipt_id else Artifact.relative_path == "render/acceptance-input.json",
         )).all()
         if len(receipts) != 1:
@@ -726,13 +734,13 @@ class BusinessRuntime:
                     or content.current_stage != "archived" or content.error_code != "RECOVERY_BLOCKED"
                     or content.error_message != QC_TARGET_REJECTION):
                 raise TaskConflictError("RECOVERY_QC_REJECTION_RECEIPT_CHANGED")
-            tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content.id)).all()
+            tasks = session.exec(select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == content.id)).all()
             if (any(row.status in {TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED} for row in tasks)
                     or session.exec(select(SchedulerOffer.request_id).where(
                         SchedulerOffer.task_id.in_([row.id for row in tasks]), SchedulerOffer.expires_at > utc_now(),
                     )).first()):
                 raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
-            if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content.id)).first():
+            if session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord), PublicationRecord.content_id == content.id)).first():
                 raise TaskConflictError("RECOVERY_PUBLISH_RECONCILIATION_REQUIRED")
             _require_reconciled_content(session, content.id)
         try:
@@ -956,7 +964,7 @@ class BusinessRuntime:
                 or not 0 < sum(row["observed"] for row in observations) < len(pages)):
             raise TaskConflictError("RECOVERY_QC_REINSPECTION_NOT_ALLOWED")
         if (session.exec(select(AgentTask.id).where(
-                AgentTask.content_id == source.content_id, AgentTask.id != recovery.id,
+                current_revision_clause(AgentTask), AgentTask.content_id == source.content_id, AgentTask.id != recovery.id,
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
             )).first() or session.exec(select(AgentTask.id).where(
                 AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
@@ -1049,7 +1057,7 @@ class BusinessRuntime:
             AuditEvent.metadata_json["recovery_task_id"].as_string() == recovery.id,
         )).first()
         children = session.exec(select(AgentTask).where(
-            AgentTask.content_id == recovery.content_id,
+            current_revision_clause(AgentTask), AgentTask.content_id == recovery.content_id,
             AgentTask.input_data["recovery_task_id"].as_string() == recovery.id,
         )).all()
         if retried or children:
@@ -1058,7 +1066,7 @@ class BusinessRuntime:
             return False
         source, _ = self._failure_source(session, source.id)
         if session.exec(select(AgentTask.id).where(
-            AgentTask.content_id == recovery.content_id, AgentTask.id != recovery.id,
+            current_revision_clause(AgentTask), AgentTask.content_id == recovery.content_id, AgentTask.id != recovery.id,
             AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
         )).first():
             raise TaskConflictError("RECOVERY_CONTENT_IN_FLIGHT")
@@ -1234,7 +1242,7 @@ class BusinessRuntime:
         with Session(self.engine) as session:
             tasks = session.exec(
                 select(AgentTask.id).where(
-                    AgentTask.status == TaskStatus.COMPLETED,
+                    current_revision_clause(AgentTask), AgentTask.status == TaskStatus.COMPLETED,
                     *([AgentTask.content_id == content_id] if content_id is not None else []),
                     eligible_task_clause(),
                     AgentTask.task_type != TaskType.SOURCE_DISCOVERY,
@@ -1296,6 +1304,21 @@ class BusinessRuntime:
                 try:
                     response = request_rerender(self, session, content_id, expected)
                     Session.commit(session)
+                    return response
+                finally:
+                    session.rollback()
+
+    def start_published_revision(self, content_id: str, expected: dict) -> dict:
+        from app.business.published_revision import start_published_revision
+        from app.business.requests import PublishedRevisionRequest
+
+        payload = PublishedRevisionRequest.model_validate(expected)
+        with content_operation_lock(self.settings, content_id):
+            with Session(self.engine) as session:
+                begin_immediate(session)
+                try:
+                    response = start_published_revision(session, content_id, payload)
+                    session.commit()
                     return response
                 finally:
                     session.rollback()
@@ -1379,7 +1402,7 @@ class BusinessRuntime:
                             or (content.business_status, content.current_stage)
                             != (ContentStatus.WAITING_AGENT, "visual_plan_qc")):
                         raise TaskConflictError("VISUAL_REPAIR_CONTENT_NOT_CURRENT")
-                    tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content_id)).all()
+                    tasks = session.exec(select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)).all()
                     if (any(task.status in {TaskStatus.LEASED, TaskStatus.SUBMITTED}
                             or (task.status == TaskStatus.PENDING and task.id != qc.id) for task in tasks)
                             or session.exec(select(SchedulerOffer.request_id).where(
@@ -1387,7 +1410,7 @@ class BusinessRuntime:
                                 SchedulerOffer.expires_at > utc_now(),
                             )).first()):
                         raise TaskConflictError("VISUAL_REPAIR_CONTENT_IN_FLIGHT")
-                    if (session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first()
+                    if (session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id)).first()
                             or session.exec(select(AuditEvent.id).where(
                                 AuditEvent.entity_type == "publish_intent",
                                 AuditEvent.metadata_json["content_id"].as_string() == content_id,
@@ -1655,7 +1678,7 @@ class BusinessRuntime:
                             or content.error_message != "角色路由动作与失败分类不匹配"):
                         raise TaskConflictError("VISUAL_REVIEW_CONTENT_NOT_CURRENT")
                     _require_idle_bundle_recovery(session, content_id)
-                    tasks = session.exec(select(AgentTask).where(AgentTask.content_id == content_id)).all()
+                    tasks = session.exec(select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)).all()
                     for task in (plan, qc, recovery):
                         _require_current_revision(session, task)
                     if (any("visual_review_context_version" in task.input_data for task in (qc, plan))
@@ -1667,7 +1690,7 @@ class BusinessRuntime:
                             AuditEvent.entity_type == "publish_intent",
                             AuditEvent.metadata_json["content_id"].as_string() == content_id,
                         )).first() or session.exec(select(PublicationRecord.id).where(
-                            PublicationRecord.content_id == content_id)).first()):
+                            current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id)).first()):
                         raise TaskConflictError("VISUAL_REVIEW_PUBLISH_HISTORY_PRESENT")
                     for task in tasks:
                         refs = task.input_data.get("upstream_task_ids", {})
@@ -1763,7 +1786,7 @@ class BusinessRuntime:
                     voice_data = plan.input_data.get("voice_artifact", {})
                     voice = session.get(Artifact, voice_data.get("id"))
                     latest_voice = session.exec(select(Artifact).where(
-                        Artifact.content_id == content_id, Artifact.artifact_type == "voice",
+                        current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "voice",
                     ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
                     root = Path(content.content_dir).resolve()
                     if (voice is None or voice.content_id != content_id or voice.artifact_type != "voice"
@@ -1909,10 +1932,10 @@ class BusinessRuntime:
                         raise ValueError("Visual restoration requires an unexecuted content QC offer")
                     _require_reconciled_content(session, content_id)
                     if session.exec(select(AgentTask.id).where(
-                        AgentTask.content_id == content_id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                         AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
                     )).first() or session.exec(select(SchedulerOffer.request_id).where(
-                        SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == content_id)),
+                        SchedulerOffer.task_id.in_(select(AgentTask.id).where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)),
                         SchedulerOffer.expires_at > utc_now(),
                     )).first():
                         raise ValueError("Visual restoration content work is active or offered")
@@ -1961,7 +1984,7 @@ class BusinessRuntime:
                     if resolved_visual_plan(session, detached) != before:
                         raise ValueError("Visual restoration is not an exact approved asset backfill")
                     offers = session.exec(select(AgentTask).where(
-                        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
                         AgentTask.status != TaskStatus.CANCELLED,
                     )).all()
                     if len(offers) != 1:
@@ -1976,7 +1999,7 @@ class BusinessRuntime:
                             or offer.input_data.get("audio_evidence_version") != 1):
                         raise ValueError("Visual restoration QC offer has already executed or changed")
                     if session.exec(select(AgentTask.id).where(
-                        AgentTask.content_id == content_id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                         AgentTask.task_type.in_([TaskType.FINAL_REVIEW_ASSIST, TaskType.PUBLISH_PREPARE,
                                                TaskType.PUBLISH_REVIEW_ASSIST, TaskType.DOUYIN_PUBLISH]),
                         AgentTask.status != TaskStatus.CANCELLED,
@@ -1988,7 +2011,7 @@ class BusinessRuntime:
                         raise ValueError("Visual restoration content root outside runtime")
                     receipt_path = root / "render" / "acceptance-input.json"
                     receipts = session.exec(select(Artifact).where(
-                        Artifact.content_id == content_id, Artifact.artifact_type == "acceptance_input",
+                        current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "acceptance_input",
                         Artifact.id == frozen.get("acceptance_receipt_artifact_id") if offer.schema_version == "3"
                         else Artifact.relative_path == "render/acceptance-input.json",
                     )).all()
@@ -2031,7 +2054,8 @@ class BusinessRuntime:
                     context = source_context(session, content_id, refs)
                     if current != expected or context != frozen["source_context"] or context.get("evidence_gaps"):
                         raise ValueError("Visual restoration current acceptance materials changed")
-                    artifact = Artifact(content_id=content_id, artifact_type="acceptance_input", relative_path="",
+                    artifact = Artifact(content_id=content_id, revision_id=content.current_revision_id,
+                                        artifact_type="acceptance_input", relative_path="",
                                         sha256="", size_bytes=0, mime_type="application/json",
                                         producer_stage="visual_plan_restoration")
                     new_input = {**frozen, "acceptance_subject": current, "previous_acceptance_task_id": offer.id,

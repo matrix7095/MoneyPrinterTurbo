@@ -8,6 +8,7 @@ from datetime import timedelta, timezone
 from pathlib import Path
 
 from glance_core.content_acceptance import is_handsfree_content
+from glance_core.content_revision import current_revision_clause, is_current_revision, require_reconciled_publish_intents
 from glance_core.models import (
     AgentTask,
     Artifact,
@@ -55,7 +56,7 @@ def publish_budget(session: Session, settings, *, now=None):
         )
     ).all()
     times = [as_utc(record.published_at) for record in records]
-    recorded_contents = {record.content_id for record in records}
+    recorded_targets = {(record.content_id, record.revision_id) for record in records}
     events = session.exec(
         select(AuditEvent).where(AuditEvent.entity_type == "publish_intent")
     ).all()
@@ -86,7 +87,7 @@ def publish_budget(session: Session, settings, *, now=None):
             )
         if (
             status == "PUBLISHED"
-            and metadata.get("content_id") not in recorded_contents
+            and (metadata.get("content_id"), metadata.get("content_revision_id")) not in recorded_targets
         ):
             times.append(as_utc(event.created_at))
     today = now.astimezone(SHANGHAI).date()
@@ -111,7 +112,7 @@ def _current_review(session, settings, content_id):
         prepare = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.PUBLISH_PREPARE,
             )
             .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
@@ -131,7 +132,7 @@ def _current_review(session, settings, content_id):
     review = session.exec(
         select(AgentTask)
         .where(
-            AgentTask.content_id == content_id,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id,
             AgentTask.task_type == TaskType.PUBLISH_REVIEW_ASSIST,
         )
         .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
@@ -171,6 +172,7 @@ def _current_review(session, settings, content_id):
         path = (root / artifact.relative_path).resolve()
         if (
             artifact.content_id != content_id
+            or artifact.revision_id != content.current_revision_id
             or not path.is_relative_to(root)
             or not path.is_file()
             or path.stat().st_size != artifact.size_bytes
@@ -180,7 +182,7 @@ def _current_review(session, settings, content_id):
     final = session.exec(
         select(Artifact)
         .where(
-            Artifact.content_id == content_id, Artifact.artifact_type == "final_video"
+            current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "final_video"
         )
         .order_by(Artifact.created_at.desc(), Artifact.id.desc())
     ).first()
@@ -193,6 +195,9 @@ def _current_review(session, settings, content_id):
 def enforce_auto_intent(session, task, base_settings, *, now=None):
     """Called under core's intent transaction; never commits or starts a transaction."""
     assert_allowed(session, task_id=task.id)
+    if not is_current_revision(session, task):
+        raise TaskConflictError("CONTENT_REVISION_STALE")
+    require_reconciled_publish_intents(session, task.content_id)
     policy = (task.input_data or {}).get("publish_policy") or {}
     if stable_hash(task.input_data) != task.input_hash:
         raise TaskConflictError("Publish task input changed")
@@ -282,7 +287,7 @@ def queue_auto_publish(session, settings, content_id, *, now=None):
     previous = session.exec(
         select(AgentTask)
         .where(
-            AgentTask.content_id == content_id,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id,
             AgentTask.task_type == TaskType.DOUYIN_PUBLISH,
         )
         .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())

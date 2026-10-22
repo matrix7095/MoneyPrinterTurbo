@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from typing import Literal
 
 from glance_core.content_acceptance import resolved_visual_plan
+from glance_core.content_revision import current_revision_clause
 from glance_core.models import AgentTask, Artifact, AuditEvent, Content, TaskStatus, TaskType
 from glance_core.task_service import stable_hash
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,17 +58,17 @@ def _artifact_bytes(root: Path, artifact: Artifact, limit: int) -> bytes:
 
 def _current_prepared_ids(session: Session, content: Content, root: Path) -> set[str]:
     plan = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content.id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+        current_revision_clause(AgentTask), AgentTask.content_id == content.id, AgentTask.task_type == TaskType.VISUAL_PLAN,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     cover = session.exec(select(Artifact).where(
-        Artifact.content_id == content.id, Artifact.artifact_type == "cover",
+        current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "cover",
     ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
     if plan is None or cover is None or not cover.relative_path.replace("\\", "/").startswith("publish/cover-revisions/"):
         raise ValueError("Current versioned cover and visual plan are required")
     _artifact_bytes(root, cover, MAX_IMAGE)
     composition_path = _safe((root / cover.relative_path).with_name("composition.json"), root)
-    compositions = session.exec(select(Artifact).where(Artifact.content_id == content.id,
+    compositions = session.exec(select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content.id,
         Artifact.artifact_type == "cover_composition",
         Artifact.relative_path == composition_path.relative_to(root).as_posix())).all()
     if len(compositions) != 1:
@@ -78,7 +79,8 @@ def _current_prepared_ids(session: Session, content: Content, root: Path) -> set
         raise ValueError("Current cover composition is not bound to the registered cover")
     binding = composition.get("source_binding") or {}
     base = session.get(Artifact, binding.get("artifact_id", ""))
-    if (base is None or base.content_id != content.id or base.artifact_type != "agent_generated_image"
+    if (base is None or base.content_id != content.id or base.revision_id != content.current_revision_id
+            or base.artifact_type != "agent_generated_image"
             or base.sha256 != composition.get("source_sha256") or base.size_bytes != composition.get("source_size_bytes")
             or base.producer_stage != binding.get("generation_task_id")):
         raise ValueError("Current cover generated-image source is unavailable")
@@ -101,6 +103,7 @@ def _preparation(session: Session, settings, content_id: str, prepared_id: str, 
     if (event is None or event.actor_type != "admin" or event.actor_id != "mpt-admin-api"
             or metadata.get("receipt_artifact_id") != receipt_id or receipt is None or original is None
             or receipt.content_id != content_id or original.content_id != content_id
+            or receipt.revision_id != content.current_revision_id or original.revision_id != content.current_revision_id
             or receipt.artifact_type != "image_preparation_receipt" or original.artifact_type != "image_preparation_original"
             or metadata.get("record_sha256") != receipt.sha256):
         raise ValueError("Unique authenticated image-preparation registration is required")
@@ -304,12 +307,13 @@ def _validate_original(settings, original_bytes: bytes) -> tuple[bytes, dict]:
 def _store(session: Session, root: Path, content_id: str, task_id: str, destination: Path,
            name: str, payload: bytes, kind: str) -> Artifact:
     relative = (destination / name).relative_to(root).as_posix()
-    rows = session.exec(select(Artifact).where(Artifact.content_id == content_id,
+    rows = session.exec(select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content_id,
         Artifact.relative_path == relative, Artifact.artifact_type == kind)).all()
     if len(rows) > 1 or (rows and (rows[0].sha256 != _sha(payload) or rows[0].size_bytes != len(payload)
             or rows[0].producer_stage != task_id)):
         raise ValueError("Immutable image-use artifact association changed")
-    artifact = rows[0] if rows else Artifact(content_id=content_id, relative_path=relative,
+    artifact = rows[0] if rows else Artifact(content_id=content_id,
+        revision_id=session.get(Content, content_id).current_revision_id, relative_path=relative,
         artifact_type=kind, sha256=_sha(payload), size_bytes=len(payload), mime_type="application/json", producer_stage=task_id)
     session.add(artifact)
     return artifact

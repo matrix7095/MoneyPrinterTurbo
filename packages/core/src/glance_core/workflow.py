@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glance_core.content_revision import current_revision_clause, revision_work_root
+
 import hashlib
 import hmac
 import json
@@ -259,13 +261,15 @@ def log_stage(
     """
     previous_runs = session.exec(
         select(StageRun).where(
-            StageRun.content_id == content_id,
+            current_revision_clause(StageRun), StageRun.content_id == content_id,
             StageRun.stage == stage,
         )
     ).all()
     next_attempt = max((int(run.attempt or 0) for run in previous_runs), default=0) + 1
     run = StageRun(
         content_id=content_id,
+        revision_id=(session.get(Content, content_id).current_revision_id
+                     if session.get(Content, content_id) else None),
         stage=stage,
         status=StageStatus.RUNNING,
         input_hash=input_hash,
@@ -757,7 +761,7 @@ class WorkflowService:
         publish_artifact = self.session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type == "publish_video",
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -765,7 +769,7 @@ class WorkflowService:
         cover = self.session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type == "cover",
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -982,7 +986,7 @@ class WorkflowService:
         final = self.session.get(Artifact, qc.input_data.get("video_artifact_id")) if qc else None
         evidence["final_video"] = artifact_record(final, "final_video")
         latest_final = self.session.exec(select(Artifact).where(
-            Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
+            current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
         ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
         subject_matches = bool(
             qc and qc.status == TaskStatus.COMPLETED and (qc.result_data or {}).get("passed") is True
@@ -1125,7 +1129,7 @@ class WorkflowService:
             }
         evidence["plan_qc"] = task_record(self.completed_task_for(content.id, TaskType.VISUAL_PLAN_QC), "plan_qc")
         image_qcs = self.session.exec(select(AgentTask).where(
-            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
+            current_revision_clause(AgentTask), AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
             AgentTask.status == TaskStatus.COMPLETED,
         ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
         evidence["asset_qc"] = [task_record(item, "asset_qc") for item in image_qcs
@@ -1180,7 +1184,7 @@ class WorkflowService:
                 requested_hash = stable_hash({"version": 1, "script": proof, "approval": receipt["tasks"],
                                               "voice_options": options, "automatic_scope": None})
                 stages = self.session.exec(select(StageRun).where(
-                    StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.status == StageStatus.SUCCESS,
+                    current_revision_clause(StageRun), StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.status == StageStatus.SUCCESS,
                     StageRun.input_hash == requested_hash,
                 )).all()
                 if len(stages) == 1:
@@ -1189,7 +1193,7 @@ class WorkflowService:
                         "approval_signature_verified": True, "actual_provider_verified": False, "license_verified": False}
                     break
         evidence["bgm"] = {"usage": "unknown", "license": "unknown"}
-        request, request_file = json_record(root / "render" / "mpt-render-request.json", "render")
+        request, request_file = json_record(revision_work_root(content) / "render" / "mpt-render-request.json", "render")
         outputs, _ = json_record((root / final.relative_path).with_name("outputs.json"), "render_outputs") if final else ({}, None)
         if (request_file and final and request.get("revision_id") == Path(final.relative_path).parent.name
                 and outputs.get("final.mp4") == final.sha256
@@ -1259,7 +1263,7 @@ class WorkflowService:
                 artifact = self.session.exec(
                     select(Artifact)
                     .where(
-                        Artifact.content_id == content.id,
+                        current_revision_clause(Artifact), Artifact.content_id == content.id,
                         Artifact.artifact_type == "final_video",
                     )
                     .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -1273,7 +1277,7 @@ class WorkflowService:
                 task_type = TaskType.PUBLISH_REVIEW_ASSIST
                 pending_prepare = self.session.exec(
                     select(AgentTask).where(
-                        AgentTask.content_id == content.id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                         AgentTask.task_type == TaskType.PUBLISH_PREPARE,
                         AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
                     )
@@ -1287,7 +1291,7 @@ class WorkflowService:
             if task_type == TaskType.SCRIPT_REVIEW_ASSIST:
                 active_review = self.session.exec(
                     select(AgentTask).where(
-                        AgentTask.content_id == content.id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                         AgentTask.task_type == task_type,
                         AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
                     )
@@ -1327,7 +1331,7 @@ class WorkflowService:
             if task_type == TaskType.PUBLISH_REVIEW_ASSIST:
                 active_review = self.session.exec(
                     select(AgentTask).where(
-                        AgentTask.content_id == content.id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                         AgentTask.task_type == task_type,
                         AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
                     )
@@ -1350,7 +1354,7 @@ class WorkflowService:
 
             existing = self.session.exec(
                 select(AgentTask).where(
-                    AgentTask.content_id == content.id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                     AgentTask.task_type == task_type,
                     AgentTask.status.in_(
                         [TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED]
@@ -1514,7 +1518,7 @@ class WorkflowService:
         if not allow_multiple:
             existing = self.session.exec(
                 select(AgentTask).where(
-                    AgentTask.content_id == content_id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                     AgentTask.task_type == task_type,
                     AgentTask.status.in_(
                         [TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED]
@@ -2091,7 +2095,7 @@ class WorkflowService:
         rows = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.RECOVERY,
             )
             .order_by(AgentTask.created_at)
@@ -2128,7 +2132,7 @@ class WorkflowService:
             return {"tasks": [], "artifacts": []}
         tasks = self.session.exec(
             select(AgentTask)
-            .where(AgentTask.content_id == content_id)
+            .where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)
             .order_by(AgentTask.created_at.desc())
             .limit(60)
         ).all()
@@ -2145,7 +2149,7 @@ class WorkflowService:
         ]
         artifacts = self.session.exec(
             select(Artifact)
-            .where(Artifact.content_id == content_id)
+            .where(current_revision_clause(Artifact), Artifact.content_id == content_id)
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
             .limit(100)
         ).all()
@@ -2194,7 +2198,7 @@ class WorkflowService:
         rows = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.RECOVERY,
             )
             .order_by(AgentTask.created_at.desc())
@@ -2250,7 +2254,7 @@ class WorkflowService:
                 return latest
             if latest.status == TaskStatus.COMPLETED and force_new:
                 related = self.session.exec(
-                    select(AgentTask).where(AgentTask.content_id == source_task.content_id)
+                    select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == source_task.content_id)
                 ).all()
                 if any(
                     row.task_type != TaskType.RECOVERY
@@ -3008,7 +3012,7 @@ class WorkflowService:
             ):
                 continue
             tasks = self.session.exec(
-                select(AgentTask).where(AgentTask.content_id == content.id)
+                select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == content.id)
             ).all()
             ids = [content.id, candidate.id, *(task.id for task in tasks)]
             events = self.session.exec(
@@ -3044,7 +3048,7 @@ class WorkflowService:
                     for task in tasks
                 )
                 or self.session.exec(
-                    select(PublicationRecord).where(PublicationRecord.content_id == content.id)
+                    select(PublicationRecord).where(current_revision_clause(PublicationRecord), PublicationRecord.content_id == content.id)
                 ).first()
                 is not None
                 or self.session.exec(
@@ -3302,7 +3306,7 @@ class WorkflowService:
         """Cancel only in-flight descendants; completed history remains immutable."""
         tasks = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type.in_(task_types),
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
             )
@@ -3513,14 +3517,14 @@ class WorkflowService:
             note_parts.append(
                 "验收：\n" + "\n".join(f"- {item}" for item in plan.acceptance_checks)
             )
-        transcript_path = Path(content.content_dir).resolve() / "transcript" / "transcript.json"
+        transcript_path = revision_work_root(content) / "transcript" / "transcript.json"
         upstream_task_ids: dict[str, str | list[str]] = {"research": research_task.id}
         if scene_tasks:
             upstream_task_ids["scene_analysis"] = [task.id for task in scene_tasks]
         input_data: dict[str, Any] = {
             "upstream_task_ids": upstream_task_ids,
             **(
-                {"materialized_context": {"transcript": "transcript/transcript.json"}}
+                {"materialized_context": {"transcript": transcript_path.relative_to(Path(content.content_dir).resolve()).as_posix()}}
                 if transcript_path.is_file()
                 else {"transcript": {"segments": []}}
             ),
@@ -3879,7 +3883,7 @@ class WorkflowService:
             if resolved is None:
                 # 兼容旧任务把 basename 写进 input 的情况；只允许回到固定 scenes/目录。
                 basename = Path(thumbnail).name
-                resolved = self._content_file(root, f"scenes/{basename}")
+                resolved = self._content_file(root, (revision_work_root(content) / "scenes" / basename).relative_to(root).as_posix())
             if resolved is None:
                 raise ValueError(f"场景缩略图不存在：{thumbnail}")
             canonical, _path = resolved
@@ -3919,7 +3923,7 @@ class WorkflowService:
             seen_scene_ids.add(scene_id)
             resolved = self._content_file(root, thumbnail)
             if resolved is None:
-                resolved = self._content_file(root, f"scenes/{Path(thumbnail).name}")
+                resolved = self._content_file(root, (revision_work_root(content) / "scenes" / Path(thumbnail).name).relative_to(root).as_posix())
             if resolved is None:
                 raise ValueError(f"画面计划质检缩略图不存在：{thumbnail}")
             canonical, _path = resolved
@@ -3949,6 +3953,7 @@ class WorkflowService:
             if (
                 artifact is None
                 or artifact.content_id != content.id
+                or artifact.revision_id != content.current_revision_id
                 or artifact.artifact_type not in allowed_type
                 or not artifact.mime_type.lower().startswith(mime_prefix)
             ):
@@ -4025,7 +4030,7 @@ class WorkflowService:
 
         published_record = self.session.exec(
             select(PublicationRecord).where(
-                PublicationRecord.content_id == content_id,
+                current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id,
                 PublicationRecord.platform == "douyin",
                 PublicationRecord.status == "PUBLISHED",
             )
@@ -4036,7 +4041,7 @@ class WorkflowService:
         publish_tasks = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.DOUYIN_PUBLISH,
             )
             .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
@@ -4060,7 +4065,7 @@ class WorkflowService:
             target_task = self.session.exec(
                 select(AgentTask)
                 .where(
-                    AgentTask.content_id == content_id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                     AgentTask.task_type == TaskType.DOUYIN_PUBLISH,
                     AgentTask.status == TaskStatus.FAILED,
                     AgentTask.error_code == "PUBLISH_UI_TIMEOUT",
@@ -4188,7 +4193,7 @@ class WorkflowService:
             raise ValueError("研究修复缺少候选来源，不能安全重建任务包")
         transcript = target_task.input_data.get("transcript")
         if not isinstance(transcript, dict):
-            transcript_path = Path(content.content_dir).resolve() / "transcript" / "transcript.json"
+            transcript_path = revision_work_root(content) / "transcript" / "transcript.json"
             try:
                 transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
@@ -4434,13 +4439,13 @@ class WorkflowService:
         candidates, gaps = {}, []
         generations = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content.id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                 AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
             )
         ).all()
         asset_checks = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content.id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                 AgentTask.task_type == TaskType.ASSET_QC,
             )
         ).all()
@@ -4602,7 +4607,7 @@ class WorkflowService:
         previous = self.completed_task_for(recovery_task.content_id, TaskType.VISUAL_PLAN)
         existing = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == recovery_task.content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == recovery_task.content_id,
                 AgentTask.task_type == TaskType.VISUAL_PLAN,
             )
         ).all()
@@ -5053,7 +5058,7 @@ class WorkflowService:
         tasks = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.CONTENT_QC,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -5075,7 +5080,7 @@ class WorkflowService:
         return self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == task_type,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -5089,7 +5094,7 @@ class WorkflowService:
         """
         tasks = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.SCENE_ANALYZE,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -5175,15 +5180,20 @@ class WorkflowService:
         platform = platform.strip()
         if not platform:
             raise ValueError("Platform is required")
+        from glance_core.content_revision import require_distinct_publication_identity
+
+        require_distinct_publication_identity(self.session, content.id, content.current_revision_id,
+                                             platform, external_id, external_url)
         record = self.session.exec(
             select(PublicationRecord).where(
-                PublicationRecord.content_id == content_id,
+                current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id,
                 PublicationRecord.platform == platform,
             )
         ).first()
         created = record is None
         if record is None:
-            record = PublicationRecord(content_id=content_id, platform=platform, mode=mode)
+            record = PublicationRecord(content_id=content_id, revision_id=content.current_revision_id,
+                                       platform=platform, mode=mode)
         record.mode = mode
         record.external_url = external_url.strip()
         record.external_id = external_id.strip()
@@ -5245,18 +5255,26 @@ class WorkflowService:
         record = self.session.exec(
             select(PublicationRecord).where(
                 PublicationRecord.content_id == task.content_id,
+                PublicationRecord.revision_id == task.revision_id,
                 PublicationRecord.platform == platform,
             )
         ).first()
         if record is None:
             record = PublicationRecord(
                 content_id=task.content_id,
+                revision_id=task.revision_id,
                 platform=platform,
                 mode=PublicationMode.EXECUTOR,
             )
             created = True
         else:
             created = False
+            if (record.status in {"PUBLISHED", "RECORDED"} and (record.external_id or record.external_url)
+                    and (status != record.status or external_id != record.external_id
+                         or external_url != record.external_url)):
+                raise ValueError("Published revision publication evidence is immutable")
+            if task.revision_id != content.current_revision_id and record.status in {"PUBLISHED", "RECORDED"}:
+                return record
         if status == "PUBLISHED":
             self.tasks.validate_published_publish_result(
                 task,
@@ -5291,7 +5309,7 @@ class WorkflowService:
         record.note = note
         record.actor_id = actor_id
         record.published_at = utc_now()
-        if status == "PUBLISHED" and content.business_status in {
+        if status == "PUBLISHED" and task.revision_id == content.current_revision_id and content.business_status in {
             ContentStatus.PACKAGED,
             ContentStatus.PUBLISHED,
         }:
@@ -5391,11 +5409,15 @@ class WorkflowService:
             raise KeyError(content_id)
         if content.business_status not in {ContentStatus.PACKAGED, ContentStatus.PUBLISHED}:
             raise ValueError("只有已打包或已发布内容可以发布到抖音")
+        if content.current_revision_id:
+            from glance_core.content_revision import require_reconciled_publish_intents
+
+            require_reconciled_publish_intents(self.session, content_id)
 
         video = self.session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type.in_(["publish_video", "final_video"]),
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -5404,7 +5426,7 @@ class WorkflowService:
             raise ValueError("缺少可发布的视频产物")
         cover = self.session.exec(
             select(Artifact)
-            .where(Artifact.content_id == content_id, Artifact.artifact_type == "cover")
+            .where(current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "cover")
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
         ).first()
         if (
@@ -5422,18 +5444,20 @@ class WorkflowService:
             "video_artifact_id": video.id,
             "video_sha256": video.sha256,
         }
+        if content.current_revision_id:
+            target["content_revision_id"] = content.current_revision_id
         target["intent_key"] = stable_hash(target)
         existing = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.DOUYIN_PUBLISH,
             )
             .order_by(AgentTask.created_at.desc())
         ).first()
         completed_record = self.session.exec(
             select(PublicationRecord).where(
-                PublicationRecord.content_id == content_id,
+                current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id,
                 PublicationRecord.platform == "douyin",
                 PublicationRecord.status.in_(["PUBLISHED", "RECORDED"]),
             )
@@ -5492,7 +5516,7 @@ class WorkflowService:
             row = self.session.exec(
                 select(AgentTask)
                 .where(
-                    AgentTask.content_id == content_id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                     AgentTask.task_type == task_type,
                     AgentTask.status == TaskStatus.COMPLETED,
                 )
@@ -5502,7 +5526,7 @@ class WorkflowService:
 
         content_artifacts = self.session.exec(
             select(Artifact)
-            .where(Artifact.content_id == content_id)
+            .where(current_revision_clause(Artifact), Artifact.content_id == content_id)
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
         ).all()
         previous_input = existing.input_data if existing is not None else {}
@@ -5639,7 +5663,7 @@ class WorkflowService:
         previous_plan: dict | None = None,
         preserve_packaged_materials: bool = False,
     ) -> AgentTask:
-        transcript_path = Path(content.content_dir).resolve() / "transcript" / "transcript.json"
+        transcript_path = revision_work_root(content) / "transcript" / "transcript.json"
         previous_script_data = previous_script if isinstance(previous_script, dict) else {}
         previous_script = {
             key: previous_script_data.get(key)
@@ -5663,7 +5687,7 @@ class WorkflowService:
         input_data = {
             "upstream_task_ids": upstream_task_ids,
             **(
-                {"materialized_context": {"transcript": "transcript/transcript.json"}}
+                {"materialized_context": {"transcript": transcript_path.relative_to(Path(content.content_dir).resolve()).as_posix()}}
                 if transcript_path.is_file()
                 else {"transcript": {"segments": []}}
             ),
@@ -5859,7 +5883,7 @@ class WorkflowService:
         """
         existing_rewrite = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.SHORT_SCRIPT,
                 AgentTask.status.in_(
                     [
@@ -6041,7 +6065,7 @@ class WorkflowService:
         existing = self.session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.SHORT_SCRIPT,
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
             )
@@ -6088,7 +6112,7 @@ class WorkflowService:
             if key in previous_script_data
         }
         previous_plan_task = self.completed_task_for(content_id, TaskType.VISUAL_PLAN)
-        transcript_path = Path(content.content_dir).resolve() / "transcript" / "transcript.json"
+        transcript_path = revision_work_root(content) / "transcript" / "transcript.json"
         issue_lines = [
             f"- [{issue.get('severity', 'warning')}] {issue.get('field', 'unknown')}: "
             f"{issue.get('message', '')}"
@@ -6125,7 +6149,7 @@ class WorkflowService:
                     ),
                 },
                 **(
-                    {"materialized_context": {"transcript": "transcript/transcript.json"}}
+                    {"materialized_context": {"transcript": transcript_path.relative_to(Path(content.content_dir).resolve()).as_posix()}}
                     if transcript_path.is_file()
                     else {"transcript": {"segments": []}}
                 ),
@@ -6179,7 +6203,7 @@ class WorkflowService:
     ) -> int:
         tasks = self.session.exec(
             select(AgentTask).where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type.in_(task_types),
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.COMPLETED]),
             )

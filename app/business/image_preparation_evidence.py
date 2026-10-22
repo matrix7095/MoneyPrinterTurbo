@@ -13,6 +13,7 @@ from zipfile import BadZipFile, ZIP_STORED, ZipFile
 
 from glance_agent.image_preparation import _dimensions, _plain_path
 from glance_core.content_acceptance import _unchanged_material_task, completed_image_origin
+from glance_core.content_revision import current_revision_clause
 from glance_core.models import AgentSubmission, AgentTask, Artifact, AuditEvent, Content, ContentStatus, ProductionMode, TaskType, as_utc
 from glance_core.task_service import stable_hash
 from PIL import Image, ImageOps, __version__ as pillow_version
@@ -126,7 +127,8 @@ def _verify(session, settings, content_id: str, prepared_id: str, binding: Prepa
     if (content is None or content.business_status != ContentStatus.PACKAGED
             or content.production_mode != ProductionMode.IMAGE_ONLY
             or prepared_id != binding.prepared_artifact_id or artifact is None
-            or artifact.content_id != content_id or artifact.artifact_type != "agent_generated_image"
+            or artifact.content_id != content_id or artifact.revision_id != content.current_revision_id
+            or artifact.artifact_type != "agent_generated_image"
             or artifact.sha256 != binding.prepared_sha256 or artifact.producer_stage != binding.task_id
             or task is None or task.content_id != content_id or task.task_type != TaskType.ASSET_GENERATE_IMAGE
             or task.attempt != binding.attempt or task.input_hash != binding.input_sha256
@@ -296,10 +298,11 @@ def register_image_preparation(engine, settings, content_id: str, prepared_id: s
         for name, payload, kind, mime in ((source_name, original, "image_preparation_original", {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}[suffix]),
                                            (record_name, record_bytes, "image_preparation_receipt", "application/json")):
             relative = (destination / name).relative_to(root).as_posix()
-            existing = session.exec(select(Artifact).where(Artifact.content_id == content_id, Artifact.relative_path == relative, Artifact.artifact_type == kind)).all()
+            existing = session.exec(select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.relative_path == relative, Artifact.artifact_type == kind)).all()
             if len(existing) > 1 or (existing and (existing[0].sha256 != _sha(payload) or existing[0].size_bytes != len(payload) or existing[0].producer_stage != binding.task_id)):
                 raise ValueError("Registered immutable preparation artifact changed")
-            artifact = existing[0] if existing else Artifact(content_id=content_id, relative_path=relative, artifact_type=kind,
+            artifact = existing[0] if existing else Artifact(content_id=content_id, revision_id=task.revision_id,
+                relative_path=relative, artifact_type=kind,
                 sha256=_sha(payload), size_bytes=len(payload), mime_type=mime, producer_stage=binding.task_id)
             session.add(artifact)
             artifacts.append(artifact)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glance_core.content_revision import current_revision_clause, revision_work_root
+
 import json
 import hashlib
 import hmac
@@ -120,7 +122,7 @@ def _voice_retry_scope(session: Session, content_id: str) -> dict:
 def _require_current_qc(session: Session, content_id: str, kind: TaskType, targets: dict) -> AgentTask:
     task = session.exec(
         select(AgentTask)
-        .where(AgentTask.content_id == content_id, AgentTask.task_type == kind)
+        .where(current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == kind)
         .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
     ).first()
     if task is None or task.status != TaskStatus.COMPLETED or not (task.result_data or {}).get("passed"):
@@ -147,7 +149,7 @@ def _current_script_tasks(session: Session, content_id: str) -> dict:
     for kind in (TaskType.CONTENT_RESEARCH, TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC,
                  TaskType.SCRIPT_REVIEW_ASSIST):
         latest = session.exec(select(AgentTask).where(
-            AgentTask.content_id == content_id, AgentTask.task_type == kind,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == kind,
             AgentTask.status != TaskStatus.CANCELLED,
         ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
         if len(latest) == 2 and latest[0].created_at == latest[1].created_at:
@@ -208,7 +210,7 @@ def _has_manual_script_approval(session: Session, settings: Settings, content_id
     try:
         snapshot = _script_approval_snapshot(session, content_id)
         plans = session.exec(select(AgentTask).where(
-            AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
             AgentTask.status != TaskStatus.CANCELLED,
         ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
         if not plans or (len(plans) == 2 and plans[0].created_at == plans[1].created_at):
@@ -321,7 +323,7 @@ def verify_publish_ready(session: Session, settings: Settings, content_id: str, 
     video_id = str((qc.input_data or {}).get("video_artifact_id") or "")
     artifact = session.get(Artifact, video_id)
     latest = session.exec(
-        select(Artifact).where(Artifact.content_id == content_id, Artifact.artifact_type == "final_video")
+        select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "final_video")
         .order_by(Artifact.created_at.desc(), Artifact.id.desc())
     ).first()
     if artifact is None or latest is None or artifact.id != latest.id:
@@ -340,6 +342,12 @@ def _require_media_tools(*names: str) -> None:
         raise NonRetryableMediaError(
             f"服务器未安装 {'、'.join(missing)}，请先安装并重启 worker 后重试"
         )
+
+
+def _media_executor(content: Content):
+    if content.current_revision_id:
+        return MediaExecutor(Path(content.content_dir).resolve(), revision_id=content.current_revision_id)
+    return MediaExecutor(Path(content.content_dir).resolve())
 
 
 def workflow(session: Session, settings: Settings) -> WorkflowService:
@@ -430,7 +438,7 @@ def register_artifact(
     if deduplicate:
         existing = session.exec(
             select(Artifact).where(
-                Artifact.content_id == content.id,
+                current_revision_clause(Artifact), Artifact.content_id == content.id,
                 Artifact.artifact_type == artifact_type,
                 Artifact.relative_path == metadata["relative_path"],
                 Artifact.sha256 == metadata["sha256"],
@@ -438,7 +446,7 @@ def register_artifact(
         ).first()
         if existing:
             return existing
-    artifact = Artifact(content_id=content.id, **metadata)
+    artifact = Artifact(content_id=content.id, revision_id=content.current_revision_id, **metadata)
     session.add(artifact)
     session.commit()
     session.refresh(artifact)
@@ -481,12 +489,12 @@ def _fallback_cover_base(
     executor: MediaExecutor,
 ) -> tuple[Path, str]:
     """Resolve the explicit non-AI cover path when AI cover generation is disabled."""
-    target = executor.root / "temp" / "cover" / "fallback-base.jpg"
-    source_video = executor.root / "source" / "original.mp4"
+    target = revision_work_root(content) / "temp" / "cover" / "fallback-base.jpg"
+    source_video = revision_work_root(content) / "source" / "original.mp4"
     scene_task = session.exec(
         select(AgentTask)
         .where(
-            AgentTask.content_id == content.id,
+            current_revision_clause(AgentTask), AgentTask.content_id == content.id,
             AgentTask.task_type == TaskType.SCENE_ANALYZE,
             AgentTask.status == TaskStatus.COMPLETED,
         )
@@ -500,7 +508,7 @@ def _fallback_cover_base(
     )
     if source_video.is_file() and ranked:
         scene_times: dict[str, dict] = {}
-        scene_file = executor.root / "scenes" / "scenes.json"
+        scene_file = revision_work_root(content) / "scenes" / "scenes.json"
         try:
             scene_times = {
                 str(item.get("scene_id")): item
@@ -519,7 +527,7 @@ def _fallback_cover_base(
             except Exception:
                 pass
     final_artifact = session.exec(select(Artifact).where(
-        Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
+        current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "final_video",
     ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
     if final_artifact is not None:
         final_video = (executor.root / final_artifact.relative_path).resolve()
@@ -535,7 +543,7 @@ def _fallback_cover_base(
             ), "final_30_percent"
         except Exception:
             pass
-    gradient = executor.root / "temp" / "cover" / "gradient.ppm"
+    gradient = revision_work_root(content) / "temp" / "cover" / "gradient.ppm"
     return executor.gradient_cover_base(gradient), "gradient"
 
 
@@ -552,7 +560,7 @@ def _build_and_register_cover(
 ) -> Artifact:
     flow = workflow(session, settings)
     script = flow.result_for(content.id, TaskType.SHORT_SCRIPT) or {}
-    executor = MediaExecutor(Path(content.content_dir).resolve())
+    executor = _media_executor(content)
     cover_title = _effective_cover_title(content, script) if cover_title is None else cover_title
     source, fallback_stage = (
         (base_image, "generated_image")
@@ -565,6 +573,7 @@ def _build_and_register_cover(
         source = source.resolve()
         generated = session.get(Artifact, base_artifact_id) if base_artifact_id else None
         if (generated is None or generated.content_id != content.id
+                or generated.revision_id != content.current_revision_id
                 or generated.artifact_type != "agent_generated_image" or not source.is_relative_to(root)
                 or source != (root / generated.relative_path).resolve()
                 or not source.is_file() or source.stat().st_size != generated.size_bytes
@@ -573,6 +582,7 @@ def _build_and_register_cover(
         generation = session.get(AgentTask, generated.producer_stage)
         images = (generation.result_data or {}).get("images", []) if generation else []
         if (generation is None or generation.content_id != content.id
+                or generation.revision_id != content.current_revision_id
                 or generation.task_type != TaskType.ASSET_GENERATE_IMAGE
                 or generation.status != TaskStatus.COMPLETED
                 or stable_hash(generation.input_data) != generation.input_hash
@@ -588,7 +598,7 @@ def _build_and_register_cover(
         source_binding=source_binding,
     )
     latest_cover = session.exec(select(Artifact).where(
-        Artifact.content_id == content.id, Artifact.artifact_type == "cover",
+        current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "cover",
     ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
     same_selection = bool(latest_cover and latest_cover.relative_path == cover.relative_to(executor.root).as_posix()
                           and latest_cover.sha256 == sha256_file(cover))
@@ -679,7 +689,7 @@ def _queue_post_package_tasks(
         cover = session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content.id,
+                current_revision_clause(Artifact), Artifact.content_id == content.id,
                 Artifact.artifact_type == "cover",
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -740,7 +750,9 @@ def _queue_post_package_tasks(
 
 
 def _source_image_index_path(content: Content) -> Path:
-    return Path(content.content_dir).resolve() / "source_images" / "index.json"
+    from glance_core.content_revision import revision_work_root
+
+    return revision_work_root(content) / "source_images" / "index.json"
 
 
 def source_image_index(content: Content) -> list[dict]:
@@ -764,12 +776,14 @@ def _acquire_source_images(
     images = list(research.get("source_images") or [])
     if not images:
         return []
-    executor = MediaExecutor(Path(content.content_dir).resolve())
+    executor = _media_executor(content)
     acquired = log_stage(
         session,
         content.id,
         "acquire_images",
-        lambda: executor.acquire_images(images),
+        lambda: executor.acquire_images(images, **(
+            {"acquisition_id": research_task.id} if content.current_revision_id and research_task else {}
+        )),
     )
     entries: list[dict] = []
     for item in acquired:
@@ -824,7 +838,7 @@ def _refresh_source_media_research(session: Session, flow: WorkflowService, cont
     if research is None or (research.result_data or {}).get("source_media_search") is not None:
         return None
     pending = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
+        current_revision_clause(AgentTask), AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
         AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
     ).order_by(AgentTask.created_at.desc())).first()
     if pending is None:
@@ -1082,8 +1096,7 @@ def prepare_content(engine: Engine, settings: Settings, content_id: str) -> Cont
             )
             return flow.mark_status(content.id, ContentStatus.WAITING_AGENT, "agent_context")
         flow.mark_status(content.id, ContentStatus.PREPARING_CONTEXT, "acquire")
-        root = Path(content.content_dir).resolve()
-        executor = MediaExecutor(root)
+        executor = _media_executor(content)
         cookies_file = (
             Path(settings.ytdlp_cookies_file) if settings.ytdlp_cookies_file.strip() else None
         )
@@ -1195,7 +1208,7 @@ def _reference_artifact_paths(
         return []
     artifacts = session.exec(
         select(Artifact).where(
-            Artifact.content_id == content_id,
+            current_revision_clause(Artifact), Artifact.content_id == content_id,
             Artifact.id.in_(reference_ids),
         )
     ).all()
@@ -1271,7 +1284,7 @@ def _asset_qc_input(
             a.id: a.relative_path
             for a in session.exec(
                 select(Artifact).where(
-                    Artifact.content_id == task.content_id,
+                    current_revision_clause(Artifact), Artifact.content_id == task.content_id,
                     Artifact.id.in_([a["artifact_id"] for a in assets]),
                 )
             ).all()
@@ -1321,7 +1334,7 @@ def _asset_qc_input(
             artifact.id: artifact.relative_path
             for artifact in session.exec(
                 select(Artifact).where(
-                    Artifact.content_id == plan_task.content_id,
+                    current_revision_clause(Artifact), Artifact.content_id == plan_task.content_id,
                     Artifact.id.in_(artifact_ids),
                 )
             ).all()
@@ -1420,6 +1433,11 @@ def advance_after_agent(engine: Engine, settings: Settings, task_id: str) -> str
         if task is None or task.status != TaskStatus.COMPLETED:
             return None
         content = session.get(Content, task.content_id) if task.content_id else None
+        if content is not None and task.revision_id != content.current_revision_id:
+            if task.task_type == TaskType.DOUYIN_PUBLISH:
+                workflow(session, settings).record_agent_publication_result(task)
+                return None
+            raise NonRetryableMediaError("CONTENT_REVISION_STALE")
         terminal = content is not None and content.business_status in {
             ContentStatus.PUBLISHED, ContentStatus.ARCHIVED, ContentStatus.REJECTED,
         }
@@ -1819,7 +1837,7 @@ def _advance_after_agent(
                         "scene_analysis": scene_reference,
                     },
                     "materialized_context": {
-                        "transcript": "transcript/transcript.json",
+                        "transcript": (revision_work_root(content) / "transcript" / "transcript.json").relative_to(Path(content.content_dir).resolve()).as_posix(),
                     },
                 },
                 priority=40,
@@ -2147,7 +2165,7 @@ def _advance_after_agent(
         elif task.task_type == TaskType.ASSET_GENERATE_IMAGE:
             if task.input_data.get("asset_purpose") == "cover":
                 generations = session.exec(select(AgentTask).where(
-                    AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
                     AgentTask.status != TaskStatus.CANCELLED,
                 ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
                 current_cover = next((item for item in generations if item.input_data.get("asset_purpose") == "cover"), None)
@@ -2287,7 +2305,7 @@ def _advance_after_agent(
             final_artifact = session.exec(
                 select(Artifact)
                 .where(
-                    Artifact.content_id == content_id,
+                    current_revision_clause(Artifact), Artifact.content_id == content_id,
                     Artifact.artifact_type == "final_video",
                 )
                 .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -2333,7 +2351,7 @@ def repair_stalled_agent_stage(
         active = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
             )
             .order_by(AgentTask.created_at.desc())
@@ -2345,7 +2363,7 @@ def repair_stalled_agent_stage(
         image_tasks = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -2422,7 +2440,7 @@ def repair_stalled_content_qc(
         active = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.CONTENT_QC,
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
             )
@@ -2440,7 +2458,7 @@ def repair_stalled_content_qc(
         final_artifact = session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type == "final_video",
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -2455,7 +2473,7 @@ def repair_stalled_content_qc(
         source = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.CONTENT_QC,
                 AgentTask.status == TaskStatus.FAILED,
             )
@@ -2515,10 +2533,10 @@ def repair_stalled_content_qc(
             for field in ("visual_evidence", "visual_evidence_version", "audio_evidence", "audio_evidence_version"):
                 input_data.pop(field, None)
             input_data["acceptance_subject"] = acceptance_subject(session, content_id, full_refs, source_context_version=1)
-            _write_acceptance_receipt(session, content, MediaExecutor(root), input_data)
+            _write_acceptance_receipt(session, content, _media_executor(content), input_data)
             _issue_acceptance(session, settings, content, input_data)
             qc_task = session.exec(select(AgentTask).where(
-                AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
                 AgentTask.schema_version == "3", AgentTask.status == TaskStatus.PENDING,
             ).order_by(AgentTask.created_at.desc())).first()
             if qc_task is None:
@@ -2584,7 +2602,7 @@ def repair_stalled_asset_generation(
         active = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
                 AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
             )
@@ -2601,7 +2619,7 @@ def repair_stalled_asset_generation(
         source = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content_id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                 AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
                 AgentTask.status == TaskStatus.FAILED,
             )
@@ -2703,7 +2721,7 @@ def _previous_visual_context(
                 or json.loads(manifest_path.read_text(encoding="utf-8")) != evidence["manifest"]):
             raise ValueError("failed QC joint manifest changed")
         checks = session.exec(select(AgentTask).where(
-            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
+            current_revision_clause(AgentTask), AgentTask.content_id == content.id, AgentTask.task_type == TaskType.ASSET_QC,
             AgentTask.status != TaskStatus.CANCELLED,
         )).all()
         checks = [qc for qc in checks if qc.input_data.get("full_generated_assets") is True
@@ -2789,8 +2807,7 @@ def approve_script(
         script_proof = _script_task_proof(script_task)
         if content.production_mode == ProductionMode.IMAGE_ONLY:
             source_media_research(session, content_id, {"upstream_task_ids": {"script": script_task.id}})
-        root = Path(content.content_dir).resolve()
-        executor = MediaExecutor(root)
+        executor = _media_executor(content)
         voice_options = {
             "voice": settings.tts_voice,
             "rate": settings.tts_rate,
@@ -2816,7 +2833,7 @@ def approve_script(
             # Count every persisted start, including orphaned RUNNING work after
             # a crash. The caller's content OS lock excludes another live writer.
             return len(session.exec(select(StageRun.id).where(
-                StageRun.content_id == content_id, StageRun.stage == "voice",
+                current_revision_clause(StageRun), StageRun.content_id == content_id, StageRun.stage == "voice",
                 StageRun.input_hash == voice_input_hash,
             )).all())
 
@@ -2852,7 +2869,7 @@ def approve_script(
             else:
                 session.expire_all()
                 latest = session.exec(select(AgentTask).where(
-                    AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
                     AgentTask.status != TaskStatus.CANCELLED,
                 ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
                 if (not latest or _script_task_proof(latest[0]) != script_proof
@@ -2928,7 +2945,7 @@ def approve_script(
         )
         failed_content_qc = flow.latest_failed_content_qc(content_id)
         latest_content_qc = session.exec(select(AgentTask).where(
-            AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
+            current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_QC,
             AgentTask.status != TaskStatus.CANCELLED,
         ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
         if latest_content_qc is None or failed_content_qc is None or latest_content_qc.id != failed_content_qc.id:
@@ -2948,7 +2965,7 @@ def approve_script(
             artifact.id
             for artifact in session.exec(
                 select(Artifact).where(
-                    Artifact.content_id == content_id,
+                    current_revision_clause(Artifact), Artifact.content_id == content_id,
                     Artifact.artifact_type.in_(["agent_generated_image", "agent_generated_video"]),
                 )
             ).all()
@@ -2998,7 +3015,7 @@ def approve_script(
             content.error_code = content.error_message = None
             session.add(content)
             return flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "visual_plan")
-        scene_data = json.loads((root / "scenes" / "scenes.json").read_text(encoding="utf-8"))
+        scene_data = json.loads((revision_work_root(content) / "scenes" / "scenes.json").read_text(encoding="utf-8"))
         scene_tasks = flow.scene_analysis_tasks(content_id)
         if not scene_tasks:
             raise ValueError("Script and scene task references are required")
@@ -3090,7 +3107,7 @@ def _render_voice_path(
     """Resolve frozen voice bytes through their real Artifact, including verified legacy pairs."""
     root = Path(content.content_dir).resolve()
     voices = session.exec(
-        select(Artifact).where(Artifact.content_id == content.id, Artifact.artifact_type == "voice")
+        select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content.id, Artifact.artifact_type == "voice")
     ).all()
     # Only the single registered legacy alias can predate frozen voice identity.
     if timing_evidence is None and (
@@ -3163,8 +3180,8 @@ def render_content(
         ):
             raise NonRetryableMediaError("Visual plan timing input hash mismatch")
         root = Path(content.content_dir).resolve()
-        executor = MediaExecutor(root)
-        scenes_file = root / "scenes" / "scenes.json"
+        executor = _media_executor(content)
+        scenes_file = revision_work_root(content) / "scenes" / "scenes.json"
         # 图文模式没有原片与场景清单：画面全由图片片段构成。
         scenes = (
             json.loads(scenes_file.read_text(encoding="utf-8"))["scenes"]
@@ -3175,7 +3192,7 @@ def render_content(
         def do_render() -> tuple[Path, Path]:
             image_artifacts = session.exec(
                 select(Artifact).where(
-                    Artifact.content_id == content_id,
+                    current_revision_clause(Artifact), Artifact.content_id == content_id,
                     Artifact.artifact_type.in_(["agent_generated_image", "source_image"]),
                 )
             ).all()
@@ -3192,7 +3209,7 @@ def render_content(
                     mood=bgm_mood,
                 )
             arguments = {
-                "video_path": root / "source" / "original.mp4",
+                "video_path": revision_work_root(content) / "source" / "original.mp4",
                 "voice_path": _render_voice_path(
                     session, content, plan_task.input_data.get("visual_timing_evidence"),
                     plan_task.input_data.get("voice_artifact"),
@@ -3289,7 +3306,7 @@ def render_content(
         final_artifact = session.exec(
             select(Artifact)
             .where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type == "final_video",
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
@@ -3338,7 +3355,14 @@ def render_content(
 
 def _write_acceptance_receipt(session, content, executor, review_input):
     """Each server snapshot owns a new file; a failed acceptance keeps its original bytes."""
-    artifact = Artifact(content_id=content.id, artifact_type="acceptance_input", relative_path="",
+    if content.current_revision_id:
+        from glance_core.task_service import _normalize_content_task_input
+
+        normalized, _ = _normalize_content_task_input(session, TaskType.CONTENT_QC, content.id, review_input)
+        review_input.clear()
+        review_input.update(normalized)
+    artifact = Artifact(content_id=content.id, revision_id=content.current_revision_id,
+                        artifact_type="acceptance_input", relative_path="",
                         sha256="", size_bytes=0, mime_type="application/json", producer_stage="render")
     relative = f"render/acceptance-input-{artifact.id}.json"
     path = (executor.root / relative).resolve()
@@ -3377,7 +3401,7 @@ def _issue_acceptance(
         )
         return flow.mark_status(content.id, ContentStatus.FAILED, "audio_evidence_closed")
     artifact = session.get(Artifact, refs["video_artifact_id"])
-    executor = MediaExecutor(Path(content.content_dir).resolve())
+    executor = _media_executor(content)
 
     def collect_audio():
         evidence = executor.final_audio_evidence(
@@ -3448,7 +3472,7 @@ def _issue_acceptance(
     if visual is not None:
         # A new offer cannot upgrade content that has ever received an older QC contract.
         first_qc = session.exec(select(AgentTask).where(
-            AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_QC,
+            current_revision_clause(AgentTask), AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_QC,
         ).order_by(AgentTask.created_at.asc(), AgentTask.id.asc())).first()
         policy = 2
         if first_qc is not None:
@@ -3492,7 +3516,7 @@ def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> 
     plan = resolved_visual_plan(session, session.get(AgentTask, refs["visual_plan"]))
     if not joint_visual_plan_supported(plan):
         raise ValueError("VISUAL_EVIDENCE_METHOD_UNSUPPORTED")
-    subtitle = root / "transcript" / "narration.ass"
+    subtitle = revision_work_root(content) / "transcript" / "narration.ass"
     if not subtitle.is_file():
         raise ValueError("VISUAL_EVIDENCE_SUBTITLES_MISSING")
     subtitle_bytes = subtitle.read_bytes()
@@ -3504,7 +3528,7 @@ def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> 
     final = (root / artifact.relative_path).resolve()
     parameter_receipt = final.with_name("render-parameters.json")
     output_receipt = final.with_name("outputs.json")
-    canonical_revision = final.parent.parent == root / "render" / "revisions" and final.name == "final.mp4"
+    canonical_revision = final.parent.parent == revision_work_root(content) / "render" / "revisions" and final.name == "final.mp4"
     try:
         stream = next(stream for stream in probe(final)["streams"] if stream.get("codec_type") == "video")
         actual_fps = Fraction(stream["avg_frame_rate"])
@@ -3516,7 +3540,7 @@ def _collect_visual_evidence(session: Session, content: Content, refs: dict) -> 
         if parameter_receipt.is_file():
             parameters = json.loads(parameter_receipt.read_text(encoding="utf-8"))
             revision_id = final.parent.name
-            spec = json.loads((root / "render" / "mpt-project" / "revisions" / revision_id / "spec.json").read_text(
+            spec = json.loads((revision_work_root(content) / "render" / "mpt-project" / "revisions" / revision_id / "spec.json").read_text(
                 encoding="utf-8"))
             if (
                 not canonical_revision or parameters["revision_id"] != revision_id or spec["revision_id"] != revision_id
@@ -3614,7 +3638,7 @@ def transition_pending_acceptance_evidence(session: Session, settings: Settings)
                 previous
                 for previous in session.exec(
                     select(AgentTask).where(
-                        AgentTask.content_id == content.id,
+                        current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                         AgentTask.task_type == TaskType.CONTENT_QC,
                         AgentTask.status.in_([TaskStatus.COMPLETED, TaskStatus.CANCELLED]),
                     )
@@ -3671,7 +3695,7 @@ def transition_pending_acceptance_evidence(session: Session, settings: Settings)
         review_input["research"] = session.get(
             AgentTask, review_input["acceptance_subject"]["research_task_id"]
         ).result_data
-        executor = MediaExecutor(Path(content.content_dir).resolve())
+        executor = _media_executor(content)
         receipt_artifact = _write_acceptance_receipt(session, content, executor, review_input)
         content.current_stage = "audio_evidence_waiting"
         content.error_code = "AUDIO_EVIDENCE_UNAVAILABLE"
@@ -3717,7 +3741,7 @@ def resume_content_acceptance(engine: Engine, settings: Settings, content_id: st
         acceptance_origin(session, content_id)
         receipts = session.exec(
             select(Artifact).where(
-                Artifact.content_id == content_id,
+                current_revision_clause(Artifact), Artifact.content_id == content_id,
                 Artifact.artifact_type == "acceptance_input",
             ).order_by(Artifact.created_at.desc(), Artifact.id.desc())
         ).all()
@@ -3792,7 +3816,7 @@ def approve_final(engine: Engine, settings: Settings, content_id: str, *, automa
                 name for name, value in (("口播脚本", script), ("事实研究", research)) if not value
             )
             raise NonRetryableMediaError(f"打包前置产物缺失（{missing}），请先完成上游阶段")
-        executor = MediaExecutor(Path(content.content_dir).resolve())
+        executor = _media_executor(content)
         package_dir = log_stage(
             session,
             content.id,
@@ -3884,7 +3908,7 @@ def rebuild_cover(
         if normalized is not None and not 1 <= len(normalized) <= 12:
             raise ValueError("封面文案需为 1-12 个字")
         old_cover = session.exec(select(Artifact).where(
-            Artifact.content_id == content_id, Artifact.artifact_type == "cover",
+            current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "cover",
         ).order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
         if old_cover:
             root = Path(content.content_dir).resolve()
@@ -3897,7 +3921,7 @@ def rebuild_cover(
         if not use_source_frame:
             generations = session.exec(
                 select(AgentTask).where(
-                    AgentTask.content_id == content_id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                     AgentTask.task_type == TaskType.ASSET_GENERATE_IMAGE,
                     AgentTask.status != TaskStatus.CANCELLED,
                 ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())

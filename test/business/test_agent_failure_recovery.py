@@ -17,7 +17,7 @@ from sqlmodel import Session, select
 
 from app.business.quarantine import CONTENT_QUARANTINE, TASK_QUARANTINE
 from app.business.runtime import AGENT_CONSUMED, OWNED, FAILURE_RECOVERY
-from test.business.test_content_http import seed_candidate
+from test.business.test_content_http import RESEARCH, seed_candidate
 from test.business.test_deployment_http import app_for, stage
 from test.business.test_discovery_http import ADMIN, make_runtime
 
@@ -41,11 +41,17 @@ def claim_source(http, runtime, *, image=False):
     assert response.status_code == 200
     content_id = response.json()["id"]
     if image:
+        # Source-first work requires real accepted research before a visual plan.
+        researcher = registered_client(http, runtime, "research")
+        research_claim = researcher.claim()
+        assert research_claim["status"] == "CLAIMED"
+        researcher.complete(research_claim["task_id"], research_claim["lease_token"],
+                            researcher.settings.agent_id, RESEARCH)
         with Session(runtime.engine) as session:
             flow = runtime.workflow_service(session)
 
             def completed(kind, inputs, result):
-                task = flow.create_agent_task(content_id, kind, inputs, allow_multiple=True)
+                task = flow.create_agent_task(content_id, kind, inputs, allow_multiple=kind != TaskType.SHORT_SCRIPT)
                 task.status, task.result_data, task.completed_at = TaskStatus.COMPLETED, result, utc_now()
                 session.add(task)
                 for action, metadata in ((OWNED, {"input_hash": task.input_hash}),

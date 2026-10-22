@@ -23,6 +23,7 @@ from glance_media.tts.kokoro import kokoro_parameters, verify_kokoro_bundle
 from sqlmodel import Session, select
 
 from app.business.media_executor import MptMediaExecutor
+from glance_core.content_revision import current_revision_clause
 
 
 def _idle(session, content_id, *, own_stage_id=None):
@@ -32,19 +33,20 @@ def _idle(session, content_id, *, own_stage_id=None):
     if run is not None and run.content_id == content_id and run.state not in {"stopped", "expired"}:
         raise TaskConflictError("VOICE_REBUILD_CONTENT_IN_FLIGHT")
     if session.exec(select(AgentTask.id).where(
-        AgentTask.content_id == content_id,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id,
         AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED, TaskStatus.SUBMITTED]),
     )).first() or session.exec(select(SchedulerOffer.request_id).where(
-        SchedulerOffer.task_id.in_(select(AgentTask.id).where(AgentTask.content_id == content_id)),
+        SchedulerOffer.task_id.in_(select(AgentTask.id).where(current_revision_clause(AgentTask), AgentTask.content_id == content_id)),
         SchedulerOffer.expires_at > utc_now(),
     )).first():
         raise TaskConflictError("VOICE_REBUILD_CONTENT_IN_FLIGHT")
     active = session.exec(select(StageRun).where(
-        StageRun.content_id == content_id, StageRun.status == StageStatus.RUNNING,
+        current_revision_clause(StageRun), StageRun.content_id == content_id, StageRun.status == StageStatus.RUNNING,
     )).all()
     if any(stage.id != own_stage_id for stage in active):
         raise TaskConflictError("VOICE_REBUILD_STAGE_IN_FLIGHT")
-    if session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first():
+    if session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord),
+                                                     PublicationRecord.content_id == content_id)).first():
         raise TaskConflictError("VOICE_REBUILD_PUBLICATION_EXISTS")
     if session.exec(select(AuditEvent.id).where(
         AuditEvent.entity_type == "publish_intent", AuditEvent.metadata_json["content_id"].as_string() == content_id,
@@ -58,7 +60,8 @@ def register_generation(session, settings, content, executor, tts_result, voice,
     path = tts_result.audio_path.with_name("tts_generation_receipt.json")
     if json.loads(path.read_bytes()) != tts_result.provenance:
         raise NonRetryableMediaError("Kokoro generation receipt changed before registration")
-    receipt = Artifact(content_id=content.id, **executor.artifact_metadata(path, "tts_generation_receipt", "voice"))
+    receipt = Artifact(content_id=content.id, revision_id=content.current_revision_id,
+                       **executor.artifact_metadata(path, "tts_generation_receipt", "voice"))
     event, summary = bind_voice_generation(
         session, settings, content, voice, receipt, script, stage,
         operation=operation, previous_plan=previous_plan,
@@ -141,14 +144,14 @@ def approved_script_voice(session, settings, content, executor, script, requeste
             raise NonRetryableMediaError("Script voice prior timing/duration evidence is unavailable")
         return voice, generation, duration, timing
     if session.exec(select(StageRun.id).where(
-        StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.input_hash == requested,
+        current_revision_clause(StageRun), StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.input_hash == requested,
         StageRun.status.in_([StageStatus.RUNNING, StageStatus.SUCCESS]),
     )).first():
         raise NonRetryableMediaError("Script voice prior attempt lacks generation evidence; reconcile before retry")
 
     def generate():
         stage = session.exec(select(StageRun).where(
-            StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.input_hash == requested,
+            current_revision_clause(StageRun), StageRun.content_id == content.id, StageRun.stage == "voice", StageRun.input_hash == requested,
             StageRun.status == StageStatus.RUNNING,
         )).one()
         result = executor.synthesize_voice(script.result_data["full_narration"], **options)
@@ -161,7 +164,8 @@ def approved_script_voice(session, settings, content, executor, script, requeste
         if timing is None:
             raise NonRetryableMediaError("Generated voice timing sidecar is missing")
         revalidate()
-        voice = Artifact(content_id=content.id, **executor.artifact_metadata(result.audio_path, "voice", "voice"))
+        voice = Artifact(content_id=content.id, revision_id=content.current_revision_id,
+                         **executor.artifact_metadata(result.audio_path, "voice", "voice"))
         _, generation = register_generation(session, settings, content, executor, result, voice, script, stage,
                                             operation="script_approval")
         session.add(voice)
@@ -231,14 +235,14 @@ def rebuild_voice(engine, settings, content_id):
             timing = executor.visual_timing_evidence(Path(content.content_dir) / voice.relative_path, duration)
         else:
             if session.exec(select(StageRun.id).where(
-                StageRun.content_id == content_id, StageRun.stage == "voice", StageRun.input_hash == requested,
+                current_revision_clause(StageRun), StageRun.content_id == content_id, StageRun.stage == "voice", StageRun.input_hash == requested,
                 StageRun.status == StageStatus.SUCCESS,
             )).first():
                 raise NonRetryableMediaError("Voice rebuild prior success lacks generation evidence; reconcile before retry")
 
             def generate():
                 stage = session.exec(select(StageRun).where(
-                    StageRun.content_id == content_id, StageRun.stage == "voice", StageRun.input_hash == requested,
+                    current_revision_clause(StageRun), StageRun.content_id == content_id, StageRun.stage == "voice", StageRun.input_hash == requested,
                     StageRun.status == StageStatus.RUNNING,
                 )).one()
                 result = executor.synthesize_voice(narration, **options)
@@ -251,7 +255,7 @@ def rebuild_voice(engine, settings, content_id):
                 if timing is None:
                     raise NonRetryableMediaError("Rebuilt voice timing sidecar is missing")
                 revalidate(own_stage_id=stage.id)
-                voice = Artifact(content_id=content_id, **executor.artifact_metadata(result.audio_path, "voice", "voice"))
+                voice = Artifact(content_id=content_id, revision_id=content.current_revision_id, **executor.artifact_metadata(result.audio_path, "voice", "voice"))
                 _, generation = register_generation(
                     session, current, content, executor, result, voice, script, stage,
                     operation="manual_kokoro_rebuild", previous_plan=old_proof,

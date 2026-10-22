@@ -38,6 +38,43 @@ from app.services.video_project import RENDERER_VERSION, VideoProject, _atomic_j
 class MptMediaExecutor(MediaExecutor):
     OPENING_IDENTITY_OVERLAY = True
 
+    def __init__(self, content_dir: Path, *, revision_id: str | None = None) -> None:
+        super().__init__(content_dir)
+        # Keep root as the public path/asset boundary. Only mutable stage outputs
+        # move; registered relative paths continue to resolve from Content.content_dir.
+        self.work_root = self.root / "revisions" / revision_id if revision_id else self.root
+        self.work_root.mkdir(parents=True, exist_ok=True)
+
+    def _stage_executor(self):
+        return MediaExecutor(self.work_root)
+
+    def acquire(self, *args, **kwargs):
+        return self._stage_executor().acquire(*args, **kwargs)
+
+    def acquire_images(self, images, *, acquisition_id: str | None = None):
+        directory = self.work_root / "research" / acquisition_id if acquisition_id and self.work_root != self.root else self.work_root
+        return MediaExecutor(directory).acquire_images(images)
+
+    def ensure_transcript(self, **kwargs):
+        return self._stage_executor().ensure_transcript(**kwargs)
+
+    def analyze_scenes(self, video_path):
+        path, scenes = self._stage_executor().analyze_scenes(video_path)
+        if self.work_root != self.root:
+            for scene in scenes:
+                scene["thumbnail"] = (self.work_root / scene["thumbnail"]).relative_to(self.root).as_posix()
+            path.write_text(json.dumps({"scenes": scenes}, indent=2), encoding="utf-8")
+        return path, scenes
+
+    def _build_subtitles(self, *args, **kwargs):
+        return self._stage_executor()._build_subtitles(*args, **kwargs)
+
+    def _write_bgm_receipt(self, *args, **kwargs):
+        return self._stage_executor()._write_bgm_receipt(*args, **kwargs)
+
+    def qc(self, *args, **kwargs):
+        return self._stage_executor().qc(*args, **kwargs)
+
     def _local_asset(self, path: Path) -> Path:
         resolved = path.resolve()
         if not resolved.is_relative_to(self.root.resolve()) or not resolved.is_file():
@@ -124,7 +161,7 @@ class MptMediaExecutor(MediaExecutor):
             f"ass=filename='{ffmpeg_filter_path(subtitle_path)}':"
             f"fontsdir='{ffmpeg_filter_path(FONT_ASSET_DIR)}'"
         )
-        prepared = self.root / "render" / "prepared"
+        prepared = self.work_root / "render" / "prepared"
         prepared.mkdir(parents=True, exist_ok=True)
         scene_map = {scene["scene_id"]: scene for scene in scenes}
         source_metadata = probe(self._local_asset(Path(video_path))) if any(
@@ -187,19 +224,19 @@ class MptMediaExecutor(MediaExecutor):
                  *(["-crf", "10" if image_only else "18", "-x264-params", "mbtree=0"]
                    if segment.layout == "image_card" and encoder == "libx264" else []),
                  "-pix_fmt", "yuv420p", str(footage)],
-                cwd=self.root,
+                cwd=self.work_root,
             )
             run_command(
                 ["ffmpeg", "-y", "-i", str(voice_path), "-af",
                  f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS",
                  "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(audio)],
-                cwd=self.root,
+                cwd=self.work_root,
             )
             project_scenes.append({"id": f"scene-{index:03d}", "footage": str(footage),
                                    "audio": str(audio), "frame_count": frame_count})
 
-        project = VideoProject(self.root / "render" / "mpt-project")
-        request = {"project_id": self.root.name, "scenes": project_scenes, "settings": {"fps": fps}}
+        project = VideoProject(self.work_root / "render" / "mpt-project")
+        request = {"project_id": self.work_root.name, "scenes": project_scenes, "settings": {"fps": fps}}
         if all(segment.layout == "image_card" for segment in plan.segments):
             request["settings"]["video_crf"] = 10 if image_only else 18
         if image_only:
@@ -222,7 +259,7 @@ class MptMediaExecutor(MediaExecutor):
         metadata = project.metadata() if (project.directory / "project.json").is_file() else {}
         revision = project.revision() if metadata.get("current_revision") else None
         # Match the frozen request before reusing an interrupted revision; never reuse replacement assets.
-        receipt = self.root / "render" / "mpt-render-request.json"
+        receipt = self.work_root / "render" / "mpt-render-request.json"
         if revision is None or not receipt.is_file() or json.loads(receipt.read_text(encoding="utf-8")) != {
             **request_receipt, "revision_id": revision["revision_id"],
         }:
@@ -233,7 +270,7 @@ class MptMediaExecutor(MediaExecutor):
                 for key in ("footage", "audio"):
                     project._asset_path(scene[key])
         status = project.render(revision["revision_id"], retry=True)
-        output_dir = self.root / "render" / "revisions" / revision["revision_id"]
+        output_dir = self.work_root / "render" / "revisions" / revision["revision_id"]
         output_dir.mkdir(parents=True, exist_ok=True)
         final, preview = output_dir / "final.mp4", output_dir / "preview.mp4"
         output_receipt = output_dir / "outputs.json"
@@ -293,13 +330,13 @@ class MptMediaExecutor(MediaExecutor):
                     command += ["-map", "0:v:0", "-map", "1:a:0"]
                 run_command(command + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                                        "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-                                       str(temporary)], cwd=self.root)
+                                       str(temporary)], cwd=self.work_root)
                 self._promote_immutable_output(temporary, final)
                 preview_temporary = Path(directory) / "preview.mp4"
                 run_command(
                     ["ffmpeg", "-y", "-i", str(final), "-vf", "scale=720:1280", "-c:v", "libx264",
                      "-preset", "veryfast", "-crf", "28", "-c:a", "aac", str(preview_temporary)],
-                    cwd=self.root,
+                    cwd=self.work_root,
                 )
                 self._promote_immutable_output(preview_temporary, preview)
             if bgm_path:

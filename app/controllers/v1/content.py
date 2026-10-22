@@ -22,7 +22,7 @@ from sqlmodel import Session, select
 
 from app.business.auth import require_admin
 from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest, ExpectedHostBinding
-from app.business.requests import PackagedVisualContextRequest, PendingRenderRevisionRequest
+from app.business.requests import PackagedVisualContextRequest, PendingRenderRevisionRequest, PublishedRevisionRequest
 from app.business.runtime import get_runtime, get_session
 from app.business.bundles import sha256_file
 from app.business.quarantine import quarantine_records, task_projection
@@ -277,6 +277,16 @@ def prepare(*, content_id: str, request: Request):
         prepare_content,
         {ContentStatus.PREPARING_CONTEXT, ContentStatus.FAILED},
     )
+
+
+@router.post("/contents/{content_id}/published-revisions")
+def start_published_revision(*, content_id: str, payload: PublishedRevisionRequest, request: Request):
+    try:
+        return get_runtime(request).start_published_revision(content_id, payload.model_dump())
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content not found") from None
+    except (ValueError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
 @router.post("/contents/{content_id}/approve-script")

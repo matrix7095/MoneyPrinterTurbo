@@ -36,7 +36,8 @@ def script_binding(script: AgentTask) -> dict:
 def verified_artifact_bytes(content: Content, artifact: Artifact, *, limit: int | None = None) -> bytes:
     root = Path(content.content_dir).resolve(strict=True)
     relative = artifact.relative_path
-    if (artifact.content_id != content.id or not isinstance(relative, str) or not relative
+    if (artifact.content_id != content.id or artifact.revision_id != content.current_revision_id
+            or not isinstance(relative, str) or not relative
             or "\\" in relative or ":" in relative or relative.startswith("/")
             or any(part in {"", ".", ".."} for part in relative.split("/"))):
         raise ValueError("Voice evidence artifact path is unsafe")
@@ -204,7 +205,7 @@ def bind_voice_generation(
             or not isinstance(parameters, dict) or parameters.get("rate") != settings.tts_rate
             or parameters.get("volume") != settings.tts_volume):
         raise ValueError("Voice generation response does not match requested voice/parameters")
-    if (stage.content_id != content.id or stage.stage != "voice"
+    if (stage.content_id != content.id or stage.revision_id != content.current_revision_id or stage.stage != "voice"
             or stage.status not in {StageStatus.RUNNING, StageStatus.SUCCESS}):
         raise ValueError("Voice generation producing stage is invalid")
     event = AuditEvent(actor_type="executor", actor_id="mpt-kokoro-generation", entity_type="content",
@@ -265,7 +266,8 @@ def verify_voice_generation(
             or not isinstance(signature, str) or not _SHA.fullmatch(signature)
             or not hmac.compare_digest(signature, _signature(settings, event))
             or metadata.get("voice_artifact") != voice_binding
-            or script.content_id != content.id or script.task_type != TaskType.SHORT_SCRIPT
+            or script.content_id != content.id or script.revision_id != content.current_revision_id
+            or script.task_type != TaskType.SHORT_SCRIPT
             or script.status != TaskStatus.COMPLETED or stable_hash(script.input_data) != script.input_hash
             or metadata.get("script") != script_binding(script)):
         raise ValueError("Voice generation signature or approved script binding changed")
@@ -275,6 +277,7 @@ def verify_voice_generation(
     stage = session.get(StageRun, metadata.get("stage_id", ""))
     if (voice is None or receipt is None or artifact_binding(voice) != voice_binding
             or artifact_binding(receipt) != receipt_binding or stage is None or stage.content_id != content.id
+            or stage.revision_id != content.current_revision_id
             or stage.stage != "voice" or stage.status != StageStatus.SUCCESS
             or stage.input_hash != metadata.get("voice_input_hash")):
         raise ValueError("Voice generation registered artifacts/stage changed")

@@ -1,5 +1,7 @@
 """Deterministic binding of a v2 Agent acceptance to its exact current materials."""
 
+from glance_core.content_revision import current_revision_clause, revision_work_root
+
 import hashlib
 import json
 from copy import deepcopy
@@ -80,6 +82,9 @@ def candidate_source_context(session: Session, candidate: Candidate) -> dict:
 
 def _unchanged_material_task(session: Session, task: AgentTask, *, owned: bool = False, consumed: bool = True) -> None:
     from glance_core.task_service import stable_hash
+    from glance_core.content_revision import require_current_revision
+
+    require_current_revision(session, task)
 
     if stable_hash(task.input_data) != task.input_hash:
         raise ValueError("visual material task input changed")
@@ -115,13 +120,13 @@ def prepared_visual_plan(session: Session, plan: AgentTask) -> dict:
 
     _unchanged_material_task(session, plan)
     current = session.exec(select(AgentTask).where(
-        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+        current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     if current is None or current.id != plan.id or plan.status != TaskStatus.COMPLETED:
         raise ValueError("visual material plan missing/stale")
     qc = session.exec(select(AgentTask).where(
-        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
+        current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     result = plan.result_data or {}
@@ -138,7 +143,7 @@ def prepared_visual_plan(session: Session, plan: AgentTask) -> dict:
 
 def _owned_visual_chain(session: Session, plan: AgentTask) -> bool:
     # Downstream publication ownership must not reclassify a portable visual graph.
-    rows = session.exec(select(AgentTask).where(AgentTask.content_id == plan.content_id)).all()
+    rows = session.exec(select(AgentTask).where(current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id)).all()
     ids = [row.id for row in rows if row.id == plan.id or (
         row.task_type in {TaskType.VISUAL_PLAN_QC, TaskType.ASSET_GENERATE_IMAGE, TaskType.ASSET_QC}
         and row.input_data.get("upstream_task_ids", {}).get("visual_plan") == plan.id
@@ -152,7 +157,7 @@ def _owned_visual_chain(session: Session, plan: AgentTask) -> bool:
 def _visual_parent_chain(session: Session, plan: AgentTask, *, owned: bool) -> None:
     def current(kind, ref=None):
         row = session.exec(select(AgentTask).where(
-            AgentTask.content_id == plan.content_id, AgentTask.task_type == kind,
+            current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id, AgentTask.task_type == kind,
             AgentTask.status != TaskStatus.CANCELLED,
         ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
         if row is None or row.status != TaskStatus.COMPLETED or (ref is not None and row.id != ref):
@@ -182,7 +187,7 @@ def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
         _visual_parent_chain(session, plan, owned=True)
     _unchanged_material_task(session, plan, owned=owned)
     plan_qc = session.exec(select(AgentTask).where(
-        AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
+        current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id, AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     consuming = session.info.get("consuming_agent_task_id")
@@ -195,7 +200,7 @@ def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
             raise ValueError("Current VISUAL_PLAN_QC must be completed and passed")
     content = session.get(Content, plan.content_id)
     tasks = session.exec(select(AgentTask).where(
-        AgentTask.content_id == plan.content_id,
+        current_revision_clause(AgentTask), AgentTask.content_id == plan.content_id,
         AgentTask.task_type.in_([TaskType.ASSET_GENERATE_IMAGE, TaskType.ASSET_QC]),
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).all()
@@ -204,6 +209,8 @@ def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
         request = segment.get("asset_request")
         if not request:
             artifact = session.get(Artifact, segment["asset_id"]) if segment.get("asset_id") else None
+            if artifact is not None and artifact.revision_id != content.current_revision_id:
+                raise ValueError("visual material asset belongs to a different content revision")
             if artifact is not None and artifact.artifact_type == "agent_generated_image":
                 material = generated_image_material(session, content, artifact.id)
                 reused[index] = material
@@ -238,6 +245,7 @@ def resolved_visual_plan(session: Session, plan: AgentTask) -> dict:
             raise ValueError("visual material asset QC coverage changed")
         artifact = session.get(Artifact, image.get("artifact_id"))
         if (content is None or artifact is None or artifact.content_id != content.id
+                or artifact.revision_id != content.current_revision_id
                 or artifact.artifact_type != "agent_generated_image" or not artifact.mime_type.startswith("image/")
                 or artifact.producer_stage != generation.id):
             raise ValueError("visual material artifact lineage changed")
@@ -324,6 +332,7 @@ def source_context(
         if (
             row is None
             or row.content_id != content_id
+            or row.revision_id != content.current_revision_id
             or row.task_type != kind
             or row.status != TaskStatus.COMPLETED
             or stable_hash(row.input_data) != row.input_hash
@@ -441,14 +450,16 @@ def source_context(
             references.append({"segment_index": index, "reference_artifact_id": ref})
     reference_ids = {r["reference_artifact_id"] for r in references}
     required_images = assets | reference_ids
-    artifacts = session.exec(select(Artifact).where(Artifact.content_id == content_id)).all()
+    artifacts = session.exec(select(Artifact).where(current_revision_clause(Artifact), Artifact.content_id == content_id)).all()
     # render_content passes this canonical acquired file to MediaExecutor. Other
     # content-owned source videos are NOT necessarily used, so must not be frozen.
     source_videos = [
         a
         for a in artifacts
         if a.artifact_type == "source_video"
-        and a.relative_path.replace("\\", "/") == "source/original.mp4"
+        and a.relative_path.replace("\\", "/") == (
+            revision_work_root(content) / "source" / "original.mp4"
+        ).relative_to(Path(content.content_dir).resolve()).as_posix()
     ]
     if context["scenes"] and len(source_videos) != 1:
         gaps.append("artifact: acquired render source missing/ambiguous")
@@ -574,9 +585,11 @@ def generated_image_material(session: Session, content: Content, artifact_id: st
     if (
         artifact is None
         or artifact.content_id != content.id
+        or artifact.revision_id != content.current_revision_id
         or artifact.artifact_type != "agent_generated_image"
         or generation is None
         or generation.content_id != content.id
+        or generation.revision_id != content.current_revision_id
         or generation.task_type != TaskType.ASSET_GENERATE_IMAGE
         or not completed_image_origin(session, generation)
         or stable_hash(generation.input_data) != generation.input_hash
@@ -653,7 +666,7 @@ def visual_review_source_context(
     content = session.get(Content, content_id)
     plan = session.get(AgentTask, refs.get("visual_plan")) if isinstance(refs.get("visual_plan"), str) else None
     current = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.VISUAL_PLAN,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     if (content is None or content.production_mode != ProductionMode.IMAGE_ONLY or plan is None
@@ -697,7 +710,7 @@ def visual_review_source_context(
     research = session.get(AgentTask, script.input_data.get("upstream_task_ids", {}).get("research"))
     receipt(research, TaskType.CONTENT_RESEARCH)
     script_qc = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SCRIPT_QC,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SCRIPT_QC,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc())).first()
     receipt(script_qc, TaskType.SCRIPT_QC)
@@ -734,7 +747,7 @@ def visual_review_source_context(
     if include_references:
         context["reference_uses"] = []
     checks = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_QC,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.ASSET_QC,
         AgentTask.status.in_([TaskStatus.COMPLETED, TaskStatus.CANCELLED]),
         AgentTask.created_at < plan.created_at,
     ).order_by(AgentTask.created_at, AgentTask.id)).all()
@@ -841,7 +854,7 @@ def _original_image_lineage(
     asset_checks = session.exec(
         select(AgentTask)
         .where(
-            AgentTask.content_id == content.id,
+            current_revision_clause(AgentTask), AgentTask.content_id == content.id,
             AgentTask.task_type == TaskType.ASSET_QC,
             AgentTask.status.in_([TaskStatus.COMPLETED, TaskStatus.CANCELLED]),
         )
@@ -1064,13 +1077,15 @@ def acceptance_subject(
             }
         ),
     }
+    if content.current_revision_id:
+        subject["content_revision_id"] = content.current_revision_id
     tasks = {}
     for key, kind in (("script", TaskType.SHORT_SCRIPT), ("visual_plan", TaskType.VISUAL_PLAN)):
         task = session.get(AgentTask, refs.get(key)) if isinstance(refs.get(key), str) else None
         latest = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content.id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                 AgentTask.task_type == kind,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -1095,6 +1110,7 @@ def acceptance_subject(
     if (
         research is None
         or research.content_id != content.id
+        or research.revision_id != content.current_revision_id
         or research.task_type != TaskType.CONTENT_RESEARCH
         or research.status != TaskStatus.COMPLETED
         or stable_hash(research.input_data) != research.input_hash
@@ -1109,7 +1125,7 @@ def acceptance_subject(
         qc = session.exec(
             select(AgentTask)
             .where(
-                AgentTask.content_id == content.id,
+                current_revision_clause(AgentTask), AgentTask.content_id == content.id,
                 AgentTask.task_type == kind,
                 AgentTask.status == TaskStatus.COMPLETED,
             )
@@ -1128,7 +1144,7 @@ def acceptance_subject(
     latest_artifact = session.exec(
         select(Artifact)
         .where(
-            Artifact.content_id == content.id,
+            current_revision_clause(Artifact), Artifact.content_id == content.id,
             Artifact.artifact_type == "final_video",
         )
         .order_by(Artifact.created_at.desc(), Artifact.id.desc())

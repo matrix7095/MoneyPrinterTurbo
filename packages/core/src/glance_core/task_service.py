@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glance_core.content_revision import current_revision_clause, is_current_revision
+
 import hashlib
 import json
 from datetime import timedelta
@@ -209,7 +211,7 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
         raise TaskConflictError("SOURCE_MEDIA_SCRIPT_LINEAGE_REQUIRED")
     script = session.get(AgentTask, script_id)
     scripts = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
     current_script = scripts[0] if scripts else None
@@ -224,7 +226,7 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
     research_id = bound_id
     research = session.get(AgentTask, research_id) if isinstance(research_id, str) else None
     researches = session.exec(select(AgentTask).where(
-        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
+        current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
         AgentTask.status != TaskStatus.CANCELLED,
     ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
     current = researches[0] if researches else None
@@ -261,6 +263,7 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
     for row in rows:
         artifact = session.get(Artifact, row.get("artifact_id"))
         if (row.get("url") not in urls or artifact is None or artifact.content_id != content_id
+                or artifact.revision_id != research.revision_id
                 or artifact.artifact_type != "source_image" or artifact.sha256 != row.get("sha256")
                 or artifact.relative_path != row.get("relative_path")):
             raise TaskConflictError("SOURCE_MEDIA_ACQUIRED_IMAGE_CHANGED")
@@ -307,7 +310,7 @@ def _source_media_priority_errors(session: Session, task: AgentTask, result: dic
     if declared - source_ids or declared != source_ids.intersection(allowed) or (source_ids and not declared):
         errors.append({"path": ["source_images"], "message": "原图必须是本内容已登记且在可用白名单中的 source_image"})
     unrelated = set(session.exec(select(Artifact.id).where(
-        Artifact.content_id == task.content_id, Artifact.artifact_type == "source_image",
+        current_revision_clause(Artifact), Artifact.content_id == task.content_id, Artifact.artifact_type == "source_image",
         Artifact.id.in_(allowed),
     )).all()) - source_ids
     if unrelated:
@@ -381,6 +384,10 @@ def publish_target_for_task(task: AgentTask) -> dict[str, str]:
         raise TaskConflictError("Publish intent is missing platform, account, or content")
     if not target["video_artifact_id"] and not target["video_sha256"]:
         raise TaskConflictError("Publish intent is missing video artifact identity")
+    if task.revision_id:
+        if input_data.get("content_revision_id") != task.revision_id:
+            raise TaskConflictError("CONTENT_REVISION_INPUT_CHANGED")
+        target["content_revision_id"] = task.revision_id
     target["intent_key"] = stable_hash({key: target[key] for key in target if key != "intent_key"})
     return target
 
@@ -431,6 +438,42 @@ def _normalize_content_task_input(
     if content is None:
         return normalized, changed
 
+    if "content_revision_id" in normalized and normalized["content_revision_id"] != content.current_revision_id:
+        raise TaskConflictError("CONTENT_REVISION_INPUT_CHANGED")
+    if content.current_revision_id:
+        normalized["content_revision_id"] = content.current_revision_id
+        changed.append("content_revision_id")
+        revision = session.get(ContentRevision, content.current_revision_id)
+        if revision is None or revision.content_id != content_id:
+            raise TaskConflictError("CONTENT_REVISION_HEAD_MISSING")
+        context = {"id": revision.id, "revision_no": revision.revision_no,
+                   "parent_revision_id": revision.parent_revision_id,
+                   "previous_snapshot_sha256": revision.subject_sha256,
+                   "feedback": revision.feedback_json.get("feedback", "")}
+        if "content_revision" in normalized and normalized["content_revision"] != context:
+            raise TaskConflictError("CONTENT_REVISION_FEEDBACK_CHANGED")
+        normalized["content_revision"] = context
+        changed.append("content_revision")
+        refs = normalized.get("upstream_task_ids") or {}
+        for value in refs.values():
+            for task_id in value if isinstance(value, list) else [value]:
+                parent = session.get(AgentTask, task_id) if isinstance(task_id, str) else None
+                if (parent is None or parent.content_id != content_id
+                        or parent.revision_id != content.current_revision_id):
+                    raise TaskConflictError("CONTENT_REVISION_UPSTREAM_CHANGED")
+        asset_ids = set(normalized.get("allowed_asset_ids") or [])
+        asset_ids.update(normalized.get("allowed_reference_artifact_ids") or [])
+        for field in ("video_artifact_id", "cover_artifact_id"):
+            if normalized.get(field):
+                asset_ids.add(normalized[field])
+        if isinstance(normalized.get("voice_artifact"), dict) and normalized["voice_artifact"].get("id"):
+            asset_ids.add(normalized["voice_artifact"]["id"])
+        for artifact_id in asset_ids:
+            artifact = session.get(Artifact, artifact_id)
+            if (artifact is None or artifact.content_id != content_id
+                    or artifact.revision_id != content.current_revision_id):
+                raise TaskConflictError("CONTENT_REVISION_ARTIFACT_CHANGED")
+
     if task_type in {
         TaskType.CONTENT_RESEARCH,
         TaskType.SHORT_SCRIPT,
@@ -457,7 +500,7 @@ def _normalize_content_task_input(
                 allowed = set(normalized.get("allowed_asset_ids") or [])
                 declared = {row.get("artifact_id") for row in normalized.get("source_images", []) if isinstance(row, dict)}
                 offered = set(session.exec(select(Artifact.id).where(
-                    Artifact.content_id == content_id, Artifact.artifact_type == "source_image", Artifact.id.in_(allowed),
+                    current_revision_clause(Artifact), Artifact.content_id == content_id, Artifact.artifact_type == "source_image", Artifact.id.in_(allowed),
                 )).all())
                 if (declared != source_ids.intersection(allowed) or offered - source_ids
                         or (source_ids and not declared)):
@@ -554,7 +597,8 @@ class AgentTaskService:
         metadata: dict[str, Any] | None, target: dict[str, str]
     ) -> bool:
         return metadata is not None and all(
-            metadata.get(field) == target[field] for field in _PUBLISH_TARGET_FIELDS
+            metadata.get(field) == target[field] for field in (*_PUBLISH_TARGET_FIELDS,
+                *(("content_revision_id",) if "content_revision_id" in target else ()))
         )
 
     def _publish_intent_registered(self, target: dict[str, str]) -> bool:
@@ -675,6 +719,14 @@ class AgentTaskService:
             if task.attempt_started_at is None:
                 raise TaskConflictError("Confirm claim before registering publish intent")
 
+            from glance_core.content_revision import is_current_revision
+
+            if not is_current_revision(self.session, task):
+                raise TaskConflictError("CONTENT_REVISION_STALE")
+            from glance_core.content_revision import require_reconciled_publish_intents
+
+            require_reconciled_publish_intents(self.session, task.content_id)
+
             event = AuditEvent(
                 actor_type="agent",
                 actor_id=agent_id,
@@ -712,7 +764,14 @@ class AgentTaskService:
             target = publish_target_for_task(task)
         except TaskConflictError:
             return None
-        if self._latest_publish_intent(target["intent_key"]) is None:
+        latest = self._latest_publish_intent(target["intent_key"])
+        if latest is None:
+            return None
+        # Lease diagnostics cannot undo a reconciled external outcome. Explicit
+        # reconciliation still accepts separately validated observed outcomes.
+        previous_metadata = latest.metadata_json if isinstance(latest.metadata_json, dict) else {}
+        if (previous_metadata.get("status") in {"PUBLISHED", "FAILED"}
+                and status.strip().upper() in {"INTERRUPTED", "RECONCILE_REQUIRED", "AUTHORIZED"}):
             return None
         previous_events = self.session.exec(
             select(AuditEvent).where(
@@ -813,6 +872,7 @@ class AgentTaskService:
         if (
             evidence is None
             or evidence.content_id != task.content_id
+            or evidence.revision_id != task.revision_id
             or evidence.artifact_type != "publish_evidence"
             or evidence.producer_stage != task.id
         ):
@@ -820,6 +880,10 @@ class AgentTaskService:
         target = publish_target_for_task(task)
         if not self._publish_intent_registered(target):
             raise TaskConflictError("PUBLISHED requires a registered publish submit intent")
+        from glance_core.content_revision import require_distinct_publication_identity
+
+        require_distinct_publication_identity(self.session, task.content_id, task.revision_id,
+            target["platform"], external_id, external_url)
         return target
 
     def create_task(
@@ -862,6 +926,8 @@ class AgentTaskService:
         task = AgentTask(
             task_type=task_type,
             content_id=content_id,
+            revision_id=(self.session.get(Content, content_id).current_revision_id
+                         if content_id and self.session.get(Content, content_id) else None),
             priority=priority,
             prompt_name=task_type.value,
             prompt_version=prompt_version,
@@ -988,6 +1054,7 @@ class AgentTaskService:
             candidate = self.session.get(AgentTask, task_id)
             eligible = (
                 candidate is not None
+                and (not candidate.content_id or is_current_revision(self.session, candidate))
                 and candidate.task_type in capabilities
                 and candidate.attempt < candidate.max_attempts
                 and (candidate.not_before is None or as_utc(candidate.not_before) <= now)
@@ -1009,6 +1076,7 @@ class AgentTaskService:
             query = (
                 select(AgentTask)
                 .where(
+                    current_revision_clause(AgentTask),
                     AgentTask.task_type.in_(capabilities),
                     AgentTask.attempt < AgentTask.max_attempts,
                     role_filter,
@@ -1163,6 +1231,12 @@ class AgentTaskService:
             raise TaskConflictError("Lease is missing, invalid, or expired")
         if task.assigned_agent_id != agent_id:
             raise TaskConflictError("Task belongs to another agent")
+
+        if task.content_id and task.task_type != TaskType.DOUYIN_PUBLISH:
+            from glance_core.content_revision import is_current_revision
+
+            if not is_current_revision(self.session, task):
+                raise TaskConflictError("CONTENT_REVISION_STALE")
         confirmed = task.attempt_started_at is None
         if confirmed:
             task.attempt += 1
@@ -1306,6 +1380,8 @@ class AgentTaskService:
         )
         if task.assigned_agent_id != agent_id:
             raise TaskConflictError("Task belongs to another agent")
+        if task.content_id and task.task_type != TaskType.DOUYIN_PUBLISH and not is_current_revision(self.session, task):
+            raise TaskConflictError("CONTENT_REVISION_STALE")
 
         expected_subject = str((task.input_data or {}).get("_expected_subject_sha256") or "")
         if expected_subject and task.content_id:
@@ -1374,6 +1450,7 @@ class AgentTaskService:
             if (
                 artifact is None
                 or artifact.content_id != task.content_id
+                or artifact.revision_id != task.revision_id
                 or artifact.artifact_type != "agent_generated_video"
                 or artifact.producer_stage != task.id
             ):
@@ -1405,6 +1482,7 @@ class AgentTaskService:
                 if (
                     evidence is None
                     or evidence.content_id != task.content_id
+                    or evidence.revision_id != task.revision_id
                     or evidence.artifact_type != "publish_evidence"
                     or evidence.producer_stage != task.id
                 ):
@@ -1423,20 +1501,12 @@ class AgentTaskService:
                 )
             if result.get("status") == "PUBLISHED":
                 try:
-                    target = publish_target_for_task(task)
+                    self.validate_published_publish_result(task,
+                        external_id=str(result.get("external_id") or ""),
+                        external_url=str(result.get("external_url") or ""),
+                        evidence_artifact_id=evidence_id)
                 except TaskConflictError as exc:
                     errors.append({"path": ["status"], "message": str(exc)})
-                else:
-                    if not self._publish_intent_registered(target):
-                        errors.append(
-                            {
-                                "path": ["status"],
-                                "message": (
-                                    "PUBLISHED 必须先登记 publish submit intent；"
-                                    "未登记的发布结果只能按 UNKNOWN/NEEDS_USER 处理"
-                                ),
-                            }
-                        )
         if not errors and task.task_type == TaskType.ASSET_GENERATE_IMAGE:
             # V8：一任务多图。requests[] 与 images[] 按 segment_index 一一对应；
             # 旧式单 request 与手工任务降级为单段 requests 同法校验。
@@ -1474,6 +1544,7 @@ class AgentTaskService:
                 if (
                     artifact is None
                     or artifact.content_id != task.content_id
+                    or artifact.revision_id != task.revision_id
                     or artifact.artifact_type != "agent_generated_image"
                     or artifact.producer_stage != task.id
                 ):
@@ -1775,6 +1846,11 @@ class AgentTaskService:
         message: str,
         attempt: int | None = None,
     ) -> AgentTask:
+        existing = self.session.get(AgentTask, task_id)
+        if existing is not None and existing.content_id and not is_current_revision(self.session, existing):
+            # Reject before both the lease path and its late-report fallback;
+            # neither may rewrite a previous published revision's task or intent.
+            raise TaskConflictError("CONTENT_REVISION_STALE")
         try:
             task = self.require_lease(
                 task_id,
@@ -1919,6 +1995,8 @@ class AgentTaskService:
         task = self.session.get(AgentTask, task_id)
         if task is None:
             raise KeyError(task_id)
+        if task.content_id and not is_current_revision(self.session, task):
+            raise TaskConflictError("CONTENT_REVISION_STALE")
         if task.status not in {TaskStatus.FAILED, TaskStatus.REJECTED, TaskStatus.CANCELLED}:
             raise TaskConflictError(f"Cannot requeue a task in status {task.status.value}")
         if task.status == TaskStatus.REJECTED:

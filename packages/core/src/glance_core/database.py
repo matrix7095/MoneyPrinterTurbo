@@ -35,10 +35,22 @@ def build_engine(settings: Settings) -> Engine:
 def create_db(engine: Engine) -> None:
     """Create the current schema once at process startup.
 
-    Glance 尚未上线，不维护历史微迁移和全表回填；Schema 变更直接进入模型定义。
+    SQLite upgrades are additive and idempotent; immutable historical inputs are not backfilled.
     """
     SQLModel.metadata.create_all(engine)
     if engine.dialect.name == "sqlite":
+        # Add nullable identities only: legacy immutable task inputs/results are untouched.
+        for table, column in (("content", "current_revision_id"),
+                              ("agent_task", "revision_id"), ("artifact", "revision_id"),
+                              ("stage_run", "revision_id"), ("publication_record", "revision_id"),
+                              ("content_revision", "request_key")):
+            if column not in {item["name"] for item in inspect(engine).get_columns(table)}:
+                with engine.begin() as connection:
+                    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} VARCHAR")
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS ix_{table}_{column} ON {table} ({column})"
+                )
         columns = {column["name"] for column in inspect(engine).get_columns("candidate")}
         if "video_url" not in columns:
             with engine.begin() as connection:
@@ -144,10 +156,30 @@ def create_db(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS ix_audit_event_action_created "
             "ON audit_event (action, created_at)"
         )
+        connection.exec_driver_sql("DROP INDEX IF EXISTS ux_publication_record_content_platform")
         connection.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_publication_record_content_platform "
-            "ON publication_record (content_id, platform)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_publication_record_legacy_content_platform "
+            "ON publication_record (content_id, platform) WHERE revision_id IS NULL"
         )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_publication_record_revision_platform "
+            "ON publication_record (content_id, revision_id, platform) WHERE revision_id IS NOT NULL"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_content_revision_number "
+            "ON content_revision (content_id, revision_no)"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_content_revision_request "
+            "ON content_revision (content_id, request_key) WHERE request_key IS NOT NULL"
+        )
+        if engine.dialect.name == "sqlite":
+            for operation in ("UPDATE", "DELETE"):
+                connection.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS content_revision_immutable_{operation.lower()} "
+                    f"BEFORE {operation} ON content_revision BEGIN "
+                    "SELECT RAISE(ABORT, 'ContentRevision is immutable'); END"
+                )
     from glance_core.capabilities import ensure_builtin_providers
 
     with Session(engine) as session:

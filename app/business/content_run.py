@@ -57,6 +57,7 @@ class ContentRun(BaseModel):
     version: Literal[1] = 1
     run_id: str = Field(pattern=r"^run_[0-9a-f]{32}$")
     content_id: str
+    revision_id: str | None = None
     generation: int = Field(ge=1)
     state: Literal["awaiting_host", "running", "draining", "stopped", "expired"]
     created_at: str
@@ -194,6 +195,8 @@ def require_run(session, run_id, generation=None):
         raise TaskConflictError("CONTENT_RUN_NOT_ACTIVE")
     assert_allowed(session, content_id=run.content_id)
     content = session.get(Content, run.content_id)
+    if content is not None and run.revision_id != content.current_revision_id:
+        raise TaskConflictError("CONTENT_RUN_REVISION_CHANGED")
     if content is None or content.business_status in {
         ContentStatus.ARCHIVED,
         ContentStatus.PUBLISHED,
@@ -250,6 +253,8 @@ def start_run(session, content_id, *, allow_local_image_adaptation=None, executi
         if existing.state in {"awaiting_host", "running", "draining"}:
             if existing.content_id != content_id:
                 raise TaskConflictError("CONTENT_RUN_ALREADY_ACTIVE")
+            if existing.revision_id != content.current_revision_id:
+                raise TaskConflictError("CONTENT_RUN_REVISION_CHANGED")
             if allow_local_image_adaptation is not None and existing.allow_local_image_adaptation != allow_local_image_adaptation:
                 raise TaskConflictError("CONTENT_RUN_PERMISSION_FROZEN")
             session.commit()
@@ -282,6 +287,7 @@ def start_run(session, content_id, *, allow_local_image_adaptation=None, executi
     run = ContentRun(
         run_id="run_" + secrets.token_hex(16),
         content_id=content_id,
+        revision_id=content.current_revision_id,
         generation=existing.generation + 1 if existing else 1,
         state="awaiting_host",
         created_at=now.isoformat(),
@@ -418,6 +424,7 @@ def authorize_claim(session, *, agent_id, task_id, role_id, runtime_info, scope)
         or task is None
         or task.status != TaskStatus.PENDING
         or task.content_id != run.content_id
+        or task.revision_id != run.revision_id
         or worker.get("run_id") != run_id
         or worker.get("run_generation") != generation
         or worker.get("content_id") != run.content_id

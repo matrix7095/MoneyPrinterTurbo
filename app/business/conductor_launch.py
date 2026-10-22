@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from glance_core.database import begin_immediate
+from glance_core.content_revision import current_revision_clause
 from glance_core.models import (
     AgentSubmission, AgentTask, AgentWorker, AuditEvent, Content, PublicationRecord,
     RuntimeSetting, SchedulerOffer, TaskStatus, TaskType, as_utc, utc_now,
@@ -504,10 +505,10 @@ def reconcile_host_loss(runtime, session, content_id, *, expected):
                 raise TaskConflictError("CONTENT_EXECUTION_JOURNAL_CHANGED")
             if (
                 session.exec(select(AgentTask.id).where(
-                    AgentTask.content_id == content_id,
+                    current_revision_clause(AgentTask), AgentTask.content_id == content_id,
                     (AgentTask.task_type == TaskType.DOUYIN_PUBLISH) | AgentTask.status.in_([TaskStatus.LEASED, TaskStatus.SUBMITTED]),
                 )).first()
-                or session.exec(select(PublicationRecord.id).where(PublicationRecord.content_id == content_id)).first()
+                or session.exec(select(PublicationRecord.id).where(current_revision_clause(PublicationRecord), PublicationRecord.content_id == content_id)).first()
             ):
                 raise TaskConflictError("CONTENT_EXECUTION_BUSINESS_WORK_UNRESOLVED")
             request_id, task = _reconcilable_intents(session, run, journal)

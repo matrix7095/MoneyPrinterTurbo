@@ -559,6 +559,8 @@ async def upload_generated_artifact(
     content = session.get(Content, task.content_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Content not found")
+    if task.revision_id != content.current_revision_id:
+        raise HTTPException(status_code=409, detail="CONTENT_REVISION_STALE")
     digest = hashlib.sha256(body).hexdigest()
     root = content_root(content, get_runtime(request))
     relative_path = Path("agent-assets") / task.id / f"{digest}{extension}"
@@ -579,6 +581,7 @@ async def upload_generated_artifact(
     ).first()
     artifact = existing or Artifact(
         content_id=task.content_id,
+        revision_id=task.revision_id,
         artifact_type=artifact_type,
         relative_path=relative_path.as_posix(),
         sha256=digest,

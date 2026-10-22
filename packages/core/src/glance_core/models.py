@@ -238,6 +238,7 @@ class Content(SQLModel, table=True):
     script_version: int = 0
     template_version: str = "p0-v1"
     content_dir: str
+    current_revision_id: str | None = Field(default=None, index=True)
     cover_title_override: str = ""
     error_code: str | None = None
     error_message: str | None = Field(default=None, sa_column=Column(Text))
@@ -250,6 +251,7 @@ class StageRun(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("stage"), primary_key=True)
     content_id: str = Field(foreign_key="content.id", index=True)
+    revision_id: str | None = Field(default=None, index=True)
     stage: str = Field(index=True)
     status: StageStatus = Field(default=StageStatus.PENDING, index=True)
     input_hash: str
@@ -265,6 +267,7 @@ class Artifact(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("asset"), primary_key=True)
     content_id: str = Field(foreign_key="content.id", index=True)
+    revision_id: str | None = Field(default=None, index=True)
     artifact_type: str = Field(index=True)
     relative_path: str
     sha256: str
@@ -279,6 +282,7 @@ class AgentTask(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("agt"), primary_key=True)
     content_id: str | None = Field(default=None, index=True)
+    revision_id: str | None = Field(default=None, index=True)
     task_type: TaskType = Field(index=True)
     status: TaskStatus = Field(default=TaskStatus.PENDING, index=True)
     priority: int = Field(default=0, index=True)
@@ -402,6 +406,7 @@ class PublicationRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("pub"), primary_key=True)
     content_id: str = Field(foreign_key="content.id", index=True)
+    revision_id: str | None = Field(default=None, index=True)
     mode: PublicationMode = Field(index=True)
     platform: str = Field(index=True)
     external_url: str = ""
@@ -441,6 +446,7 @@ class ContentRevision(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("rev"), primary_key=True)
     content_id: str = Field(foreign_key="content.id", index=True)
     revision_no: int = Field(default=1, index=True)
+    request_key: str | None = Field(default=None, index=True)
     revision_type: str = Field(default="WORKFLOW", index=True)
     subject_sha256: str = Field(index=True)
     parent_revision_id: str | None = Field(default=None, index=True)

@@ -11,6 +11,15 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PublishedRevisionRequest(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_key: str = Field(min_length=1, max_length=160)
+    expected_revision_id: str | None
+    publication_id: str = Field(min_length=1, max_length=100)
+    feedback: str = Field(min_length=1, max_length=10000)
+
+
 class DispatchRequest(StrictRequest):
     agent_id: str = Field(min_length=1)
     role_id: AgentRole | None = None
