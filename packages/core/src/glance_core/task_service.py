@@ -30,7 +30,7 @@ from glance_core.models import (
     utc_now,
 )
 from glance_core.security import hash_secret, issue_token, verify_secret
-from glance_core.task_schemas import is_blocked_discovery_url, result_model_for, schema_for
+from glance_core.task_schemas import ContentResearchResult, is_blocked_discovery_url, result_model_for, schema_for
 
 
 class TaskConflictError(RuntimeError):
@@ -198,6 +198,131 @@ def _generated_segment_errors(task: AgentTask, segments: list[dict[str, Any]]) -
     return errors
 
 
+def source_media_research(session: Session, content_id: str, inputs: dict) -> tuple[AgentTask, dict, list[dict]]:
+    """Resolve the accepted research and its acquired images from server-owned lineage."""
+    refs = inputs.get("upstream_task_ids") or {}
+    if not isinstance(refs, dict):
+        raise TaskConflictError("SOURCE_MEDIA_SCRIPT_LINEAGE_REQUIRED")
+    research_id = refs.get("research")
+    script_id = refs.get("script")
+    if not isinstance(script_id, str) or not script_id.strip():
+        raise TaskConflictError("SOURCE_MEDIA_SCRIPT_LINEAGE_REQUIRED")
+    script = session.get(AgentTask, script_id)
+    scripts = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.SHORT_SCRIPT,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+    current_script = scripts[0] if scripts else None
+    if (script is None or script.content_id != content_id or script.task_type != TaskType.SHORT_SCRIPT
+            or current_script is None or current_script.id != script.id
+            or (len(scripts) == 2 and scripts[0].created_at == scripts[1].created_at)
+            or script.status != TaskStatus.COMPLETED or stable_hash(script.input_data) != script.input_hash):
+        raise TaskConflictError("SOURCE_MEDIA_SCRIPT_LINEAGE_CHANGED")
+    bound_id = (script.input_data.get("upstream_task_ids") or {}).get("research")
+    if research_id and research_id != bound_id:
+        raise TaskConflictError("SOURCE_MEDIA_RESEARCH_LINEAGE_CHANGED")
+    research_id = bound_id
+    research = session.get(AgentTask, research_id) if isinstance(research_id, str) else None
+    researches = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
+        AgentTask.status != TaskStatus.CANCELLED,
+    ).order_by(AgentTask.created_at.desc(), AgentTask.id.desc()).limit(2)).all()
+    current = researches[0] if researches else None
+    if (research is None or current is None or research.id != current.id or research.content_id != content_id
+            or (len(researches) == 2 and researches[0].created_at == researches[1].created_at)
+            or research.task_type != TaskType.CONTENT_RESEARCH or research.status != TaskStatus.COMPLETED
+            or stable_hash(research.input_data) != research.input_hash):
+        raise TaskConflictError("SOURCE_MEDIA_RESEARCH_REQUIRED: 先完成当前产品素材盘点研究")
+    accepted = session.exec(select(AgentSubmission).where(
+        AgentSubmission.task_id == research.id, AgentSubmission.attempt == research.attempt,
+        AgentSubmission.validation_status == "ACCEPTED",
+    )).all()
+    if (len(accepted) != 1 or accepted[0].agent_id != research.assigned_agent_id
+            or accepted[0].result_hash != stable_hash(research.result_data)):
+        raise TaskConflictError("SOURCE_MEDIA_ACCEPTED_RESEARCH_CHANGED")
+    try:
+        value = ContentResearchResult.model_validate(research.result_data).model_dump(mode="json")
+        search = value.get("source_media_search")
+        if search is None or (not value["source_images"] and not search["image_gap_reason"]):
+            raise ValueError("素材盘点缺失")
+    except ValueError as exc:
+        raise TaskConflictError("SOURCE_MEDIA_AUDIT_REQUIRED: 先执行补充研究，不得沿用未盘点结果") from exc
+    receipts = session.exec(select(AuditEvent).where(
+        AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == research.id,
+        AuditEvent.actor_type == "system", AuditEvent.actor_id == "pipeline",
+        AuditEvent.action == "source_media_images_acquired",
+    )).all()
+    if not value["source_images"] and not receipts:
+        return research, search, []
+    if len(receipts) != 1 or receipts[0].metadata_json.get("result_hash") != accepted[0].result_hash:
+        raise TaskConflictError("SOURCE_MEDIA_ACQUISITION_REQUIRED: 图片下载结果尚未登记")
+    rows = receipts[0].metadata_json.get("images", [])
+    urls = {item["url"] for item in value["source_images"]}
+    for row in rows:
+        artifact = session.get(Artifact, row.get("artifact_id"))
+        if (row.get("url") not in urls or artifact is None or artifact.content_id != content_id
+                or artifact.artifact_type != "source_image" or artifact.sha256 != row.get("sha256")
+                or artifact.relative_path != row.get("relative_path")):
+            raise TaskConflictError("SOURCE_MEDIA_ACQUIRED_IMAGE_CHANGED")
+    if receipts[0].metadata_json.get("unavailable_image_urls") != [
+        item["url"] for item in value["source_images"] if item["url"] not in {row["url"] for row in rows}
+    ]:
+        raise TaskConflictError("SOURCE_MEDIA_ACQUISITION_OUTCOME_CHANGED")
+    return research, search, rows
+
+
+def source_media_acquisition(research: AgentTask, rows: list[dict]) -> dict:
+    requested = [item["url"] for item in research.result_data.get("source_images", [])]
+    downloaded = [row["url"] for row in rows]
+    return {"research_task_id": research.id, "research_result_hash": stable_hash(research.result_data),
+            "requested_image_urls": requested, "downloaded_image_urls": downloaded,
+            "unavailable_image_urls": [url for url in requested if url not in downloaded]}
+
+
+def _source_media_priority_errors(session: Session, task: AgentTask, result: dict) -> list[dict]:
+    inputs = task.input_data or {}
+    if inputs.get("production_mode") != "image_only" or "source_media_priority_version" not in inputs:
+        return []
+    if type(inputs["source_media_priority_version"]) is not int or inputs["source_media_priority_version"] != 1:
+        return [{"path": ["source_media_priority_version"], "message": "不支持的素材优先级合同版本"}]
+    if task.task_type == TaskType.CONTENT_RESEARCH:
+        search = result.get("source_media_search")
+        if not isinstance(search, dict):
+            return [{"path": ["source_media_search"], "message": "必须先盘点官方产品图片、同型号宣传视频及媒体库，不能把漏检当成素材不足"}]
+        if not result.get("source_images") and not str(search.get("image_gap_reason") or "").strip():
+            return [{"path": ["source_media_search", "image_gap_reason"], "message": "没有可用原图时必须说明已检查来源及具体缺口，不能静默改用全 AI 图"}]
+    if task.task_type != TaskType.VISUAL_PLAN:
+        return []
+    try:
+        research, search, registered = source_media_research(session, task.content_id, inputs)
+        if (inputs.get("source_media_search") != search
+                or inputs.get("source_media_acquisition") != source_media_acquisition(research, registered)):
+            raise TaskConflictError("SOURCE_MEDIA_AUDIT_CHANGED: 计划盘点必须与已接受研究完全一致")
+    except TaskConflictError as exc:
+        return [{"path": ["source_media_search"], "message": str(exc)}]
+    allowed = set(inputs.get("allowed_asset_ids") or [])
+    source_ids = {row["artifact_id"] for row in registered}
+    declared = {item.get("artifact_id") for item in inputs.get("source_images", []) if isinstance(item, dict)}
+    errors = []
+    if declared - source_ids or declared != source_ids.intersection(allowed) or (source_ids and not declared):
+        errors.append({"path": ["source_images"], "message": "原图必须是本内容已登记且在可用白名单中的 source_image"})
+    unrelated = set(session.exec(select(Artifact.id).where(
+        Artifact.content_id == task.content_id, Artifact.artifact_type == "source_image",
+        Artifact.id.in_(allowed),
+    )).all()) - source_ids
+    if unrelated:
+        errors.append({"path": ["allowed_asset_ids"], "message": "原图白名单包含不属于当前已接受研究取图收据的素材"})
+    segments = result.get("segments", [])
+    if source_ids and not any(segment.get("asset_id") in source_ids for segment in segments):
+        errors.append({"path": ["segments"], "message": "已有相关产品原图，计划必须优先直用，不能整片由 AI 图替代"})
+    for index, segment in enumerate(segments):
+        request = segment.get("asset_request")
+        if request and not str(request.get("source_gap_reason") or "").strip():
+            errors.append({"path": ["segments", index, "asset_request", "source_gap_reason"],
+                           "message": "AI 补图必须说明现有产品素材无法覆盖的具体画面缺口"})
+    return errors
+
+
 def stable_hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -315,6 +440,28 @@ def _normalize_content_task_input(
         if normalized.get("production_mode") != expected_mode:
             normalized["production_mode"] = expected_mode
             changed.append("production_mode")
+        if task_type in {TaskType.CONTENT_RESEARCH, TaskType.VISUAL_PLAN} and expected_mode == "image_only":
+            if type(normalized.get("source_media_priority_version")) is not int or normalized.get("source_media_priority_version") != 1:
+                normalized["source_media_priority_version"] = 1
+                changed.append("source_media_priority_version")
+            if task_type == TaskType.VISUAL_PLAN:
+                research, search, rows = source_media_research(session, content_id, normalized)
+                acquisition = source_media_acquisition(research, rows)
+                for key, value in (("source_media_search", search), ("source_media_acquisition", acquisition)):
+                    if key in normalized and normalized[key] != value:
+                        raise TaskConflictError(f"SOURCE_MEDIA_AUDIT_CHANGED: {key}")
+                    if key not in normalized:
+                        normalized[key] = value
+                        changed.append(key)
+                source_ids = {row["artifact_id"] for row in rows}
+                allowed = set(normalized.get("allowed_asset_ids") or [])
+                declared = {row.get("artifact_id") for row in normalized.get("source_images", []) if isinstance(row, dict)}
+                offered = set(session.exec(select(Artifact.id).where(
+                    Artifact.content_id == content_id, Artifact.artifact_type == "source_image", Artifact.id.in_(allowed),
+                )).all())
+                if (declared != source_ids.intersection(allowed) or offered - source_ids
+                        or (source_ids and not declared)):
+                    raise TaskConflictError("SOURCE_MEDIA_SOURCE_WHITELIST_CHANGED")
 
     if task_type in {
         TaskType.SCENE_ANALYZE,
@@ -1202,6 +1349,8 @@ class AgentTaskService:
                 result = model.model_validate(result).model_dump(mode="json")
             except ValueError as exc:
                 errors.append({"path": [], "message": str(exc)})
+        if not errors:
+            errors.extend(_source_media_priority_errors(self.session, task, result))
         if not errors and task.task_type == TaskType.SOURCE_DISCOVERY:
             for index, candidate in enumerate(result.get("candidates", [])):
                 for field in ("url", "video_url"):

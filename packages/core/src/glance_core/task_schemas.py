@@ -7,7 +7,7 @@ from itertools import pairwise
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from glance_core.models import RightsStatus, TaskType
 
@@ -249,6 +249,27 @@ class SourceImage(StrictModel):
     source_page: str = Field(default="", max_length=2000)
 
 
+class SourceMediaSearch(StrictModel):
+    checked_pages: list[SourceRef] = Field(min_length=1, max_length=20)
+    video_search_note: str = Field(min_length=1, max_length=1500)
+    image_gap_reason: str = Field(default="", max_length=1500)
+
+    @field_validator("video_search_note", "image_gap_reason", mode="before")
+    @classmethod
+    def strip_search_notes(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def require_primary_media_search(self) -> SourceMediaSearch:
+        if not any(page.source_type in {"official", "primary"} for page in self.checked_pages):
+            raise ValueError("素材盘点必须实际检查官方或一手来源页面")
+        for page in self.checked_pages:
+            parsed = urlparse(page.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not page.title.strip():
+                raise ValueError("checked_pages 必须记录实际页面的完整 HTTP(S) URL 和标题")
+        return self
+
+
 class ContentResearchResult(StrictModel):
     subject: str
     primary_sources: list[SourceRef]
@@ -261,6 +282,15 @@ class ContentResearchResult(StrictModel):
     recommended_verdict: str
     #: 图文模式的画面素材来源；与 verified_claims 相关的配图，可为空。
     source_images: list[SourceImage] = Field(default_factory=list, max_length=30)
+    source_media_search: SourceMediaSearch | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_result(self, handler) -> dict:
+        result = handler(self)
+        # Historical accepted hashes must not gain a newly defaulted field.
+        if self.source_media_search is None:
+            result.pop("source_media_search", None)
+        return result
 
 
 class MediaSourceAssistResult(StrictModel):
@@ -545,6 +575,7 @@ class AssetRequest(StrictModel):
     information: str = Field(min_length=1, max_length=300)
     style_direction: str = Field(min_length=1, max_length=200)
     subject: str = Field(min_length=1, max_length=500)
+    source_gap_reason: str | None = Field(default=None, min_length=1, max_length=1500)
     #: 图文模式的参考重绘：指向已下载的网页原图 artifact；纯生图留空。
     reference_artifact_id: str | None = Field(default=None, pattern=r"^asset_[a-f0-9]{32}$")
     # 平台硬约束
@@ -555,6 +586,13 @@ class AssetRequest(StrictModel):
     min_height: int = Field(default=1920, gt=0, le=16384)
     #: 仅支持 seed 的工具填写；gpt-image 系列留空，风格一致性用参考图机制。
     seed: int | None = Field(default=None, ge=0)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_request(self, handler) -> dict:
+        result = handler(self)
+        if self.source_gap_reason is None:
+            result.pop("source_gap_reason", None)
+        return result
 
     @field_validator("seed", mode="before")
     @classmethod
@@ -944,8 +982,10 @@ INPUT_FIELDS: dict[TaskType, frozenset[str]] = {
             "transcript",
             "production_mode",
             "source_url",
+            "video_url",
             "image_only",
             "footage",
+            "source_media_priority_version",
         }
     ),
     TaskType.SCENE_ANALYZE: frozenset(
@@ -1022,6 +1062,9 @@ INPUT_FIELDS: dict[TaskType, frozenset[str]] = {
             "production_mode",
             "image_only_gen_budget",
             "source_images",
+            "source_media_priority_version",
+            "source_media_search",
+            "source_media_acquisition",
             "allowed_reference_artifact_ids",
             "context_files",
             "artifact_id",
@@ -1046,6 +1089,11 @@ INPUT_FIELDS: dict[TaskType, frozenset[str]] = {
             "voice_duration_sec",
             "allowed_layouts",
             "allowed_asset_ids",
+            "source_media_priority_version",
+            "source_media_search",
+            "source_media_acquisition",
+            "source_images",
+            "source_gap_reason",
             "context_files",
             "qc_issues",
             "previous_plan",

@@ -13,7 +13,7 @@ import pytest
 from glance_core.content_acceptance import acceptance_origin, acceptance_subject, is_handsfree_content, verify_acceptance
 from glance_core.database import build_engine, create_db
 from glance_core.models import (
-    AgentTask, Artifact, AuditEvent, Candidate, CandidateStatus, Content,
+    AgentSubmission, AgentTask, Artifact, AuditEvent, Candidate, CandidateStatus, Content,
     ContentStatus, RightsStatus, TaskStatus, TaskType, utc_now,
 )
 from glance_core.settings import Settings
@@ -28,6 +28,7 @@ from app.business.pipeline import (
     verify_publish_ready, workflow,
 )
 from app.services.video_project import VideoProject
+from test.business.test_content_http import RESEARCH
 
 
 @pytest.fixture
@@ -60,8 +61,16 @@ def media_contract(tmp_path):
             session.commit()
             return task
 
-        research = completed(TaskType.CONTENT_RESEARCH, {}, {"verified_claims": [
-            {"id": "c1", "claim": "Product fact", "source_urls": [candidate.source_url]}]})
+        research = completed(TaskType.CONTENT_RESEARCH, {}, {**deepcopy(RESEARCH), "verified_claims": [
+            {"id": "c1", "claim": "Product fact", "source_urls": [candidate.source_url], "confidence": "high"}]})
+        research.attempt, research.assigned_agent_id = 1, "fixture-worker"
+        raw_research = settings.agent_submission_dir / research.id / "1" / "result.json"
+        raw_research.parent.mkdir(parents=True)
+        raw_research.write_text(json.dumps(research.result_data), encoding="utf-8")
+        session.add(research)
+        session.add(AgentSubmission(task_id=research.id, attempt=1, agent_id=research.assigned_agent_id,
+                                   raw_result_path=str(raw_research), result_hash=stable_hash(research.result_data), validation_status="ACCEPTED"))
+        session.commit()
         script = completed(TaskType.SHORT_SCRIPT, {"research": research.id}, {"full_narration": "产品测试。"})
         script_qc = completed(TaskType.SCRIPT_QC, {"script": script.id, "research": research.id}, {"passed": True})
         plan = completed(TaskType.VISUAL_PLAN, {"script": script.id}, {"segments": [{"scene_id": "s1"}]})

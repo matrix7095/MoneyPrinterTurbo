@@ -22,6 +22,7 @@ from test.business.test_discovery_http import make_runtime
 from test.business.test_discovery_http import ADMIN
 from test.business.test_deployment_http import app_for
 from test.business.test_agent_failure_recovery import registered_client
+from test.business.test_content_http import RESEARCH
 
 
 @pytest.mark.parametrize(
@@ -381,7 +382,7 @@ def image_contract(tmp_path):
             session.commit()
             return task
 
-        research = completed(TaskType.CONTENT_RESEARCH, {}, {"verified_claims": []})
+        research = completed(TaskType.CONTENT_RESEARCH, {}, {**deepcopy(RESEARCH), "verified_claims": []})
         script = completed(TaskType.SHORT_SCRIPT, {"upstream_task_ids": {"research": research.id}},
                            {"full_narration": "产品测试。"})
         completed(TaskType.SCRIPT_QC, {"upstream_task_ids": {"script": script.id, "research": research.id}}, {"passed": True})
@@ -465,7 +466,7 @@ def test_first_asset_qc_automatic_render_uses_only_current_accepted_consumption(
     assert calls == [content_id]
 
 
-def test_sparse_preparation_keeps_agent_result_and_qc_bundle_uses_same_frozen_plan(image_contract, tmp_path):
+def test_source_priority_plan_is_not_replaced_by_automatic_ai_fill(image_contract, tmp_path):
     from glance_core.content_acceptance import prepared_visual_plan
 
     runtime, content_id, old_plan_id, _, _, image_id, _ = image_contract
@@ -491,9 +492,10 @@ def test_sparse_preparation_keeps_agent_result_and_qc_bundle_uses_same_frozen_pl
             qc = session.exec(select(AgentTask).where(AgentTask.content_id == content_id,
                                                      AgentTask.task_type == TaskType.VISUAL_PLAN_QC,
                                                      AgentTask.status == TaskStatus.PENDING)).one()
-            prepared = deepcopy(qc.input_data["prepared_visual_plan"])
-            assert len(prepared["segments"]) == 4
-            assert qc.input_data["visual_plan_result_sha256"] == stable_hash(original)
+            assert "prepared_visual_plan" not in qc.input_data
+            assert "visual_plan_result_sha256" not in qc.input_data
+            assert qc.input_data["source_media_priority_version"] == 1
+            prepared = original
             qc_id = qc.id
         claim = client.claim()
         assert claim["status"] == "CLAIMED", claim
@@ -991,7 +993,7 @@ def test_reuse_qc_input_during_exact_accepted_generation_consumption(image_contr
 
 
 @pytest.fixture
-def manual_reuse_contract(image_contract, request):
+def manual_reuse_contract(image_contract, request, monkeypatch):
     runtime, content_id, old_plan_id, generation_id, old_qc_id, image_id, _ = image_contract
     assert runtime.consume_agent(old_qc_id)
     with Session(runtime.engine) as session:
@@ -1032,10 +1034,33 @@ def manual_reuse_contract(image_contract, request):
             allowed_ids.append(source.id)
             for segment in segments if shape == "source_only" else segments[-1:]:
                 segment["asset_id"] = source.id
+            # This fixture's current research includes the real source image; give
+            # the normal acquisition path the same evidence as a production task.
+            script = session.get(AgentTask, old_plan.input_data["upstream_task_ids"]["script"])
+            research = session.get(AgentTask, script.input_data["upstream_task_ids"]["research"])
+            image_source = {"url": "https://example.org/product-source.png", "caption": "Official product",
+                            "source_page": "https://example.org/product"}
+            research.result_data = {**research.result_data, "source_images": [image_source]}
+            accepted = session.exec(select(AgentSubmission).where(AgentSubmission.task_id == research.id)).one()
+            accepted.result_hash = stable_hash(research.result_data)
+            Path(accepted.raw_result_path).write_text(json.dumps(research.result_data), encoding="utf-8")
+            session.add(research)
+            session.add(accepted)
+            for event in session.exec(select(AuditEvent).where(AuditEvent.entity_id == research.id,
+                                                              AuditEvent.action.in_(["completed", AGENT_CONSUMED]))).all():
+                event.metadata_json = {"result_hash": accepted.result_hash}
+                session.add(event)
+            session.commit()
+            monkeypatch.setattr(pipeline.MediaExecutor, "acquire_images", lambda self, images: [
+                {**image_source, "path": path, "width": 1080, "height": 1920}])
+            source_rows = pipeline._acquire_source_images(session, content, research.result_data, research)
         elif shape == "future_generation":
             segments[-1].pop("asset_id")
             segments[-1]["asset_request"] = {"prompt": "new current plan image"}
         inputs = {**old_plan.input_data, "allowed_asset_ids": allowed_ids}
+        if shape in {"source_only", "mixed_source"}:
+            inputs.pop("source_media_acquisition", None)
+            inputs["source_images"] = source_rows
         if shape == "reuse_false":
             inputs["original_reuse"] = False
         plan = flow.create_agent_task(content_id, TaskType.VISUAL_PLAN, inputs, allow_multiple=True)

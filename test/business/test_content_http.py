@@ -62,6 +62,12 @@ RESEARCH = {
     "recommended_angle": "Explain the design",
     "recommended_verdict": "Clear functionality",
     "source_images": [],
+    "source_media_search": {
+        "checked_pages": [{"url": "https://example.org/project-a", "title": "Official Project A",
+                           "source_type": "official"}],
+        "video_search_note": "Official fixture page and its media section contain no matching product video.",
+        "image_gap_reason": "Metadata-only test fixture has no downloadable product images.",
+    },
 }
 
 

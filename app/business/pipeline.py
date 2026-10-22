@@ -43,7 +43,7 @@ from glance_core.models import (
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import DEFAULT_COVER_STYLE_PRESET, Settings
 from glance_core.task_schemas import ManualAssistResult, result_model_for
-from glance_core.task_service import stable_hash
+from glance_core.task_service import source_media_acquisition, source_media_research, stable_hash
 from glance_core.workflow import (
     WorkflowService,
     handsfree_review_policy,
@@ -758,6 +758,7 @@ def _acquire_source_images(
     session: Session,
     content: Content,
     research: dict,
+    research_task: AgentTask | None = None,
 ) -> list[dict]:
     """图文模式的 acquire 节点：把研究回传的配图 URL 下载并逐张登记。"""
     images = list(research.get("source_images") or [])
@@ -797,7 +798,40 @@ def _acquire_source_images(
     index_path.write_text(
         json.dumps({"images": entries}, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if research_task is not None and research.get("source_media_search") is not None:
+        metadata = {"result_hash": stable_hash(research), "images": [
+            {**entry, "sha256": session.get(Artifact, entry["artifact_id"]).sha256} for entry in entries
+        ], "unavailable_image_urls": [item["url"] for item in images if item["url"] not in {row["url"] for row in entries}]}
+        existing = session.exec(select(AuditEvent).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == research_task.id,
+            AuditEvent.action == "source_media_images_acquired",
+        )).first()
+        if existing is None:
+            session.add(AuditEvent(actor_type="system", actor_id="pipeline", entity_type="agent_task",
+                                   entity_id=research_task.id, action="source_media_images_acquired", metadata_json=metadata))
+            session.commit()
+        elif existing.metadata_json != metadata:
+            raise NonRetryableMediaError("Current research source image acquisition changed")
     return entries
+
+
+def _refresh_source_media_research(session: Session, flow: WorkflowService, content: Content) -> Content | None:
+    """Re-enter normal research for an actionable legacy image-only script, without editing history."""
+    if (content.production_mode != ProductionMode.IMAGE_ONLY
+            or content.business_status not in {ContentStatus.SCRIPT_REVIEW, ContentStatus.PREPARING_CONTEXT, ContentStatus.FAILED}):
+        return None
+    research = flow.completed_task_for(content.id, TaskType.CONTENT_RESEARCH)
+    if research is None or (research.result_data or {}).get("source_media_search") is not None:
+        return None
+    pending = session.exec(select(AgentTask).where(
+        AgentTask.content_id == content.id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
+        AgentTask.status.in_([TaskStatus.PENDING, TaskStatus.LEASED]),
+    ).order_by(AgentTask.created_at.desc())).first()
+    if pending is None:
+        inputs = flow._research_repair_input(content, research)
+        inputs["source_media_refresh_of"] = research.id
+        flow.create_agent_task(content.id, TaskType.CONTENT_RESEARCH, inputs, priority=35, allow_multiple=True)
+    return flow.mark_status(content.id, ContentStatus.WAITING_AGENT, "agent_context")
 
 
 _IMAGE_ONLY_DEFAULT_STYLE = (
@@ -878,7 +912,7 @@ def _ensure_image_only_asset_requests(
     plan_task: AgentTask,
     script: dict,
 ) -> tuple[dict, dict[str, int]]:
-    """Deterministically fill a too-sparse image plan with bounded Agent requests.
+    """Preserve source-first plans; fill only legacy sparse plans with Agent requests.
 
     The worker does not invent a new claim or decide what the product does. It
     only turns repeated/overlong image slots already selected by the visual
@@ -907,6 +941,9 @@ def _ensure_image_only_asset_requests(
     ]
     asset_ids = {str(segment.get("asset_id")) for segment in segments if segment.get("asset_id")}
     asset_count = len(asset_ids) + len(requests)
+    if plan_task.input_data.get("source_media_priority_version") == 1:
+        # New plans need Agent-evidenced gaps; a picture-count target cannot invent AI requests.
+        return plan, {"minimum": minimum, "asset_count": asset_count, "injected": 0, "budget": budget}
     if asset_count >= minimum or budget <= len(requests):
         return plan, {
             "minimum": minimum,
@@ -1005,10 +1042,15 @@ def prepare_content(engine: Engine, settings: Settings, content_id: str) -> Cont
         content = session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
+        if content.business_status == ContentStatus.PUBLISHED:
+            raise NonRetryableMediaError("Published content cannot be automatically returned to research")
         candidate = session.get(Candidate, content.candidate_id)
         if candidate is None:
             raise KeyError(content.candidate_id)
         flow = workflow(session, settings)
+        refreshed = _refresh_source_media_research(session, flow, content)
+        if refreshed is not None:
+            return refreshed
         base = {
             "content_id": content.id,
             "candidate": {
@@ -1739,7 +1781,7 @@ def _advance_after_agent(
             }
             if image_only:
                 # 图文模式：研究完成后先把配图下载登记，再直达口播脚本。
-                _acquire_source_images(session, content, research_task.result_data or {})
+                _acquire_source_images(session, content, research_task.result_data or {}, research_task)
                 flow.create_agent_task(
                     content_id,
                     TaskType.SHORT_SCRIPT,
@@ -1748,7 +1790,7 @@ def _advance_after_agent(
                         "upstream_task_ids": {"research": research_task.id},
                     },
                     priority=40,
-                    allow_multiple=rights_research_repair,
+                    allow_multiple=rights_research_repair or bool(research_task.input_data.get("source_media_refresh_of")),
                 )
                 flow.mark_status(content_id, ContentStatus.WAITING_AGENT, "short_script")
                 return
@@ -2710,6 +2752,8 @@ def approve_script(
         content = session.get(Content, content_id)
         if content is None:
             raise KeyError(content_id)
+        if content.business_status == ContentStatus.PUBLISHED:
+            raise NonRetryableMediaError("Published content cannot be automatically returned to production")
         flow = workflow(session, settings)
         _verify_rights(session, content)
         script_task = flow.completed_task_for(content_id, TaskType.SHORT_SCRIPT)
@@ -2720,6 +2764,9 @@ def approve_script(
         )
         if automatic and manual_approval:
             raise NonRetryableMediaError("Automatic execution cannot mint manual script approval")
+        refreshed = _refresh_source_media_research(session, flow, content)
+        if refreshed is not None:
+            return refreshed
         snapshot = None
         if manual_approval:
             if content.business_status != ContentStatus.SCRIPT_REVIEW:
@@ -2740,6 +2787,8 @@ def approve_script(
             raise ValueError("Script and a completed script QC are required")
         _unchanged_material_task(session, script_task, consumed=False)
         script_proof = _script_task_proof(script_task)
+        if content.production_mode == ProductionMode.IMAGE_ONLY:
+            source_media_research(session, content_id, {"upstream_task_ids": {"script": script_task.id}})
         root = Path(content.content_dir).resolve()
         executor = MediaExecutor(root)
         voice_options = {
@@ -2907,7 +2956,10 @@ def approve_script(
         if image_only:
             # 图文模式：全部片段为 image_card，可用素材是已下载的网页原图，
             # 生图段（参考重绘 + 纯生图）受管理台预算限制。
-            source_images = source_image_index(content)
+            research_task, media_search, acquired_images = source_media_research(
+                session, content_id, {"upstream_task_ids": {"script": script_task.id}},
+            )
+            source_images = [{key: value for key, value in row.items() if key != "sha256"} for row in acquired_images]
             source_ids = [str(item["artifact_id"]) for item in source_images]
             visual_context = {
                 "source_images": source_images,
@@ -2919,6 +2971,8 @@ def approve_script(
                 from app.business.visual_plan_context import packaged_visual_context
 
                 visual_context = packaged_visual_context(session, content, script_task, previous_plan, source_images)
+            visual_context["source_media_search"] = deepcopy(media_search)
+            visual_context["source_media_acquisition"] = source_media_acquisition(research_task, acquired_images)
             budget = settings.image_only_gen_budget if settings.asset_image_enabled else 0
             plan_input = {
                 "upstream_task_ids": {"script": script_task.id},

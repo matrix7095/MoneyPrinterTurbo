@@ -23,7 +23,7 @@ from glance_media.tts import TtsResult
 from sqlmodel import Session, select
 
 from app.business import pipeline, voice_rebuild
-from test.business.test_content_http import content_app
+from test.business.test_content_http import RESEARCH, content_app
 from test.business.test_discovery_http import ADMIN, make_runtime
 
 
@@ -105,7 +105,8 @@ def contract(tmp_path, monkeypatch):
             session.commit()
             return item
 
-        research = completed(TaskType.CONTENT_RESEARCH, {}, {"verified_claims": []})
+        research = completed(TaskType.CONTENT_RESEARCH, {}, {**deepcopy(RESEARCH), "verified_claims": []})
+        prove_completed(session, runtime, research)
         script = completed(TaskType.SHORT_SCRIPT, {"upstream_task_ids": {"research": research.id}},
                            {"full_narration": "已批准的原文，面积为2.5平方米。", "estimated_duration_sec": 30})
         completed(TaskType.SCRIPT_QC, {"upstream_task_ids": {"script": script.id, "research": research.id}}, {"passed": True})
@@ -136,7 +137,8 @@ def contract(tmp_path, monkeypatch):
         ids = {"content": content.id, "script": script.id, "plan": plan.id, "voice": old_voice.id,
                "images": [item.id for item in images], "negative": negative.id, "recovery": recovery.id}
         for task in session.exec(select(AgentTask).where(AgentTask.content_id == content.id)).all():
-            prove_completed(session, runtime, task)
+            if task.id != research.id:
+                prove_completed(session, runtime, task)
     with TestClient(content_app(runtime)) as http:
         yield runtime, http, ids, calls, fail, bundle
 

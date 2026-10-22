@@ -1562,6 +1562,10 @@ class WorkflowService:
                     "image_only_gen_budget",
                     "visual_timing_evidence",
                     "opening_identity_overlay",
+                    "source_media_priority_version",
+                    "source_media_search",
+                    "source_media_acquisition",
+                    "source_images",
                 )
                 if key in plan.input_data
             },

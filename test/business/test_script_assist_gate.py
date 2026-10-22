@@ -23,7 +23,7 @@ from pydantic import SecretStr
 from app.business import pipeline
 from app.business.runtime import AGENT_CONSUMED, OWNED
 from test.business.test_discovery_http import make_runtime
-from test.business.test_content_http import ADMIN, content_app
+from test.business.test_content_http import ADMIN, RESEARCH, content_app
 from test.business.test_visual_plan_materialization import record_accepted_completion
 
 
@@ -75,7 +75,7 @@ def script_review_contract(tmp_path):
             session.commit()
             return task
 
-        research = completed(TaskType.CONTENT_RESEARCH, {}, {"verified_claims": []})
+        research = completed(TaskType.CONTENT_RESEARCH, {}, {**deepcopy(RESEARCH), "verified_claims": []})
         script = completed(TaskType.SHORT_SCRIPT, {"upstream_task_ids": {"research": research.id}},
                            {"full_narration": "产品测试。"})
         qc = completed(TaskType.SCRIPT_QC, {"upstream_task_ids": {"script": script.id, "research": research.id}},
@@ -467,7 +467,11 @@ def test_pending_review_completing_during_manual_tts_leaves_no_new_downstream(sc
         "script": deepcopy(script.result_data), "script_qc": deepcopy(qc.result_data),
         "research": deepcopy(research.result_data),
     })
-    old_plan = flow.create_agent_task(content.id, TaskType.VISUAL_PLAN, {"old_plan": True})
+    old_plan = AgentTask(content_id=content.id, task_type=TaskType.VISUAL_PLAN, prompt_name="visual_plan",
+                         instructions="Historical pending plan", input_data={"old_plan": True},
+                         input_hash=stable_hash({"old_plan": True}))
+    session.add(old_plan)
+    session.commit()
 
     def complete_review():
         with Session(runtime.engine) as changed:
