@@ -65,6 +65,58 @@ def _signature(settings: Settings, event: AuditEvent) -> str:
     return hmac.new(secret.encode(), message.encode("ascii"), hashlib.sha256).hexdigest()
 
 
+def _sentence_tempo_receipt(data: dict, narration: str) -> None:
+    parameters, synthesis, conversion = (data.get(key) for key in ("parameters", "synthesis", "conversion"))
+    if not all(isinstance(value, dict) for value in (parameters, synthesis, conversion)) or "speed" in parameters:
+        raise ValueError("Voice generation sentence/tempo evidence is missing or ambiguous")
+    parsed = {}
+    for key, numeric_key, low, high in (("rate", "requested_speed", 0.5, 2.0), ("volume", "gain", 0.01, 2.0)):
+        raw = parameters.get(key)
+        match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)%", raw.strip()) if isinstance(raw, str) else None
+        number = parameters.get(numeric_key)
+        if (match is None or type(number) not in {int, float} or not math.isfinite(number)
+                or not low <= number <= high or abs(number - (1 + float(match.group(1)) / 100)) > 1e-12):
+            raise ValueError("Voice generation requested sentence/tempo parameters are inconsistent")
+        parsed[key] = float(number)
+    if (type(parameters.get("model_speed")) not in {int, float} or parameters["model_speed"] != 1.0
+            or type(parameters.get("tempo_factor")) not in {int, float}
+            or parameters["tempo_factor"] != parsed["rate"]):
+        raise ValueError("Voice generation model speed and output tempo are inconsistent")
+    audio = data["audio"]
+    if (audio.get("pcm_stage") != "pre_tempo"
+            or abs(audio["encoded_duration_sec"] - audio["pcm_duration_sec"] / parsed["rate"]) > 0.15):
+        raise ValueError("Voice generation pre-tempo PCM and encoded duration are inconsistent")
+    rows = synthesis.get("sentences")
+    if (synthesis.get("strategy") != "sentence-model-1x-atempo-v1" or not isinstance(rows, list) or not rows
+            or type(synthesis.get("sentence_count")) is not int or synthesis["sentence_count"] != len(rows)):
+        raise ValueError("Voice generation sentence inventory is invalid")
+    text_start, sample_start = 0, 0
+    for row in rows:
+        if (not isinstance(row, dict)
+                or any(type(row.get(key)) is not int for key in
+                       ("text_start_char", "text_end_char", "pcm_start_sample", "pcm_end_sample"))
+                or row["text_start_char"] != text_start or row["pcm_start_sample"] != sample_start
+                or not text_start < row["text_end_char"] <= len(narration)
+                or not sample_start < row["pcm_end_sample"] <= audio["sample_count"]
+                or not _SHA.fullmatch(str(row.get("pcm16_sha256", "")))):
+            raise ValueError("Voice generation sentence PCM/text coverage is inconsistent")
+        text = narration[text_start:row["text_end_char"]]
+        if not text.strip() or row.get("text_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            raise ValueError("Voice generation sentence text binding changed")
+        text_start, sample_start = row["text_end_char"], row["pcm_end_sample"]
+    if text_start != len(narration) or sample_start != audio["sample_count"]:
+        raise ValueError("Voice generation sentences do not cover the complete narration/PCM")
+    tempo_filter = f"atempo={parsed['rate']}" if parsed["rate"] != 1.0 else None
+    command, version = conversion.get("command"), conversion.get("ffmpeg_version")
+    if (not isinstance(command, list) or len(command) != (12 if tempo_filter else 10)
+            or any(not isinstance(item, str) or not item for item in command)
+            or command != ["ffmpeg", "-nostdin", "-y", "-i", command[4]]
+            + (["-af", tempo_filter] if tempo_filter else []) + ["-codec:a", "libmp3lame", "-q:a", "2", command[-1]]
+            or conversion.get("tempo_filter") != tempo_filter
+            or not isinstance(version, str) or not version.startswith("ffmpeg version ")):
+        raise ValueError("Voice generation FFmpeg tempo recipe/version is inconsistent")
+
+
 def _receipt(content: Content, voice: Artifact, receipt: Artifact, script: AgentTask) -> dict:
     verified_artifact_bytes(content, voice)
     if (receipt.artifact_type != "tts_generation_receipt" or voice.artifact_type != "voice"
@@ -74,7 +126,7 @@ def _receipt(content: Content, voice: Artifact, receipt: Artifact, script: Agent
     narration = (script.result_data or {}).get("full_narration")
     if not isinstance(narration, str):
         raise ValueError("Voice generation approved narration is unavailable")
-    if (not isinstance(data, dict) or data.get("schema_version") != 1 or data.get("provider") != "kokoro"
+    if (not isinstance(data, dict) or data.get("schema_version") not in (1, 2) or data.get("provider") != "kokoro"
             or data.get("output_sha256") != voice.sha256 or data.get("output_size_bytes") != voice.size_bytes
             or data.get("narration_sha256") != hashlib.sha256(narration.encode("utf-8")).hexdigest()):
         raise ValueError("Voice generation receipt does not match approved narration/audio")
@@ -136,6 +188,8 @@ def _receipt(content: Content, voice: Artifact, receipt: Artifact, script: Agent
     for row in licenses:
         if any(not isinstance(row.get(key), str) or not row[key].strip() for key in ("spdx_id", "scope", "source_url")):
             raise ValueError("Voice generation license attribution is incomplete")
+    if data["schema_version"] == 2:
+        _sentence_tempo_receipt(data, narration)
     return data
 
 
@@ -169,7 +223,7 @@ def bind_voice_generation(
 
 def _summary(event: AuditEvent, data: dict, receipt: Artifact) -> dict:
     bundle = data["bundle"]
-    return {
+    summary = {
         "binding_event_id": event.id, "receipt_artifact": artifact_binding(receipt),
         "provider": "kokoro", "actual_provider_verified": True,
         "generated_at": data["generated_at"], "model_id": bundle["model_id"],
@@ -187,6 +241,9 @@ def _summary(event: AuditEvent, data: dict, receipt: Artifact) -> dict:
         "provenance_limits": bundle.get("provenance_limits", []),
         "limitation": "Verified local generation and retained license texts do not independently prove speaker consent or legal authorization.",
     }
+    if data["schema_version"] == 2:
+        summary.update(receipt_schema_version=2, synthesis=data["synthesis"], conversion=data["conversion"])
+    return summary
 
 
 def verify_voice_generation(

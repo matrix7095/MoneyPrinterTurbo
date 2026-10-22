@@ -38,6 +38,7 @@ _REQUIRED_FILES = {
 }
 _PERCENT = re.compile(r"([+-]?\d+(?:\.\d+)?)%")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_SENTENCE_END = re.compile(r'''(?:[。！？!?]+|\.(?=["'”’」』）)]*(?:\s|$)))["'”’」』）)]*\s*''')
 
 
 def _sha256(path: Path) -> str:
@@ -193,6 +194,19 @@ def _runtime():
     return sherpa_onnx
 
 
+def _sentences(narration: str) -> list[str]:
+    ends = []
+    for match in _SENTENCE_END.finditer(narration):
+        # shortcut: common English titles only; broader English prose needs a dedicated segmenter.
+        if (narration[match.start()] == "."
+                and re.search(r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr)$", narration[:match.start()], re.IGNORECASE)):
+            continue
+        ends.append(match.end())
+    if not ends or ends[-1] != len(narration):
+        ends.append(len(narration))
+    return [narration[start:end] for start, end in zip([0, *ends[:-1]], ends, strict=True)]
+
+
 class KokoroProvider:
     name = "kokoro"
 
@@ -225,31 +239,57 @@ class KokoroProvider:
         if not config.validate():
             raise RuntimeError("Kokoro CPU model configuration is invalid")
         generated_at = datetime.now(timezone.utc).isoformat()
-        audio = runtime.OfflineTts(config).generate(narration, sid=sid, speed=speed)
         import numpy as np
 
-        samples = np.asarray(audio.samples, dtype=np.float32)
-        if (
-            audio.sample_rate != 24000 or samples.ndim != 1 or not samples.size
-            or not np.isfinite(samples).all()
-        ):
-            raise RuntimeError("Kokoro returned invalid PCM samples or sample rate")
-        samples = samples * gain
-        peak = float(np.max(np.abs(samples)))
-        if not math.isfinite(peak) or peak <= 0 or peak > 1.0:
-            raise RuntimeError("Kokoro PCM is silent or would clip")
-        pcm = np.rint(samples * 32767).astype("<i2")
-        duration = samples.size / audio.sample_rate
+        engine = runtime.OfflineTts(config)
+        chunks, sentences = [], []
+        text_start, sample_start, peak = 0, 0, 0.0
+        # Keep model articulation at 1x; apply the requested tempo after complete sentences.
+        for text in _sentences(narration):
+            audio = engine.generate(text, sid=sid, speed=1.0)
+            samples = np.asarray(audio.samples, dtype=np.float32)
+            if (
+                audio.sample_rate != 24000 or samples.ndim != 1 or not samples.size
+                or not np.isfinite(samples).all()
+            ):
+                raise RuntimeError("Kokoro returned invalid PCM samples or sample rate")
+            samples = samples * gain
+            chunk_peak = float(np.max(np.abs(samples)))
+            if not math.isfinite(chunk_peak) or chunk_peak <= 0 or chunk_peak > 1.0:
+                raise RuntimeError("Kokoro PCM is silent or would clip")
+            pcm_chunk = np.rint(samples * 32767).astype("<i2")
+            chunks.append(pcm_chunk)
+            sentences.append({
+                "text_start_char": text_start, "text_end_char": text_start + len(text),
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "pcm_start_sample": sample_start, "pcm_end_sample": sample_start + int(samples.size),
+                "pcm16_sha256": hashlib.sha256(pcm_chunk.tobytes()).hexdigest(),
+            })
+            text_start += len(text)
+            sample_start += int(samples.size)
+            peak = max(peak, chunk_peak)
+        pcm = np.concatenate(chunks)
+        duration = pcm.size / 24000
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg_version = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=60, check=True, shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        if not ffmpeg_version.strip():
+            raise RuntimeError("Kokoro conversion version evidence is empty")
         with tempfile.TemporaryDirectory(prefix="glance-kokoro-") as directory:
             wav_path = Path(directory) / "narration.wav"
             with wave.open(str(wav_path), "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
-                wav.setframerate(audio.sample_rate)
+                wav.setframerate(24000)
                 wav.writeframes(pcm.tobytes())
+            command = ["ffmpeg", "-nostdin", "-y", "-i", str(wav_path)]
+            if speed != 1.0:
+                command.extend(["-af", f"atempo={speed}"])
+            command.extend(["-codec:a", "libmp3lame", "-q:a", "2", str(output_path)])
             subprocess.run(
-                ["ffmpeg", "-nostdin", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", str(output_path)],
+                command,
                 capture_output=True, text=True, timeout=120, check=True, shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -264,16 +304,21 @@ class KokoroProvider:
         if not math.isfinite(encoded_duration) or encoded_duration <= 0:
             raise RuntimeError("Kokoro encoded audio duration is invalid")
         receipt = {
-            "schema_version": 1, "provider": self.name, "generated_at": generated_at,
+            "schema_version": 2, "provider": self.name, "generated_at": generated_at,
             "bundle": bundle, "runtime": {**bundle["runtime"], "provider": "cpu", "num_threads": 2},
             "voice": {"id": voice_name, "sid": sid},
             "narration_sha256": hashlib.sha256(narration.encode("utf-8")).hexdigest(),
-            "parameters": {"rate": rate, "speed": speed, "volume": volume, "gain": gain,
+            "parameters": {"rate": rate, "requested_speed": speed, "model_speed": 1.0,
+                           "tempo_factor": speed, "volume": volume, "gain": gain,
                            "rule_fsts": list(_RULE_FILES)},
-            "audio": {"sample_rate": audio.sample_rate, "sample_count": int(samples.size),
+            "synthesis": {"strategy": "sentence-model-1x-atempo-v1", "sentence_count": len(sentences),
+                          "sentences": sentences},
+            "audio": {"pcm_stage": "pre_tempo", "sample_rate": 24000, "sample_count": int(pcm.size),
                       "pcm_duration_sec": duration, "encoded_duration_sec": encoded_duration,
                       "peak_amplitude": peak,
                       "pcm16_sha256": hashlib.sha256(pcm.tobytes()).hexdigest()},
+            "conversion": {"command": command, "ffmpeg_version": ffmpeg_version,
+                           "tempo_filter": f"atempo={speed}" if speed != 1.0 else None},
             "output_sha256": _sha256(output_path), "output_size_bytes": output_path.stat().st_size,
         }
         return TtsResult(output_path, encoded_duration, [], self.name, provenance=receipt)

@@ -171,9 +171,13 @@ def fake_runtime(monkeypatch):
 
     def engine(configuration):
         assert configuration == calls["config"]
+        calls["engine_count"] = calls.get("engine_count", 0) + 1
 
         def generate(text, **kwargs):
             calls["generate"] = (text, kwargs)
+            calls.setdefault("generations", []).append((text, kwargs))
+            if "audios" in calls:
+                return calls["audios"][len(calls["generations"]) - 1]
             return calls["audio"]
 
         return SimpleNamespace(generate=generate)
@@ -184,6 +188,9 @@ def fake_runtime(monkeypatch):
     monkeypatch.setattr(kokoro, "_runtime", lambda: runtime)
 
     def convert(args, **kwargs):
+        if args == ["ffmpeg", "-version"]:
+            calls["ffmpeg_version"] = (args, kwargs)
+            return SimpleNamespace(stdout="ffmpeg version fixture\nconfiguration: fixture\n")
         if args[0] == "ffprobe":
             calls["ffprobe"] = (args, kwargs)
             return SimpleNamespace(stdout='{"format":{"duration":"0.048"}}')
@@ -200,7 +207,7 @@ def test_cpu_chinese_generation_pcm_and_receipt(bundle, fake_runtime, tmp_path):
     root, _ = bundle
     result = get_tts_provider("kokoro", model_dir=str(root)).synthesize(
         "中文 2026年10月", tmp_path / "voice.mp3", voice="kokoro:58", rate="+20%", volume="+0%")
-    assert fake_runtime["generate"] == ("中文 2026年10月", {"sid": 58, "speed": 1.2})
+    assert fake_runtime["generate"] == ("中文 2026年10月", {"sid": 58, "speed": 1.0})
     config = fake_runtime["config"]
     assert config.model.provider == "cpu" and config.model.num_threads == 2
     assert config.model.kokoro.model == str(root / "model.onnx")
@@ -212,17 +219,27 @@ def test_cpu_chinese_generation_pcm_and_receipt(bundle, fake_runtime, tmp_path):
     assert np.frombuffer(pcm, dtype="<i2").tolist() == [-16384, 0, 16384]
     command, options = fake_runtime["subprocess"]
     assert command[0] == "ffmpeg" and "-nostdin" in command
+    assert command[command.index("-af") + 1] == "atempo=1.2"
+    assert command[command.index("-q:a") + 1] == "2"
     assert options["shell"] is False and options["check"] is True
     assert options["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
     assert result.duration_sec == 0.048 and result.boundaries == []
     assert fake_runtime["ffprobe"][1]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
     receipt = result.provenance
+    assert receipt["schema_version"] == 2
+    assert receipt["parameters"]["requested_speed"] == 1.2
+    assert receipt["parameters"]["model_speed"] == 1.0
+    assert receipt["parameters"]["tempo_factor"] == 1.2
+    assert "speed" not in receipt["parameters"]
     assert receipt["provider"] == "kokoro" and receipt["voice"] == {"id": "zm_009", "sid": 58}
     assert receipt["output_sha256"] == digest(result.audio_path.read_bytes())
     assert receipt["narration_sha256"] == digest("中文 2026年10月".encode())
     assert receipt["audio"]["pcm16_sha256"] == digest(pcm)
     assert receipt["audio"]["pcm_duration_sec"] == 3 / 24000
+    assert receipt["audio"]["pcm_stage"] == "pre_tempo"
     assert receipt["audio"]["encoded_duration_sec"] == result.duration_sec
+    assert receipt["conversion"]["command"] == command
+    assert receipt["conversion"]["ffmpeg_version"] == "ffmpeg version fixture\nconfiguration: fixture\n"
     assert receipt["generated_at"] and receipt["bundle"]["licenses"][0]["text"]
 
 
@@ -232,8 +249,91 @@ def test_only_two_approved_prebuilt_voices_record_truthful_canonical_pairs(bundl
     result = kokoro.KokoroProvider(str(bundle[0])).synthesize("中文", tmp_path / "voice.mp3", voice=voice, rate="+0%", volume="+0%")
     assert fake_runtime["generate"] == ("中文", {"sid": sid, "speed": 1.0})
     assert result.provenance["voice"] == {"id": name, "sid": sid}
+    assert "-af" not in fake_runtime["subprocess"][0]
     settings = Settings(_env_file=None, tts_provider="kokoro", tts_voice=voice)
     assert settings.tts_voice == voice
+
+
+@pytest.mark.parametrize("narration,expected", [
+    ("第一句。第二句！还有吗？结尾", ["第一句。", "第二句！", "还有吗？", "结尾"]),
+    ("  首句。\n Next sentence!  Last one? \t", ["  首句。\n ", "Next sentence!  ", "Last one? \t"]),
+    ('她问：“可以吗？” 然后继续。', ['她问：“可以吗？” ', "然后继续。"]),
+    ("面积2.5平方米，先预约。 Done. Next", ["面积2.5平方米，先预约。 ", "Done. ", "Next"]),
+    ("Version 1.2 is ready, okay? Yes!", ["Version 1.2 is ready, okay? ", "Yes!"]),
+    ("二点五平方米。版本v1.1已发布。", ["二点五平方米。", "版本v1.1已发布。"]),
+    ("Mr. Smith is ready. Dr. Lee? Yes.", ["Mr. Smith is ready. ", "Dr. Lee? ", "Yes."]),
+    ("一个句子，保留逗号；不要碎切", ["一个句子，保留逗号；不要碎切"]),
+])
+def test_sentence_synthesis_preserves_every_character_and_pcm_order(bundle, fake_runtime, tmp_path, narration, expected):
+    sample_chunks = [np.array([-0.5 + index * 0.05, 0, 0.5 - index * 0.05], dtype=np.float32)
+                     for index in range(len(expected))]
+    fake_runtime["audios"] = [SimpleNamespace(samples=samples, sample_rate=24000) for samples in sample_chunks]
+    result = kokoro.KokoroProvider(str(bundle[0])).synthesize(
+        narration, tmp_path / "voice.mp3", voice="kokoro:3", rate="+50%", volume="-50%")
+    generations = fake_runtime["generations"]
+    assert [text for text, _ in generations] == expected
+    assert "".join(text for text, _ in generations) == narration
+    assert all(options == {"sid": 3, "speed": 1.0} for _, options in generations)
+    assert fake_runtime["engine_count"] == 1
+    command = fake_runtime["subprocess"][0]
+    assert command[command.index("-af") + 1] == "atempo=1.5"
+    assert "-ar" not in command and "asetrate" not in " ".join(command)
+    _, pcm = fake_runtime["wav"]
+    expected_pcm = np.concatenate([np.rint(samples * 0.5 * 32767).astype("<i2") for samples in sample_chunks])
+    assert np.frombuffer(pcm, dtype="<i2").tolist() == expected_pcm.tolist()
+    receipt = result.provenance
+    chunks = receipt["synthesis"]["sentences"]
+    assert receipt["synthesis"]["strategy"] == "sentence-model-1x-atempo-v1"
+    assert receipt["synthesis"]["sentence_count"] == len(expected)
+    for index, (text, chunk) in enumerate(zip(expected, chunks, strict=True)):
+        assert narration[chunk["text_start_char"]:chunk["text_end_char"]] == text
+        assert chunk["text_sha256"] == digest(text.encode())
+        assert (chunk["pcm_start_sample"], chunk["pcm_end_sample"]) == (index * 3, (index + 1) * 3)
+        assert chunk["pcm16_sha256"] == digest(pcm[index * 6:(index + 1) * 6])
+    assert receipt["audio"]["sample_count"] == 3 * len(expected)
+    assert receipt["audio"]["pcm16_sha256"] == digest(pcm)
+    assert result.boundaries == []
+
+
+def test_a_bad_later_sentence_never_publishes_a_partial_voice(bundle, fake_runtime, tmp_path):
+    fake_runtime["audios"] = [fake_runtime["audio"], SimpleNamespace(samples=[float("nan")], sample_rate=24000)]
+    executor = media.MediaExecutor(tmp_path / "content")
+    with pytest.raises(RuntimeError, match="invalid PCM"):
+        executor.synthesize_voice("第一句。第二句。", provider="kokoro", model_dir=str(bundle[0]), voice="kokoro:3")
+    assert "subprocess" not in fake_runtime
+    assert "ffmpeg_version" not in fake_runtime
+    assert list((executor.root / "audio").iterdir()) == []
+
+
+def test_failed_tempo_conversion_never_publishes_partial_voice(bundle, fake_runtime, tmp_path, monkeypatch):
+    original_run = kokoro.subprocess.run
+
+    def fail_conversion(args, **kwargs):
+        if args[0] == "ffmpeg" and "-i" in args:
+            Path(args[-1]).write_bytes(b"partial output")
+            raise subprocess.CalledProcessError(1, args)
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(kokoro.subprocess, "run", fail_conversion)
+    executor = media.MediaExecutor(tmp_path / "content")
+    with pytest.raises(subprocess.CalledProcessError):
+        executor.synthesize_voice("第一句。第二句。", provider="kokoro", model_dir=str(bundle[0]), voice="kokoro:3", rate="+50%")
+    assert list((executor.root / "audio").iterdir()) == []
+
+
+def test_executor_preserves_existing_schema1_receipts(tmp_path, monkeypatch):
+    narration = "历史凭据"
+    receipt = {"schema_version": 1, "provider": "kokoro", "parameters": {"rate": "+50%", "speed": 1.5},
+               "narration_sha256": digest(narration.encode()), "output_sha256": digest(b"old voice")}
+
+    class Provider:
+        def synthesize(self, text, output, **kwargs):
+            output.write_bytes(b"old voice")
+            return TtsResult(output, 1, [], "kokoro", provenance=receipt)
+
+    monkeypatch.setattr(media, "get_tts_provider", lambda *args, **kwargs: Provider())
+    result = media.MediaExecutor(tmp_path).synthesize_voice(narration, provider="kokoro")
+    assert json.loads(result.audio_path.with_name("tts_generation_receipt.json").read_bytes()) == receipt
 
 
 @pytest.mark.parametrize("samples,rate", [([], 24000), ([float("nan")], 24000),
