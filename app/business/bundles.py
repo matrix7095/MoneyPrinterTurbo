@@ -30,7 +30,7 @@ from glance_core.models import (
 )
 from glance_core.prompts import resolve_instructions
 from glance_core.task_schemas import schema_for
-from glance_core.task_service import AgentTaskService, TaskConflictError, stable_hash
+from glance_core.task_service import AgentTaskService, TaskConflictError, script_source_media_context, stable_hash
 from glance_core.workflow import WorkflowService
 from sqlmodel import Session, select
 
@@ -564,6 +564,12 @@ def build_bundle(
             }:
                 upstream_result = _compact_scene_analysis(upstream_result)
             bundle_input[field] = upstream_result
+    if task.task_type == TaskType.SHORT_SCRIPT:
+        source = _script_source_context(task, session)
+        if source is not None:
+            bundle_input.update(source)
+            bundle_input["research"] = {**bundle_input["research"], "source_images": source["source_images"]}
+            bundle_input["script_source_media_context_read_only"] = source
     if task.task_type == TaskType.VISUAL_PLAN_QC and "prepared_visual_plan" in task.input_data:
         if (stable_hash(task.input_data) != task.input_hash
                 or task.input_data.get("visual_plan_result_sha256") != stable_hash(bundle_input.get("visual_plan"))):
@@ -641,7 +647,8 @@ def build_bundle(
                 bundle_input["research"] = research.result_data
             if mode == "image_only":
                 if research is not None:
-                    bundle_input["source_images"] = [
+                    source = _script_source_context(script, session)
+                    bundle_input["source_images"] = source["source_images"] if source is not None else [
                         {
                             key: image[key]
                             for key in ("url", "caption", "source_page")
@@ -658,6 +665,9 @@ def build_bundle(
                         and isinstance(image.get("url"), str)
                         and image["url"].startswith(("https://", "http://"))
                     ]
+                    if source is not None:
+                        bundle_input["research"] = {**research.result_data, "source_images": source["source_images"]}
+                        bundle_input["script_source_media_context_read_only"] = source
                 enabled = script.input_data.get("asset_image_enabled")
                 budget = script.input_data.get("image_only_gen_budget")
                 if isinstance(enabled, bool):
@@ -771,6 +781,10 @@ def build_bundle(
             )
             for artifact in _visual_image_artifacts(task, session):
                 context_manifest[context_files.index(artifact.relative_path)]["input_ref"] = artifact.id
+            source = _script_source_context(task, session)
+            if source is not None:
+                for image in source["source_images"]:
+                    context_manifest[context_files.index(image["relative_path"])]["input_ref"] = image["artifact_id"]
     bundle_errors = _bundle_contract_errors(
         session,
         task,
@@ -945,6 +959,48 @@ def _visual_image_artifacts(task: AgentTask, session: Session) -> list[Artifact]
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
+def _script_source_context(task: AgentTask, session: Session) -> dict | None:
+    if task.task_type not in {TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC, TaskType.SCRIPT_REVIEW_ASSIST}:
+        return None
+    try:
+        if stable_hash(task.input_data) != task.input_hash or not task.content_id:
+            raise TaskConflictError("SOURCE_MEDIA_SCRIPT_INPUT_CHANGED")
+        content = session.get(Content, task.content_id)
+        if content is None or task.revision_id != content.current_revision_id:
+            raise TaskConflictError("SOURCE_MEDIA_SCRIPT_REVISION_CHANGED")
+        if task.task_type != TaskType.SHORT_SCRIPT:
+            refs = task.input_data.get("upstream_task_ids") or {}
+            script_id = refs.get("script") if isinstance(refs, dict) else None
+            if isinstance(script_id, list):
+                script_id = script_id[0] if len(script_id) == 1 else None
+            if not script_id:
+                return None
+            script = session.get(AgentTask, script_id) if isinstance(script_id, str) else None
+            if (script is None or script.content_id != task.content_id or script.revision_id != task.revision_id
+                    or script.task_type != TaskType.SHORT_SCRIPT or script.status != TaskStatus.COMPLETED):
+                raise TaskConflictError("SOURCE_MEDIA_REVIEW_SCRIPT_CHANGED")
+            declared = refs.get("research")
+            research_id = (script.input_data.get("upstream_task_ids") or {}).get("research")
+            if declared is not None and declared not in (research_id, [research_id]):
+                raise TaskConflictError("SOURCE_MEDIA_REVIEW_RESEARCH_CHANGED")
+            return _script_source_context(script, session)
+        if task.input_data.get("production_mode") != "image_only":
+            return None
+        context = script_source_media_context(session, task.content_id, task.input_data, verify_files=True)
+        if context is not None:
+            acquisition = context["source_media_acquisition"]
+            consumed = session.exec(select(AuditEvent).where(
+                AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == acquisition["research_task_id"],
+                AuditEvent.action == "mpt_agent_consumed",
+            )).all()
+            if (len(consumed) != 1 or consumed[0].actor_type != "system"
+                    or consumed[0].metadata_json.get("result_hash") != acquisition["research_result_hash"]):
+                raise TaskConflictError("SOURCE_MEDIA_SCRIPT_RESEARCH_NOT_CONSUMED")
+        return context
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 def context_files_for(task: AgentTask, session: Session | None = None) -> list[str]:
     # Bundle and download must share indices after video filtering; never mutate the leased hash.
     files = _filter_context_files(
@@ -957,10 +1013,16 @@ def context_files_for(task: AgentTask, session: Session | None = None) -> list[s
     }:
         files = _scene_context_files(list(task.input_data.get("scenes", []) or []))
     if session is not None:
+        source = _script_source_context(task, session)
+        if source is not None:
+            for relative_path in source["context_files"]:
+                if relative_path not in files:
+                    files.append(relative_path)
         for artifact in _visual_image_artifacts(task, session):
             if artifact.relative_path not in files:
                 files.append(artifact.relative_path)
-        if task.task_type in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC}:
+        if task.task_type in {TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC, TaskType.SHORT_SCRIPT,
+                              TaskType.SCRIPT_QC, TaskType.SCRIPT_REVIEW_ASSIST}:
             names = [Path(path).name.casefold() for path in files]
             if len(names) != len(set(names)):
                 raise HTTPException(status_code=409, detail="Visual context filenames collide")

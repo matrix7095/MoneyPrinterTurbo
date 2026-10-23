@@ -223,7 +223,11 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
     bound_id = (script.input_data.get("upstream_task_ids") or {}).get("research")
     if research_id and research_id != bound_id:
         raise TaskConflictError("SOURCE_MEDIA_RESEARCH_LINEAGE_CHANGED")
-    research_id = bound_id
+    return _accepted_source_media_research(session, content_id, bound_id)
+
+
+def _accepted_source_media_research(session: Session, content_id: str, research_id: str) -> tuple[AgentTask, dict, list[dict]]:
+    """Shared exact research receipt for script context and downstream planning."""
     research = session.get(AgentTask, research_id) if isinstance(research_id, str) else None
     researches = session.exec(select(AgentTask).where(
         current_revision_clause(AgentTask), AgentTask.content_id == content_id, AgentTask.task_type == TaskType.CONTENT_RESEARCH,
@@ -260,6 +264,10 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
         raise TaskConflictError("SOURCE_MEDIA_ACQUISITION_REQUIRED: 图片下载结果尚未登记")
     rows = receipts[0].metadata_json.get("images", [])
     urls = {item["url"] for item in value["source_images"]}
+    if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+            or len({row.get("url") for row in rows}) != len(rows)
+            or len({row.get("artifact_id") for row in rows}) != len(rows)):
+        raise TaskConflictError("SOURCE_MEDIA_ACQUISITION_AMBIGUOUS")
     for row in rows:
         artifact = session.get(Artifact, row.get("artifact_id"))
         if (row.get("url") not in urls or artifact is None or artifact.content_id != content_id
@@ -282,8 +290,54 @@ def source_media_acquisition(research: AgentTask, rows: list[dict]) -> dict:
             "unavailable_image_urls": [url for url in requested if url not in downloaded]}
 
 
+def script_source_media_context(session: Session, content_id: str, inputs: dict, *, verify_files: bool = False) -> dict | None:
+    """Derive registered originals from accepted research, never from URL order or loose indexes."""
+    refs = inputs.get("upstream_task_ids") or {}
+    research_id = refs.get("research") if isinstance(refs, dict) else None
+    research = session.get(AgentTask, research_id) if isinstance(research_id, str) else None
+    if research is None or (research.result_data or {}).get("source_media_search") is None:
+        return None
+    research, search, rows = _accepted_source_media_research(session, content_id, research_id)
+    by_url = {row["url"]: row for row in rows}
+    images = []
+    content = session.get(Content, content_id)
+    if content is None:
+        raise TaskConflictError("SOURCE_MEDIA_SCRIPT_CONTENT_MISSING")
+    root = Path(content.content_dir).resolve()
+    for image in research.result_data.get("source_images", []):
+        row = by_url.get(image["url"])
+        if row is None:
+            continue
+        artifact = session.get(Artifact, row["artifact_id"])
+        if verify_files:
+            target = (root / artifact.relative_path).resolve()
+            if (root not in target.parents or not target.is_file() or target.is_symlink()
+                    or target.stat().st_size != artifact.size_bytes
+                    or hashlib.sha256(target.read_bytes()).hexdigest() != artifact.sha256):
+                raise TaskConflictError("SOURCE_MEDIA_SCRIPT_IMAGE_BYTES_CHANGED")
+        images.append({**row, **image})
+    context = {"script_source_media_context_version": 1, "source_media_search": search,
+               "source_media_acquisition": source_media_acquisition(research, rows),
+               "source_images": images, "allowed_asset_ids": [row["artifact_id"] for row in images],
+               "context_files": [row["relative_path"] for row in images]}
+    if any(key in inputs and inputs[key] != value for key, value in context.items()):
+        raise TaskConflictError("SOURCE_MEDIA_SCRIPT_CONTEXT_CHANGED")
+    return context
+
+
 def _source_media_priority_errors(session: Session, task: AgentTask, result: dict) -> list[dict]:
     inputs = task.input_data or {}
+    if task.task_type == TaskType.SHORT_SCRIPT and inputs.get("production_mode") == "image_only":
+        try:
+            context = script_source_media_context(session, task.content_id, inputs, verify_files=True)
+        except TaskConflictError as exc:
+            return [{"path": ["source_images"], "message": str(exc)}]
+        if context is not None and context["source_images"]:
+            allowed = {*context["allowed_asset_ids"], "ai_generate"}
+            return [{"path": ["visual_requirements", index, "preferred_source"],
+                     "message": "图文脚本必须引用当前研究已登记的 artifact_id 或 ai_generate"}
+                    for index, row in enumerate(result.get("visual_requirements", []))
+                    if row.get("preferred_source") not in allowed]
     if inputs.get("production_mode") != "image_only" or "source_media_priority_version" not in inputs:
         return []
     if type(inputs["source_media_priority_version"]) is not int or inputs["source_media_priority_version"] != 1:
