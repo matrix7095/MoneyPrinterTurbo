@@ -4,7 +4,7 @@ from typing import Literal
 
 from glance_core.agent_roles import AgentRole
 from glance_core.models import TaskType
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
 
 
 class StrictRequest(BaseModel):
@@ -18,6 +18,22 @@ class PublishedRevisionRequest(StrictRequest):
     expected_revision_id: str | None
     publication_id: str = Field(min_length=1, max_length=100)
     feedback: str = Field(min_length=1, max_length=10000)
+
+
+class SourceMediaRefreshRequest(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_key: str = Field(min_length=1, max_length=160)
+    expected_revision_id: str = Field(min_length=1, max_length=100)
+    research_task_id: str = Field(min_length=1, max_length=100)
+    feedback: str = Field(min_length=1, max_length=10000)
+
+    @field_validator("request_key", "expected_revision_id", "research_task_id", "feedback")
+    @classmethod
+    def reject_blank(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
 
 class DispatchRequest(StrictRequest):
