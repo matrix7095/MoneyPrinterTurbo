@@ -147,6 +147,10 @@ EDITABLE_FIELDS: tuple[EditableField, ...] = (
     ),
     # ---- 转写 ----
     EditableField(
+        "subtitle_alignment_fallback_model_dir", "字幕备用本机模型目录", "转写", "text",
+        "留空禁用。仅字幕全文不匹配时启用；须为完整已安装目录，不下载模型，不改变最终音频质检配置。",
+    ),
+    EditableField(
         "asr_model",
         "本地转写模型",
         "转写",

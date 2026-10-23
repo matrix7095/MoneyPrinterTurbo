@@ -49,6 +49,10 @@ class NonRetryableMediaError(RuntimeError):
     """
 
 
+class _SubtitleTextMismatch(NonRetryableMediaError):
+    """Only a complete but differently transcribed voice permits the subtitle fallback."""
+
+
 def missing_media_tools(*names: str) -> list[str]:
     """返回 PATH 中缺失的工具名；用于失败前置，避免深层英文报错。"""
     return [name for name in names if shutil.which(name) is None]
@@ -701,6 +705,8 @@ def _split_boundary(boundary: dict[str, Any], duration: float) -> list[tuple[flo
 
 
 _SUBTITLE_ALIGNMENT_VERSION = 1
+_SUBTITLE_ALIGNMENT_V2_STRATEGY = "positional_pronouns_pcm_midpoint_v2"
+_SUBTITLE_PRONOUNS = frozenset("他她它")
 _SUBTITLE_ALIGNMENT_PUNCTUATION = frozenset("，。！？；：、,.!?;:“”‘’\"「」『』《》〈〉（）()【】[]")
 _SUBTITLE_WORD_OVERLAP_SEC = 0.1
 
@@ -718,7 +724,7 @@ def _spoken_subtitle_indices(text: str) -> list[int]:
     )]
 
 
-def _aligned_subtitle_words(narration: str, segments: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
+def _aligned_subtitle_words(narration: str, segments: list[dict[str, Any]], duration: float, *, version: int = 1) -> list[dict[str, Any]]:
     """Map exact ASR characters back to approved text; never rewrite the script."""
     if not isinstance(narration, str) or not narration.strip() or not isinstance(segments, list) or not segments:
         raise NonRetryableMediaError("Subtitle alignment requires complete ASR words")
@@ -730,14 +736,24 @@ def _aligned_subtitle_words(narration: str, segments: list[dict[str, Any]], dura
         words.extend(segment["words"])
     if any(not isinstance(word, dict) or not isinstance(word.get("text"), str) or not word["text"].strip() for word in words):
         raise NonRetryableMediaError("Subtitle alignment requires complete ASR words")
+    if version == 2:
+        for segment in segments:
+            segment_words = "".join(word["text"] for word in segment["words"])
+            if ("".join(segment_words[index] for index in _spoken_subtitle_indices(segment_words))
+                    != "".join(segment["text"][index] for index in _spoken_subtitle_indices(segment["text"]))):
+                raise NonRetryableMediaError("Subtitle ASR words and segment text disagree")
     observed = "".join(word["text"] for word in words)
     observed_indices = _spoken_subtitle_indices(observed)
     source_indices = _spoken_subtitle_indices(narration)
     spoken = "".join(observed[index] for index in observed_indices)
     segment_text = "".join(segment["text"] for segment in segments)
-    if (not spoken or spoken != "".join(narration[index] for index in source_indices)
-            or spoken != "".join(segment_text[index] for index in _spoken_subtitle_indices(segment_text))):
-        raise NonRetryableMediaError("Subtitle ASR text does not exactly match the approved narration")
+    if not spoken or spoken != "".join(segment_text[index] for index in _spoken_subtitle_indices(segment_text)):
+        raise NonRetryableMediaError("Subtitle ASR words and segment text disagree")
+    approved = "".join(narration[index] for index in source_indices)
+    if (version not in (1, 2) or len(spoken) != len(approved)
+            or any(left != right and not (version == 2 and left in _SUBTITLE_PRONOUNS and right in _SUBTITLE_PRONOUNS)
+                   for left, right in zip(spoken, approved))):
+        raise _SubtitleTextMismatch("Subtitle ASR text does not exactly match the approved narration")
     result, consumed, source_start, observed_start = [], 0, 0, 0
     previous_start = previous_end = None
     for index, word in enumerate(words):
@@ -753,13 +769,186 @@ def _aligned_subtitle_words(narration: str, segments: list[dict[str, Any]], dura
         observed_start = observed_end
         if not count:
             continue
+        mappings = [{"observed": spoken[position], "approved": approved[position],
+                     "observed_char_index": observed_indices[position], "source_char_index": source_indices[position],
+                     "asr_word_index": index, "start_sec": float(start), "end_sec": float(end)}
+                    for position in range(consumed, consumed + count) if spoken[position] != approved[position]]
         consumed += count
         source_end = source_indices[consumed] if consumed < len(source_indices) else len(narration)
         result.append({"asr_word_index": index, "text": narration[source_start:source_end],
                        "start_sec": float(start), "end_sec": float(end),
                        "source_start_char": source_start, "source_end_char": source_end})
+        if mappings:
+            result[-1]["pronoun_mappings"] = mappings
         source_start = source_end
     return result
+
+
+def _subtitle_model_manifest(model_dir: str) -> dict[str, Any]:
+    path = Path(model_dir)
+    if not path.is_absolute() or str(path).startswith(("\\\\", "//")) or not path.is_dir():
+        raise NonRetryableMediaError("Subtitle fallback requires an existing local model directory")
+    names = {"config.json", "model.bin", "tokenizer.json"}
+    vocabulary = [item.name for item in path.glob("vocabulary.*") if item.is_file()]
+    if not vocabulary:
+        raise NonRetryableMediaError("Subtitle fallback model is incomplete")
+    names.update(vocabulary)
+    if (path / "preprocessor_config.json").is_file():
+        names.add("preprocessor_config.json")
+    files = []
+    for name in sorted(names):
+        target = path / name
+        if not target.is_file() or not target.stat().st_size:
+            raise NonRetryableMediaError("Subtitle fallback model is incomplete")
+        files.append({"name": name, "size_bytes": target.stat().st_size, "sha256": sha256_file(target)})
+    return {"model_dir": str(path.resolve()), "files": files, "files_sha256": _subtitle_alignment_hash(files)}
+
+
+def _subtitle_pcm_plan(voice_path: Path, duration: float) -> dict[str, Any]:
+    decoded = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(voice_path), "-f", "s16le",
+         "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+        check=True, capture_output=True, timeout=90, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    samples = array("h")
+    if len(decoded.stdout) % 2:
+        raise NonRetryableMediaError("Subtitle fallback PCM is not 16-bit aligned")
+    samples.frombytes(decoded.stdout)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    pcm_duration = len(samples) / 24000
+    if not samples or abs(pcm_duration - duration) > .03:
+        raise NonRetryableMediaError("Subtitle fallback PCM duration does not match voice")
+    quiet = []
+    for first in range(0, len(samples), 240):
+        block = samples[first:first + 240]
+        rms = math.sqrt(sum(sample * sample for sample in block) / len(block))
+        quiet.append(20 * math.log10(max(rms, 1.0) / 32768) <= -45)
+    runs, start = [], None
+    for index in range(len(quiet) + 1):
+        if index < len(quiet) and quiet[index]:
+            if start is None:
+                start = index
+        elif start is not None:
+            left, right = start * .01, min(index * .01, pcm_duration)
+            if index - start >= 10 and left > .05 and right < pcm_duration - .05:
+                runs.append({"start_sec": round(left, 4), "end_sec": round(right, 4),
+                             "center_sec": round((left + right) / 2, 5)})
+            start = None
+    if not runs:
+        raise NonRetryableMediaError("Subtitle fallback has no qualifying internal PCM silence")
+    selected = min(runs, key=lambda row: (abs(row["center_sec"] - duration / 2), row["start_sec"]))
+    cut = selected["center_sec"]
+    if not .25 < cut < duration - .25:
+        raise NonRetryableMediaError("Subtitle fallback cannot produce two substantial halves")
+    return {"algorithm": "nearest_midpoint_internal_pcm_silence_v1", "sample_rate_hz": 24000,
+            "sample_count": len(samples), "decoded_duration_sec": pcm_duration,
+            "decoded_pcm_sha256": hashlib.sha256(decoded.stdout).hexdigest(),
+            "window_sec": .01, "rms_threshold_dbfs": -45, "minimum_quiet_run_sec": .1,
+            "edge_guard_sec": .05, "minimum_half_sec": .25, "silence_runs": runs,
+            "selected_silence": selected, "halves": [[0.0, cut], [cut, duration]]}
+
+
+def _validate_subtitle_half(records, start, end, duration):
+    _aligned_subtitle_words("".join(row["text"] for row in records), records, duration, version=2)
+    for segment in records:
+        for row in [segment, *segment["words"]]:
+            if row["start_sec"] < start - .03 or row["end_sec"] > end + .03:
+                raise NonRetryableMediaError("Subtitle fallback requires original global clip timestamps")
+
+
+def _validate_subtitle_recognition(alignment, narration, duration, voice_path):
+    evidence = alignment["recognition_evidence"]
+    primary = evidence["primary"]
+    if (primary["model"] != alignment["asr_model"] or primary["device"] != alignment["asr_device"]
+            or primary["compute_type"] != alignment["asr_compute_type"]
+            or primary["parameters"] != {"vad_filter": True, "word_timestamps": True, "sdk_defaults": True}):
+        raise NonRetryableMediaError("Subtitle primary ASR evidence changed")
+    records = primary["segments"]
+    _aligned_subtitle_words("".join(row["text"] for row in records), records, duration, version=2)
+    fallback = evidence.get("fallback")
+    if fallback is None:
+        if records != alignment["segments"]:
+            raise NonRetryableMediaError("Subtitle primary ASR observations changed")
+        return
+    try:
+        _aligned_subtitle_words(narration, records, duration, version=2)
+    except _SubtitleTextMismatch:
+        pass
+    else:
+        raise NonRetryableMediaError("Subtitle fallback lacks a primary text mismatch")
+    plan, model = fallback["pcm"], fallback["model"]
+    if (fallback["parameters"] != {"vad_filter": False, "condition_on_previous_text": False, "word_timestamps": True}
+            or not isinstance(fallback.get("sdk_version"), str) or not fallback["sdk_version"]
+            or fallback["device"] != alignment["asr_device"] or fallback["compute_type"] != alignment["asr_compute_type"]
+            or model["files_sha256"] != _subtitle_alignment_hash(model["files"])
+            or plan["algorithm"] != "nearest_midpoint_internal_pcm_silence_v1"
+            or (plan["sample_rate_hz"], plan["window_sec"], plan["rms_threshold_dbfs"], plan["minimum_quiet_run_sec"],
+                plan["edge_guard_sec"], plan["minimum_half_sec"]) != (24000, .01, -45, .1, .05, .25)
+            or type(plan["sample_count"]) is not int or plan["sample_count"] <= 0
+            or plan["decoded_duration_sec"] != plan["sample_count"] / 24000
+            or abs(plan["decoded_duration_sec"] - duration) > .03
+            or not re.fullmatch(r"[0-9a-f]{64}", plan["decoded_pcm_sha256"])):
+        raise NonRetryableMediaError("Subtitle fallback strategy evidence changed")
+    runs = plan["silence_runs"]
+    if not runs or any(not (.05 < row["start_sec"] < row["end_sec"] < plan["decoded_duration_sec"] - .05)
+                       or row["end_sec"] - row["start_sec"] < .1 - 1e-6
+                       or row["center_sec"] != round((row["start_sec"] + row["end_sec"]) / 2, 5) for row in runs):
+        raise NonRetryableMediaError("Subtitle fallback silence evidence changed")
+    selected = min(runs, key=lambda row: (abs(row["center_sec"] - duration / 2), row["start_sec"]))
+    cut = selected["center_sec"]
+    if (plan["selected_silence"] != selected or not .25 < cut < duration - .25
+            or plan["halves"] != [[0., cut], [cut, duration]] or len(fallback["halves"]) != 2):
+        raise NonRetryableMediaError("Subtitle fallback does not cover the complete voice")
+    if voice_path is not None and (_subtitle_pcm_plan(voice_path, duration) != plan
+                                  or _subtitle_model_manifest(model["model_dir"]) != model):
+        raise NonRetryableMediaError("Subtitle fallback source bytes changed")
+    merged = []
+    for half, bounds in zip(fallback["halves"], plan["halves"], strict=True):
+        if half["clip_timestamps"] != bounds:
+            raise NonRetryableMediaError("Subtitle fallback clip coverage changed")
+        _validate_subtitle_half(half["segments"], *bounds, duration)
+        merged.extend(half["segments"])
+    if merged != alignment["segments"]:
+        raise NonRetryableMediaError("Subtitle fallback raw observations changed")
+
+
+def _serialize_asr_segments(raw_segments):
+    segments = []
+    for index, segment in enumerate(raw_segments, start=1):
+        item: dict[str, Any] = {
+            "segment_id": f"seg-{index:04d}",
+            "start_sec": round(segment.start, 3),
+            "end_sec": round(segment.end, 3),
+            "text": segment.text.strip(),
+        }
+        for key in ("avg_logprob", "no_speech_prob"):
+            value = getattr(segment, key, None)
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                item[key] = value
+        words = []
+        for word in getattr(segment, "words", None) or []:
+            word_text = str(getattr(word, "word", "") or "").strip()
+            if word_text:
+                words.append(
+                    {
+                        "start_sec": round(word.start, 3),
+                        "end_sec": round(word.end, 3),
+                        "text": word_text,
+                    }
+                )
+                probability = getattr(word, "probability", None)
+                if (
+                    isinstance(probability, Real)
+                    and not isinstance(probability, bool)
+                    and math.isfinite(probability)
+                    and 0 <= probability <= 1
+                ):
+                    words[-1]["probability"] = float(probability)
+        if words:
+            item["words"] = words
+        segments.append(item)
+    return segments
 
 
 def _aligned_subtitle_events(words: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
@@ -1853,40 +2042,7 @@ class MediaExecutor:
                 vad_filter=True,
                 word_timestamps=True,
             )
-            segments = []
-            for index, segment in enumerate(raw_segments, start=1):
-                item: dict[str, Any] = {
-                    "segment_id": f"seg-{index:04d}",
-                    "start_sec": round(segment.start, 3),
-                    "end_sec": round(segment.end, 3),
-                    "text": segment.text.strip(),
-                }
-                for key in ("avg_logprob", "no_speech_prob"):
-                    value = getattr(segment, key, None)
-                    if isinstance(value, (int, float)) and math.isfinite(value):
-                        item[key] = value
-                words = []
-                for word in getattr(segment, "words", None) or []:
-                    word_text = str(getattr(word, "word", "") or "").strip()
-                    if word_text:
-                        words.append(
-                            {
-                                "start_sec": round(word.start, 3),
-                                "end_sec": round(word.end, 3),
-                                "text": word_text,
-                            }
-                        )
-                        probability = getattr(word, "probability", None)
-                        if (
-                            isinstance(probability, Real)
-                            and not isinstance(probability, bool)
-                            and math.isfinite(probability)
-                            and 0 <= probability <= 1
-                        ):
-                            words[-1]["probability"] = float(probability)
-                if words:
-                    item["words"] = words
-                segments.append(item)
+            segments = _serialize_asr_segments(raw_segments)
         except (RuntimeError, ValueError, OSError) as exc:
             return [], f"local ASR failed ({type(exc).__name__}): {exc}"
         return segments, ""
@@ -1894,6 +2050,7 @@ class MediaExecutor:
     def align_subtitles(
         self, voice_path: Path, narration: str, *, asr_model: str,
         asr_device: str = "auto", asr_compute_type: str = "float16",
+        fallback_model_dir: str = "",
     ) -> dict[str, Any]:
         """Fresh unprompted voice ASR for rendering, never final-track QC evidence."""
         if not asr_model:
@@ -1916,19 +2073,93 @@ class MediaExecutor:
             raise NonRetryableMediaError(f"Subtitle local ASR unavailable [{code}]; no estimated timing was used")
         if sha256_file(voice_path) != voice_sha:
             raise NonRetryableMediaError("Subtitle voice bytes changed during ASR")
-        words = _aligned_subtitle_words(narration, segments, duration)
-        _aligned_subtitle_events(words)
-        return {"version": _SUBTITLE_ALIGNMENT_VERSION, "method": "strict_voice_asr_words",
+        evidence = {"primary": {"model": asr_model, "device": asr_device, "compute_type": asr_compute_type,
+                                "parameters": {"vad_filter": True, "word_timestamps": True, "sdk_defaults": True},
+                                "segments": segments}}
+        version = 1
+        try:
+            try:
+                words = _aligned_subtitle_words(narration, segments, duration)
+            except _SubtitleTextMismatch:
+                version = 2
+                try:
+                    words = _aligned_subtitle_words(narration, segments, duration, version=2)
+                except _SubtitleTextMismatch:
+                    # Validate the original observations before considering another recognition.
+                    _aligned_subtitle_words("".join(row["text"] for row in segments), segments, duration, version=2)
+                    if not fallback_model_dir:
+                        raise
+                    evidence["fallback"] = {}
+                    segments = self._subtitle_fallback(voice_path, duration, fallback_model_dir,
+                                                       asr_device, asr_compute_type, evidence["fallback"])
+                    words = _aligned_subtitle_words(narration, segments, duration, version=2)
+            if sha256_file(voice_path) != voice_sha:
+                raise NonRetryableMediaError("Subtitle voice bytes changed during ASR")
+            _aligned_subtitle_events(words)
+        except (NonRetryableMediaError, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            self._subtitle_asr_record(voice_sha, narration, duration, evidence, type(exc).__name__, exception=exc)
+            if isinstance(exc, NonRetryableMediaError):
+                raise
+            raise NonRetryableMediaError("Subtitle fallback recognition failed; original evidence retained") from exc
+        result = {"version": version, "method": "strict_voice_asr_words",
                 "voice_sha256": voice_sha, "narration_sha256": hashlib.sha256(narration.encode("utf-8")).hexdigest(),
                 "duration_sec": duration, "asr_model": asr_model, "asr_device": asr_device,
                 "asr_compute_type": asr_compute_type, "segments": segments,
                 "segments_sha256": _subtitle_alignment_hash(segments), "words": words,
                 "mapping_sha256": _subtitle_alignment_hash(words)}
+        if version == 2:
+            result.update(strategy=_SUBTITLE_ALIGNMENT_V2_STRATEGY,
+                          pronoun_mappings=[row for word in words for row in word.get("pronoun_mappings", [])],
+                          recognition_evidence=evidence, recognition_evidence_sha256=_subtitle_alignment_hash(evidence))
+            self._subtitle_asr_record(voice_sha, narration, duration, evidence, "aligned_v2")
+        return result
+
+    def _subtitle_asr_record(self, voice_sha, narration, duration, evidence, outcome, *, exception=None):
+        record = {"voice_sha256": voice_sha, "narration_sha256": hashlib.sha256(narration.encode()).hexdigest(),
+                  "duration_sec": duration, "recognition_evidence": evidence, "outcome": outcome}
+        if exception is not None:
+            record["exception"] = {"type": type(exception).__name__, "message": str(exception)}
+        try:
+            fingerprint = _subtitle_alignment_hash(record)
+        except (TypeError, ValueError):
+            record["invalid_observations_repr"] = repr(record.pop("recognition_evidence"))
+            fingerprint = _subtitle_alignment_hash(record)
+        directory = self.root / "render" / "subtitle-asr-evidence"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{fingerprint}.json"
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                json.dump(record, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        except FileExistsError:
+            if json.loads(path.read_text(encoding="utf-8")) != record:
+                raise NonRetryableMediaError("Immutable subtitle ASR evidence changed") from None
+
+    def _subtitle_fallback(self, voice_path, duration, model_dir, device, compute_type, evidence):
+        from importlib.metadata import version
+        from faster_whisper import WhisperModel
+
+        evidence["sdk_version"] = version("faster-whisper")
+        evidence["model"] = _subtitle_model_manifest(model_dir)
+        evidence["pcm"] = _subtitle_pcm_plan(voice_path, duration)
+        evidence["parameters"] = {"vad_filter": False, "condition_on_previous_text": False, "word_timestamps": True}
+        evidence["device"], evidence["compute_type"] = device, compute_type
+        evidence["halves"] = []
+        model = WhisperModel(evidence["model"]["model_dir"], device=device, compute_type=compute_type, local_files_only=True)
+        merged = []
+        for start, end in evidence["pcm"]["halves"]:
+            raw, _ = model.transcribe(str(voice_path), clip_timestamps=[start, end], **evidence["parameters"])
+            records = _serialize_asr_segments(raw)
+            evidence["halves"].append({"clip_timestamps": [start, end], "segments": records})
+            _validate_subtitle_half(records, start, end, duration)
+            merged.extend(records)
+        if _subtitle_model_manifest(model_dir) != evidence["model"]:
+            raise NonRetryableMediaError("Subtitle fallback model bytes changed during ASR")
+        return merged
 
     def _checked_subtitle_alignment(
         self, alignment: dict[str, Any], narration: str, duration: float, *, voice_path: Path | None = None,
     ) -> list[tuple[float, float, str]]:
-        if (not isinstance(alignment, dict) or alignment.get("version") != _SUBTITLE_ALIGNMENT_VERSION
+        if (not isinstance(alignment, dict) or type(alignment.get("version")) is not int or alignment.get("version") not in (1, 2)
                 or alignment.get("method") != "strict_voice_asr_words"
                 or alignment.get("narration_sha256") != hashlib.sha256(narration.encode("utf-8")).hexdigest()
                 or alignment.get("duration_sec") != duration
@@ -1937,11 +2168,20 @@ class MediaExecutor:
                 or (voice_path is not None and alignment["voice_sha256"] != sha256_file(voice_path))):
             raise NonRetryableMediaError("Subtitle alignment identity is stale or invalid")
         try:
-            words = _aligned_subtitle_words(narration, alignment.get("segments"), duration)
+            version = alignment["version"]
+            words = _aligned_subtitle_words(narration, alignment.get("segments"), duration, version=version)
             if (alignment.get("segments_sha256") != _subtitle_alignment_hash(alignment["segments"])
                     or alignment.get("words") != words or alignment.get("mapping_sha256") != _subtitle_alignment_hash(words)):
                 raise NonRetryableMediaError("Subtitle alignment mapping hash is invalid")
-        except (KeyError, TypeError, ValueError) as exc:
+            if version == 2:
+                if (alignment.get("strategy") != _SUBTITLE_ALIGNMENT_V2_STRATEGY
+                        or alignment.get("pronoun_mappings") != [row for word in words for row in word.get("pronoun_mappings", [])]
+                        or alignment.get("recognition_evidence_sha256") != _subtitle_alignment_hash(alignment.get("recognition_evidence"))):
+                    raise NonRetryableMediaError("Subtitle alignment v2 evidence hash is invalid")
+                _validate_subtitle_recognition(alignment, narration, duration, voice_path)
+            elif any(key in alignment for key in ("strategy", "pronoun_mappings", "recognition_evidence", "recognition_evidence_sha256")):
+                raise NonRetryableMediaError("Subtitle alignment v1 cannot claim v2 evidence")
+        except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             raise NonRetryableMediaError("Subtitle alignment mapping is invalid") from exc
         return _aligned_subtitle_events(words)
 

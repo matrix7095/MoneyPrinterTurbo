@@ -157,6 +157,7 @@ class Settings(BaseSettings):
     asr_model: str = ""
     asr_device: str = "auto"
     asr_compute_type: str = "float16"
+    subtitle_alignment_fallback_model_dir: str = ""
 
     # yt-dlp 下载携带的 YouTube Cookies（Netscape 格式 cookies.txt 绝对路径）。
     # 留空则裸请求；用于破解 "Sign in to confirm you're not a bot" 人机验证。

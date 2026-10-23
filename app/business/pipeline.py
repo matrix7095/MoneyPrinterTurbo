@@ -3247,6 +3247,7 @@ def render_content(
             arguments["subtitle_alignment"] = executor.align_subtitles(
                 arguments["voice_path"], arguments["narration"], asr_model=settings.asr_model,
                 asr_device=settings.asr_device, asr_compute_type=settings.asr_compute_type,
+                fallback_model_dir=settings.subtitle_alignment_fallback_model_dir,
             )
             return executor.render(**arguments, encoder=settings.video_encoder)
 
