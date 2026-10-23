@@ -115,6 +115,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot identify this virtual environment runti
 
 $businessOptions = [ordered]@{
     asr_model = 'medium'; asr_device = 'cpu'; asr_compute_type = 'int8'
+    subtitle_alignment_fallback_model_dir = ''
     tts_provider = 'edge'; tts_voice = 'zh-CN-YunxiNeural'; tts_rate = '+20%'; tts_volume = '+0%'
     tts_provider_endpoint = ''; kokoro_model_dir = ''
     handsfree_enabled = $false; handsfree_auto_topic_enabled = $true
@@ -198,6 +199,20 @@ if not failures:
         local.is_dir() and (local / "model.bin").is_file() and (local / "config.json").is_file()
     ):
         failures.append("asr_model:unsupported_model_or_local_directory")
+    if options.get("subtitle_alignment_fallback_model_dir"):
+        try:
+            # The watchdog repeats startup validation; hash model bytes only at actual subtitle recognition.
+            subtitle_model = Path(options["subtitle_alignment_fallback_model_dir"])
+            if not subtitle_model.is_absolute() or str(subtitle_model).startswith(("\\\\", "//")) or not subtitle_model.is_dir():
+                raise ValueError("local absolute directory required")
+            vocabulary = [item for item in subtitle_model.glob("vocabulary.*") if item.is_file()]
+            required = [subtitle_model / name for name in ("model.bin", "config.json", "tokenizer.json")]
+            if (not vocabulary or any(not item.is_file() or not item.stat().st_size for item in required + vocabulary)
+                    or ((subtitle_model / "preprocessor_config.json").is_file()
+                        and not (subtitle_model / "preprocessor_config.json").stat().st_size)):
+                raise ValueError("complete local model required")
+        except (OSError, ValueError):
+            failures.append("subtitle_alignment_fallback_model_dir:complete_local_model_required")
     device = options["asr_device"]
     if device not in {"cpu", "cuda", "auto"}:
         failures.append("asr_device:unsupported_device")
