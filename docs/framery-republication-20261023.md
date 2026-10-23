@@ -1,6 +1,6 @@
 # Framery One Work 修订制作与重新发布
 
-截至 2026-10-23，重新发布所需的业务修订功能已部署，新修订的正式研究已完成。研究确认官方图片存在，但公开使用许可仍缺失，后续制作暂未放行。本文不把部署验收或旧作品链接当作本次发布成功。
+截至 2026-10-23，重新发布所需的业务修订功能已部署，新修订的正式研究已完成。用户最新明确表示“我已有这两张图片的书面许可”；目前正在定位许可正文，以核对适用素材、使用范围和署名要求。许可询问邮件不发送。后续制作暂未恢复，本文不把用户表示持有许可写成已经审阅许可文件，也不把部署验收或旧作品链接当作本次发布成功。
 
 ## 制作要求
 
@@ -46,7 +46,7 @@
 | --- | --- |
 | 采集记录核对、代码提交推送、受管部署 | 已完成 |
 | 当前修订正式研究 | 已完成并接收 |
-| 官方素材许可 | 尚缺适用凭据 |
+| 官方素材许可 | 用户已确认持有书面许可，原文位置及范围待核对 |
 | 新正式成片、九项成片质检、发布包 | 尚未完成 |
 | 本次新作品链接 | 尚无；不能用旧作品链接替代 |
 
@@ -67,5 +67,6 @@
 - [防止全 AI 分支的正常排空请求](../storage/smoke/published-revision-20261022/formal-revision-official-route-drain-20261023.json)
 - [官方素材使用依据调查](../storage/smoke/source-first-recut-20261022/rights-research-20261022.json)
 - [新增官方渠道许可调查](../storage/smoke/source-first-recut-20261022/alternate-official-rights-search-20261023.json)
+- [用户确认已有书面许可](../storage/smoke/source-first-recut-20261022/permission-user-confirmation-20261023.json)
 - [尚未发送的素材许可询问邮件](../storage/smoke/source-first-recut-20261022/framery-image-permission-request-20261022.txt)
 - [已发布内容修订操作协议](published-revisions.md)
