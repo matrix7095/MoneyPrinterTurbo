@@ -22,7 +22,7 @@ from sqlmodel import Session, select
 
 from app.business.auth import require_admin
 from app.business.requests import RejectScriptRequest, HostAttachRequest, SpawnIntentRequest, HostObservationRequest, StopRunRequest, ExpectedHostBinding
-from app.business.requests import PackagedVisualContextRequest, PendingRenderRevisionRequest, PublishedRevisionRequest, SourceMediaRefreshRequest
+from app.business.requests import PackagedVisualContextRequest, PendingRenderRevisionRequest, PublishedRevisionRequest, RightsEvidenceRequest, SourceMediaRefreshRequest
 from app.business.runtime import get_runtime, get_session
 from app.business.bundles import sha256_file
 from app.business.quarantine import quarantine_records, task_projection
@@ -295,6 +295,31 @@ def refresh_source_media(*, content_id: str, payload: SourceMediaRefreshRequest,
 
     try:
         return refresh(get_runtime(request), content_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content not found") from None
+    except (ValueError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.get("/contents/{content_id}/rights-evidence/preflight")
+def rights_evidence_preflight(*, content_id: str, expected_revision_id: str, research_task_id: str,
+                             qc_task_id: str, recovery_task_id: str, request: Request):
+    from app.business.rights_evidence import preflight
+
+    try:
+        return preflight(get_runtime(request), content_id, expected_revision_id, research_task_id, qc_task_id, recovery_task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content not found") from None
+    except (ValueError, TaskConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/contents/{content_id}/rights-evidence")
+def submit_rights_evidence(*, content_id: str, payload: RightsEvidenceRequest, request: Request):
+    from app.business.rights_evidence import submit
+
+    try:
+        return submit(get_runtime(request), content_id, payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="Content not found") from None
     except (ValueError, TaskConflictError) as exc:

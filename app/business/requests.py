@@ -36,6 +36,27 @@ class SourceMediaRefreshRequest(StrictRequest):
         return value
 
 
+class RightsEvidenceRequest(StrictRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_key: str = Field(min_length=1, max_length=160)
+    expected_revision_id: str = Field(min_length=1, max_length=100)
+    research_task_id: str = Field(min_length=1, max_length=100)
+    qc_task_id: str = Field(min_length=1, max_length=100)
+    recovery_task_id: str = Field(min_length=1, max_length=100)
+    research_result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    qc_result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    recovery_result_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_text: str = Field(min_length=1, max_length=20000)
+
+    @field_validator("request_key", "expected_revision_id", "research_task_id", "qc_task_id", "recovery_task_id", "evidence_text")
+    @classmethod
+    def reject_blank(cls, value):
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
 class DispatchRequest(StrictRequest):
     agent_id: str = Field(min_length=1)
     role_id: AgentRole | None = None

@@ -1484,6 +1484,8 @@ def _advance_after_agent(
     settings: Settings,
     task_id: str,
 ) -> str | None:
+    from app.business.rights_evidence import continuation_inputs
+
     with Session(engine) as session:
         session.info["consuming_agent_task_id"] = task_id
         task = session.get(AgentTask, task_id)
@@ -1797,6 +1799,7 @@ def _advance_after_agent(
                 ],
                 **flow.script_audience_inputs(content, research_task, settings=settings),
             }
+            script_input.update(continuation_inputs(session, research_task, recovery_max_rounds=flow.recovery_max_rounds))
             if image_only:
                 # 图文模式：研究完成后先把配图下载登记，再直达口播脚本。
                 _acquire_source_images(session, content, research_task.result_data or {}, research_task)
@@ -1897,6 +1900,7 @@ def _advance_after_agent(
                 content_id,
                 TaskType.SCRIPT_QC,
                 {
+                    **continuation_inputs(session, task, recovery_max_rounds=flow.recovery_max_rounds),
                     "upstream_task_ids": {
                         "script": task.id,
                         "research": research_task.id if research_task else "",
