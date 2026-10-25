@@ -38,7 +38,11 @@ logger = logging.getLogger(__name__)
 _BOUNDARY_QUANTIZATION_TOLERANCE_SEC = 0.001
 _BOUNDARY_OVERLAP_TOLERANCE_SEC = 0.05
 _MIN_RENDER_SEGMENT_DURATION_SEC = 0.05
-_SUBTITLE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._'\u2019/-][A-Za-z0-9]+)*|[^\s]")
+_SUBTITLE_TOKEN_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:平方(?:千米|公里|厘米|毫米|米)|立方(?:厘米|米)|厘米|毫米|分米|千米|公里|米|"
+    r"英寸|英尺|千克|公斤|毫克|克|毫升|升|小时|分钟|秒钟|秒|摄氏度|度)"
+    r"|[A-Za-z0-9]+(?:[._'\u2019/-][A-Za-z0-9]+)*|[^\s]"
+)
 _SUBTITLE_BREAK_CHARS = frozenset("，。！？；、,.!?;")
 
 
@@ -681,6 +685,25 @@ def _subtitle_parts(text: str) -> list[str]:
     return parts
 
 
+def _aligned_subtitle_parts(text: str) -> list[str]:
+    parts = _subtitle_parts(text)
+    if len(parts) <= 2 and all(_subtitle_visible_length(part) <= _SUBTITLE_LINE_CHARS for part in parts):
+        return parts
+
+    units = _subtitle_units(text)
+    choices = []
+    for split in range(1, len(units)):
+        left, right = "".join(units[:split]).strip(), "".join(units[split:]).strip()
+        left_length, right_length = _subtitle_visible_length(left), _subtitle_visible_length(right)
+        if max(left_length, right_length) <= _SUBTITLE_LINE_CHARS:
+            punctuation = bool(left and left[-1] in _SUBTITLE_BREAK_CHARS)
+            choices.append((not punctuation, abs(left_length - right_length), split, left, right))
+    if not choices:
+        return parts
+    _, _, _, left, right = min(choices)
+    return [left, right]
+
+
 def _split_boundary(boundary: dict[str, Any], duration: float) -> list[tuple[float, float, str]]:
     """把超长边界按标点和不可拆分 token 切成多行，按字数分配时间。"""
     text = str(boundary["text"])
@@ -988,7 +1011,12 @@ def _aligned_subtitle_events(words: list[dict[str, Any]]) -> list[tuple[float, f
         text = re.sub(r"\s+", " ", "".join(word["text"] for word in group)).strip()
         if len(text) > 2 * _SUBTITLE_LINE_CHARS:
             raise NonRetryableMediaError("Subtitle ASR words cannot safely display in two lines")
-        events.append((start, end, hard_wrap(text, _SUBTITLE_LINE_CHARS)))
+        lines = _aligned_subtitle_parts(text)
+        if len(lines) > 2 or any(
+            _subtitle_visible_length(line) > _SUBTITLE_LINE_CHARS for line in lines
+        ):
+            raise NonRetryableMediaError("Subtitle ASR event cannot safely display in two lines")
+        events.append((start, end, r"\N".join(lines)))
     return events
 
 

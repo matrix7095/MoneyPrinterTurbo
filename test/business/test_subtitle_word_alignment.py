@@ -109,6 +109,87 @@ def test_decimal_token_spanning_asr_words_never_becomes_two_timed_captions(align
     assert alignment["words"][2]["text"] == "5"
 
 
+def test_aligned_caption_wrap_keeps_decimal_unit_together(aligner):
+    executor, _, state, _, align = aligner
+    narration = "这款单人工作舱，每个占地2.5平方米。"
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    events = caption_events(executor, narration, align(narration), 1.2)
+
+    lines = [line for event in events for line in event.text.split(r"\N")]
+    assert "".join(lines) == narration
+    assert any("2.5平方米" in line for line in lines)
+    assert all(len(line) <= portable._SUBTITLE_LINE_CHARS for line in lines)
+
+
+@pytest.mark.parametrize(
+    "measurement",
+    ["2.5平方米", "2.5平方米面积", "2.5 平方米", "68厘米", "118厘米", "Model-X100"],
+)
+def test_aligned_caption_keeps_measurement_and_model_tokens_together(aligner, measurement):
+    executor, _, state, _, align = aligner
+    narration = "甲" * 11 + measurement + "后"
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    events = caption_events(executor, narration, align(narration), 1.2)
+
+    lines = [line for event in events for line in event.text.split(r"\N")]
+    assert "".join(lines) == narration
+    assert any(measurement in line for line in lines)
+    assert all(portable._subtitle_visible_length(line) <= portable._SUBTITLE_LINE_CHARS for line in lines)
+
+
+@pytest.mark.parametrize("identifier", ["5G网络支持", "3D建模", "5mmWave", "1.2.3版本"])
+def test_aligned_caption_keeps_numeric_leading_identifiers_together(aligner, identifier):
+    executor, _, state, _, align = aligner
+    narration = "甲" * 13 + identifier
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    events = caption_events(executor, narration, align(narration), 1.2)
+
+    lines = [line for event in events for line in event.text.split(r"\N")]
+    assert "".join(lines) == narration
+    assert any(identifier in line for line in lines)
+    assert all(portable._subtitle_visible_length(line) <= portable._SUBTITLE_LINE_CHARS for line in lines)
+
+
+def test_aligned_caption_wraps_long_cjk_without_losing_text(aligner):
+    executor, _, state, _, align = aligner
+    narration = "这是一个比较长的中文字幕句子，需要正常换行。"
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    events = caption_events(executor, narration, align(narration), 1.2)
+
+    lines = [line for event in events for line in event.text.split(r"\N")]
+    assert len(lines) > 1
+    assert "".join(lines) == narration
+    assert all(len(line) <= portable._SUBTITLE_LINE_CHARS for line in lines)
+
+
+def test_aligned_caption_packs_multiple_punctuation_breaks_into_two_lines(aligner):
+    executor, _, state, _, align = aligner
+    narration = "甲" * 6 + "，" + "乙" * 6 + "，" + "丙" * 6 + "。"
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    events = caption_events(executor, narration, align(narration), 1.2)
+
+    lines = [line for event in events for line in event.text.split(r"\N")]
+    assert len(events) == 1
+    assert (events[0].start, events[0].end) == (100, 900)
+    assert len(lines) == 2
+    assert "".join(lines) == narration
+    assert all(len(line) <= portable._SUBTITLE_LINE_CHARS for line in lines)
+
+
+def test_aligned_caption_rejects_unbreakable_token_wider_than_line(aligner):
+    executor, _, state, _, align = aligner
+    narration = "abcdefghijklmnop"
+    state["segments"] = segments([(narration, 0.1, 0.9)])
+
+    with pytest.raises(NonRetryableMediaError, match="two lines"):
+        caption_events(executor, narration, align(narration), 1.2)
+
+
 @pytest.mark.parametrize(("start", "end"), [(-0.1, .5), (.1, .1), (.5, .1), (float("nan"), .5), (.1, float("inf")), (.1, 2), (True, 1)])
 def test_invalid_word_times_fail_instead_of_estimation(aligner, start, end):
     _, _, state, _, align = aligner
