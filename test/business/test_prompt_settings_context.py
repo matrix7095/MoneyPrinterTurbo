@@ -36,6 +36,8 @@ def test_startup_mode_reaches_live_script_and_recovery_contracts(
                     session.add(TaskPrompt(task_type=kind.value, instructions="旧合同：全部使用条件只能留后台。"))
             session.commit()
         content_id, researcher, claim = select_and_claim(http, runtime)
+        research_bundle = researcher.bundle(claim["bundle_url"], claim["lease_token"])
+        assert "私有许可证据：用户针对指定素材" in research_bundle["instructions"]
         assert researcher.complete(claim["task_id"], claim["lease_token"], "research-worker", RESEARCH)["advanced"] == "CONSUMED"
         script_agent = client_for(http, "script")
         task_ids = []
@@ -44,6 +46,7 @@ def test_startup_mode_reaches_live_script_and_recovery_contracts(
         ]}):
             claim = script_agent.claim()
             bundle = script_agent.bundle(claim["bundle_url"], claim["lease_token"])
+            assert "私有许可证据：用户针对指定素材" in bundle["instructions"]
             assert (_HANDSFREE_STAGE_FACT_RULE in bundle["instructions"]) is effective
             task_ids.append(claim["task_id"])
             assert script_agent.complete(claim["task_id"], claim["lease_token"], "script-worker", result)["advanced"] == "CONSUMED"
@@ -68,6 +71,7 @@ def test_startup_mode_reaches_live_script_and_recovery_contracts(
         assert claim["task_id"] == task_id
         bundle = assistant.bundle(claim["bundle_url"], claim["lease_token"])
         assert bundle["instructions"] == frozen_instructions
+        assert "私有许可证据：用户针对指定素材" in bundle["instructions"]
         if passed:
             assert (_HANDSFREE_STAGE_FACT_RULE in bundle["instructions"]) is effective
         else:

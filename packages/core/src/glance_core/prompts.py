@@ -351,6 +351,18 @@ def resolve_instructions(
         template += _MPT_OPENING_IDENTITY_RULE
     use_handsfree = (handsfree is True if task_type == TaskType.PUBLISH_REVIEW_ASSIST
                     else current.handsfree_enabled if handsfree is None else handsfree)
+    if task_type in {
+        TaskType.CONTENT_RESEARCH, TaskType.SHORT_SCRIPT, TaskType.SCRIPT_QC,
+        TaskType.SCRIPT_REVIEW_ASSIST, TaskType.VISUAL_PLAN, TaskType.VISUAL_PLAN_QC,
+        TaskType.CONTENT_QC, TaskType.FINAL_REVIEW_ASSIST, TaskType.RECOVERY,
+    }:
+        template += """
+私有许可证据：用户针对指定素材和本次具体用途明确确认持有许可时，保留原话、提问上下文与素材对应关系，
+可将该可追溯声明作为使用依据交由独立审核；不得仅因未附许可原件、完整合同或公开许可 URL 判定失败。
+准确区分“用户确认持有许可”和“已审阅许可原件”，不得虚构授权方、条款或署名条件，不扩展至其他素材或用途。
+核对声明与实际用途、已知限制及其他证据；存在具体矛盾或影响本次使用的范围歧义时如实报告，不能自动通过。
+本规则不修改权益登记、不改写历史审核结果，也不代替正常研究、素材及成片审核。
+"""
     if use_handsfree:
         template += _HANDSFREE_INSTRUCTIONS.get(task_type, "")
         if task_type in {TaskType.RECOVERY, TaskType.SCRIPT_QC, TaskType.SCRIPT_REVIEW_ASSIST}:
