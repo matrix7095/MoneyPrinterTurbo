@@ -21,7 +21,7 @@
 
 ## 新的同型号官方素材线索
 
-[Framery 官方 LinkedIn 帖子](https://www.linkedin.com/posts/framery_framery-one-work-debuts-at-orgatec-2026-activity-7518236545343062016-gbYb)于 2026-10-20 发布，明确为 One Work。2026-10-25 读取公开视频源并通过远端 ffprobe 核验：H.264、720×1280、30fps、AAC、17.621995 秒；本轮未下载。
+[Framery 官方 LinkedIn 帖子](https://www.linkedin.com/posts/framery_framery-one-work-debuts-at-orgatec-2026-activity-7518236545343062016-gbYb)于 2026-10-20 发布，明确为 One Work。2026-10-25 先通过远端 ffprobe 核验，后为内部效果制作下载并查看：H.264、720×1280、30fps、AAC，视频 17.600 秒、音频 17.621995 秒；源 SHA-256 `8aa4c99fec96ae36380cbc78d1ddf9b5b6db94081013d78255176002785fb411`。安装/摄制过程未冒充产品使用演示。
 
 现有[发布公告](https://framery.com/en/framery-launches-one-work/)和[官网首页](https://framery.com/en/)的两张图 srcset 最高仍为 1500×1150 与 1500×1500。官方视频可播放不等于可以跨平台剪辑发布；用户现有两图许可声明未被扩展到这段视频。新的官方素材比此前“未找到同型号视频”的结论更具体，但其使用条件仍需核验。
 
@@ -34,6 +34,14 @@
 部署前 SQLite 一致性备份保存在生产私密备份目录。独立重新计算 content、content_revision、agent_task、agent_submission、artifact、publication_record、publication_preview 七张表，全部记录摘要与部署前一致，quick_check=ok。回执位于 `storage/smoke/production-fixes-20261025/`。
 
 25.01125 秒 v2 配音 SHA-256 为 `06910de27a3b9a7bfad15663d60ecccf1290dc7c147e4ec852eb30624afd2dc7`。medium 识别的两处错误保留；本机 large-v3 对同一完整音轨的独立识别与数字展示稿相符，11 句字幕、142 个 ASR word 记录、157 个可见字符，尾词至 24.82 秒。实际 TTS 中文数字稿、展示稿、两份原始识别及音轨收据分别绑定，不能将它描述成 medium 或正式声音 QC 已通过。用户听感反馈尚待接收。
+
+## 25 秒官方视频混合版
+
+最新内部预览：[r03 成片](../storage/smoke/creative-recut-20261025/video/render/revisions/ac379766d7de4c3e91b9b1b1afb84c17/final.mp4)，SHA-256 `d46f7771a861e7675ef33687d75a6a9c0d4d63d8249bb9d0224a4c387766cd33`。画面 25.033333 秒、音轨 25.01125 秒，1080×1920、30fps、751 帧。官方原视频为 30fps，未声称原生 60fps。11 段镜头中官方视频/图片约占 62.2%，AI 进入和离开情境共 5.36 秒，其余为信息卡。
+
+实际修复并复验了型号缺失、桌面口播配灯具画面、字幕跨 cue 拆词和 0.20 秒单字闪字。独立检查全部 11 句中点与桌面段三个时间点；字幕全文与冻结展示稿一致，最短 1.52 秒，数字卡无碰撞，官方/AI 属性标记明确。全片音画严格解码成功、PTS 连续。官方桌面近景只说明参数，标明“非升降演示”。
+
+实际成片还暴露了生产公共分段按一行字数硬切、留下短尾词的问题。第二次修复按真实句末和停顿分段，充分使用两行容量，超预算时优先标点和可读的分配。151 项相关测试及独立 104 项测试通过；同一冻结音轨在公共路径得到 9 个 cue，最短 0.74 秒，原 0.20 秒“用。”消除，使用/预约/释放/继续均不跨 timed cue，原 ASR 字节和时间戳未变。普通汉字仍可能跨视觉换行，不把这种排版处理冒充中文分词器。
 
 ## 完成标准
 

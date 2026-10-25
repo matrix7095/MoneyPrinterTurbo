@@ -985,20 +985,48 @@ def _aligned_subtitle_events(words: list[dict[str, Any]]) -> list[tuple[float, f
             atoms[-1] = {**atoms[-1], "text": atoms[-1]["text"] + word["text"], "end_sec": word["end_sec"]}
         else:
             atoms.append(dict(word))
-    groups, current, length = [], [], 0
+    runs, current = [], []
     for word in atoms:
         size = len(re.sub(r"\s+", " ", word["text"]).strip())
         if size > 2 * _SUBTITLE_LINE_CHARS:
             raise NonRetryableMediaError("Subtitle ASR word cannot safely display in two lines")
-        if current and (length + size > _SUBTITLE_LINE_CHARS
-                        or word["start_sec"] > current[-1]["end_sec"] + 0.15
+        if current and (word["start_sec"] > current[-1]["end_sec"] + 0.15
                         or current[-1]["text"].rstrip().endswith(tuple("。！？.!?"))):
-            groups.append(current)
-            current, length = [], 0
+            runs.append(current)
+            current = []
         current.append(word)
-        length += size
     if current:
-        groups.append(current)
+        runs.append(current)
+
+    groups = []
+    for run in runs:
+        while run:
+            text = "".join(word["text"] for word in run).strip()
+            lines = _aligned_subtitle_parts(text)
+            if len(text) <= 2 * _SUBTITLE_LINE_CHARS and len(lines) <= 2 and all(
+                _subtitle_visible_length(line) <= _SUBTITLE_LINE_CHARS for line in lines
+            ):
+                groups.append(run)
+                break
+            choices = []
+            for split in range(1, len(run)):
+                left = "".join(word["text"] for word in run[:split]).strip()
+                if len(left) > 2 * _SUBTITLE_LINE_CHARS:
+                    break
+                parts = _aligned_subtitle_parts(left)
+                if len(parts) > 2 or any(_subtitle_visible_length(part) > _SUBTITLE_LINE_CHARS for part in parts):
+                    continue
+                right = "".join(word["text"] for word in run[split:]).strip()
+                # Prefer readable phrases over a single flashing word at the tail.
+                short = (run[split - 1]["end_sec"] - run[0]["start_sec"] < 0.5
+                         or run[-1]["end_sec"] - run[split]["start_sec"] < 0.5)
+                balance = abs(len(left) - len(right)) if len(right) <= 2 * _SUBTITLE_LINE_CHARS else -len(left)
+                choices.append((short, left[-1] not in _SUBTITLE_BREAK_CHARS, balance, -split, split))
+            if not choices:
+                raise NonRetryableMediaError("Subtitle ASR event cannot safely display in two lines")
+            split = min(choices)[-1]
+            groups.append(run[:split])
+            run = run[split:]
     events = []
     for group in groups:
         start, end = group[0]["start_sec"], group[-1]["end_sec"]

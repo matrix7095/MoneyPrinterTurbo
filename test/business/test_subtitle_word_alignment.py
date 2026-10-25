@@ -190,6 +190,73 @@ def test_aligned_caption_rejects_unbreakable_token_wider_than_line(aligner):
         caption_events(executor, narration, align(narration), 1.2)
 
 
+def test_actual_shared_space_phrase_has_no_flashing_orphan(aligner):
+    executor, _, state, _, align = aligner
+    narration = "私人空间，也能让大家轮流使用。"
+    observations = [
+        ("私", 5.72, 5.98), ("人", 5.98, 6.14), ("空", 6.14, 6.26),
+        ("间", 6.26, 6.48), ("也", 6.48, 6.74), ("能", 6.74, 6.86),
+        ("让", 6.86, 7.0), ("大家", 7.0, 7.26), ("轮", 7.26, 7.48),
+        ("流", 7.48, 7.58), ("使", 7.58, 7.72), ("用", 7.72, 7.92),
+    ]
+    state.update(duration=8.0, segments=segments(observations))
+    alignment = align(narration)
+    before = deepcopy(alignment)
+
+    events = caption_events(executor, narration, alignment, 8.0)
+
+    assert len(events) == 1
+    assert (events[0].start, events[0].end) == (5720, 7920)
+    assert events[0].text.replace(r"\N", "") == narration
+    assert alignment == before
+
+
+def test_long_phrase_prefers_punctuation_over_splitting_chinese_words(aligner):
+    executor, _, state, _, align = aligner
+    narration = "你走进去，系统自动生成临时预约；人一离开，预约就自动释放，下一位再接着用。"
+    observed = "".join(char for char in narration if char not in "，；。")
+    state.update(duration=12, segments=segments([
+        (char, i * .25, (i + 1) * .25) for i, char in enumerate(observed)
+    ]))
+
+    events = caption_events(executor, narration, align(narration), 12)
+
+    assert "".join(event.text.replace(r"\N", "") for event in events) == narration
+    assert all(event.text.endswith(("，", "；", "。")) for event in events)
+    assert all(event.end - event.start >= 500 for event in events)
+
+
+def test_overflow_without_punctuation_rebalances_short_tail(aligner):
+    executor, _, state, _, align = aligner
+    narration = "甲" * 29
+    state.update(duration=6, segments=segments([
+        (char, i * .2, (i + 1) * .2) for i, char in enumerate(narration)
+    ]))
+
+    events = caption_events(executor, narration, align(narration), 6)
+
+    assert len(events) == 2
+    assert all(event.end - event.start >= 500 for event in events)
+    assert "".join(event.text.replace(r"\N", "") for event in events) == narration
+    assert events[0].start == 0 and events[-1].end == 5800
+
+
+@pytest.mark.parametrize("separator", ["，", "。"])
+def test_short_phrase_does_not_merge_across_silence_or_sentence(aligner, separator):
+    executor, _, state, _, align = aligner
+    narration = "产品测试" + separator + "好。"
+    second_start = 1.2 if separator == "，" else .9
+    state.update(duration=2, segments=segments([
+        ("产品测试", .1, .9), ("好", second_start, second_start + .2),
+    ]))
+
+    events = caption_events(executor, narration, align(narration), 2)
+
+    assert [(event.start, event.end) for event in events] == [
+        (100, 900), (round(second_start * 1000), round((second_start + .2) * 1000)),
+    ]
+
+
 @pytest.mark.parametrize(("start", "end"), [(-0.1, .5), (.1, .1), (.5, .1), (float("nan"), .5), (.1, float("inf")), (.1, 2), (True, 1)])
 def test_invalid_word_times_fail_instead_of_estimation(aligner, start, end):
     _, _, state, _, align = aligner
