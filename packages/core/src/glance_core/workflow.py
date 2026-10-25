@@ -4205,6 +4205,8 @@ class WorkflowService:
             "candidate": self._candidate_task_input(candidate),
             "transcript": transcript,
             "production_mode": content.production_mode.value,
+            **({"source_media_priority_version": 1}
+               if target_task.input_data.get("source_media_priority_version") == 1 else {}),
             **(
                 self.image_generation_inputs(effective_settings(self.session, self.base_settings or Settings()))
                 if content.production_mode == ProductionMode.IMAGE_ONLY

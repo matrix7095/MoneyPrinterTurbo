@@ -45,7 +45,7 @@ from glance_core.models import (
 from glance_core.runtime_config import effective_settings
 from glance_core.settings import DEFAULT_COVER_STYLE_PRESET, Settings
 from glance_core.task_schemas import ManualAssistResult, result_model_for
-from glance_core.task_service import source_media_acquisition, source_media_research, stable_hash
+from glance_core.task_service import _source_media_priority_errors, script_source_media_context, source_media_acquisition, source_media_research, stable_hash
 from glance_core.workflow import (
     WorkflowService,
     handsfree_review_policy,
@@ -772,10 +772,22 @@ def _acquire_source_images(
     research: dict,
     research_task: AgentTask | None = None,
 ) -> list[dict]:
-    """图文模式的 acquire 节点：把研究回传的配图 URL 下载并逐张登记。"""
+    """把研究回传的配图 URL 下载并逐张登记；批次回调复用同一研究收据。"""
     images = list(research.get("source_images") or [])
     if not images:
         return []
+    if research_task is not None and research.get("source_media_search") is not None:
+        receipt = session.exec(select(AuditEvent.id).where(
+            AuditEvent.entity_type == "agent_task", AuditEvent.entity_id == research_task.id,
+            AuditEvent.action == "source_media_images_acquired",
+        )).first()
+        if receipt is not None:
+            context = script_source_media_context(session, content.id,
+                {"upstream_task_ids": {"research": research_task.id}}, verify_files=True)
+            if context is None:
+                raise NonRetryableMediaError("Current research source image receipt is unavailable")
+            return [{key: value for key, value in row.items() if key != "sha256"}
+                    for row in context["source_images"]]
     executor = _media_executor(content)
     acquired = log_stage(
         session,
@@ -1187,6 +1199,7 @@ def prepare_content(engine: Engine, settings: Settings, content_id: str) -> Cont
                 **base,
                 "transcript": _cap_transcript(transcript),
                 "production_mode": content.production_mode.value,
+                "source_media_priority_version": 1,
             },
             priority=30,
         )
@@ -1800,9 +1813,11 @@ def _advance_after_agent(
                 **flow.script_audience_inputs(content, research_task, settings=settings),
             }
             script_input.update(continuation_inputs(session, research_task, recovery_max_rounds=flow.recovery_max_rounds))
+            if image_only or research_task.input_data.get("source_media_priority_version") == 1:
+                _acquire_source_images(session, content, research_task.result_data or {}, research_task)
+                script_input["source_media_priority_version"] = 1
             if image_only:
                 # 图文模式：研究完成后先把配图下载登记，再直达口播脚本。
-                _acquire_source_images(session, content, research_task.result_data or {}, research_task)
                 flow.create_agent_task(
                     content_id,
                     TaskType.SHORT_SCRIPT,
@@ -2809,8 +2824,10 @@ def approve_script(
             raise ValueError("Script and a completed script QC are required")
         _unchanged_material_task(session, script_task, consumed=False)
         script_proof = _script_task_proof(script_task)
-        if content.production_mode == ProductionMode.IMAGE_ONLY:
-            source_media_research(session, content_id, {"upstream_task_ids": {"script": script_task.id}})
+        if (content.production_mode == ProductionMode.IMAGE_ONLY
+                or script_task.input_data.get("source_media_priority_version") == 1):
+            source_media_research(session, content_id, {"upstream_task_ids": {"script": script_task.id}},
+                                  verify_files=content.production_mode == ProductionMode.FOOTAGE)
         executor = _media_executor(content)
         voice_options = {
             "voice": settings.tts_voice,
@@ -3023,6 +3040,19 @@ def approve_script(
         scene_tasks = flow.scene_analysis_tasks(content_id)
         if not scene_tasks:
             raise ValueError("Script and scene task references are required")
+        source_images = []
+        source_context = {}
+        if script_task.input_data.get("source_media_priority_version") == 1:
+            research_task, media_search, acquired_images = source_media_research(
+                session, content_id, {"upstream_task_ids": {"script": script_task.id}}, verify_files=True,
+            )
+            source_images = [{key: value for key, value in row.items() if key != "sha256"} for row in acquired_images]
+            source_context = {
+                "source_media_priority_version": 1,
+                "source_media_search": media_search,
+                "source_media_acquisition": source_media_acquisition(research_task, acquired_images),
+                "source_images": source_images,
+            }
         flow.create_agent_task(
             content_id,
             TaskType.VISUAL_PLAN,
@@ -3039,21 +3069,23 @@ def approve_script(
                 "visual_timing_evidence": timing_evidence,
                 "voice_artifact": voice_binding,
                 **generation_input,
+                **source_context,
                 "scenes": scene_data["scenes"],
                 "production_mode": ProductionMode.FOOTAGE.value,
                 "allowed_layouts": [
                     "center_crop",
                     "blur_background",
                     "fit",
-                    *(["image_card"] if settings.asset_image_enabled else []),
+                    *(["image_card"] if settings.asset_image_enabled or source_images else []),
                 ],
                 "asset_image_enabled": settings.asset_image_enabled,
-                "allowed_asset_ids": generated_asset_ids,
+                "allowed_asset_ids": [row["artifact_id"] for row in source_images] + generated_asset_ids,
                 "context_files": [
                     str(scene["thumbnail"])
                     for scene in scene_data["scenes"]
                     if scene.get("thumbnail")
-                ] + ([generation_input["voice_generation"]["receipt_artifact"]["relative_path"]] if generation_input else []),
+                ] + [row["relative_path"] for row in source_images]
+                + ([generation_input["voice_generation"]["receipt_artifact"]["relative_path"]] if generation_input else []),
                 **content_qc_rework,
             },
             priority=50,
@@ -3167,6 +3199,11 @@ def render_content(
             session, content_id, TaskType.VISUAL_PLAN_QC,
             {"visual_plan": plan_task, "script": script_task},
         )
+        if (content.production_mode == ProductionMode.FOOTAGE and plan_task is not None
+                and plan_task.input_data.get("source_media_priority_version") == 1):
+            errors = _source_media_priority_errors(session, plan_task, plan_task.result_data or {})
+            if errors:
+                raise NonRetryableMediaError("Source media changed after visual QC: " + json.dumps(errors, ensure_ascii=False))
         plan = resolved_visual_plan(session, plan_task) if plan_task else None
         script = script_task.result_data if script_task else None
         if not plan or not script:

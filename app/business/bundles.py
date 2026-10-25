@@ -567,7 +567,9 @@ def build_bundle(
     if task.task_type == TaskType.SHORT_SCRIPT:
         source = _script_source_context(task, session)
         if source is not None:
+            files = list(dict.fromkeys([*(bundle_input.get("context_files") or []), *source["context_files"]]))
             bundle_input.update(source)
+            bundle_input["context_files"] = files
             bundle_input["research"] = {**bundle_input["research"], "source_images": source["source_images"]}
             bundle_input["script_source_media_context_read_only"] = source
     if task.task_type == TaskType.VISUAL_PLAN_QC and "prepared_visual_plan" in task.input_data:
@@ -681,6 +683,12 @@ def build_bundle(
                         "source_images: exact research image evidence unavailable"
                     )
             else:
+                if research is not None and script.input_data.get("source_media_priority_version") == 1:
+                    source = _script_source_context(script, session)
+                    if source is not None:
+                        bundle_input["source_images"] = source["source_images"]
+                        bundle_input["research"] = {**research.result_data, "source_images": source["source_images"]}
+                        bundle_input["script_source_media_context_read_only"] = source
                 evidence = flow._recovery_current_input(script)
                 if evidence.get("scene_analysis", {}).get("scenes"):
                     bundle_input["scene_analysis"] = evidence["scene_analysis"]
@@ -984,7 +992,8 @@ def _script_source_context(task: AgentTask, session: Session) -> dict | None:
             if declared is not None and declared not in (research_id, [research_id]):
                 raise TaskConflictError("SOURCE_MEDIA_REVIEW_RESEARCH_CHANGED")
             return _script_source_context(script, session)
-        if task.input_data.get("production_mode") != "image_only":
+        if (task.input_data.get("production_mode") != "image_only"
+                and task.input_data.get("source_media_priority_version") != 1):
             return None
         context = script_source_media_context(session, task.content_id, task.input_data, verify_files=True)
         if context is not None:

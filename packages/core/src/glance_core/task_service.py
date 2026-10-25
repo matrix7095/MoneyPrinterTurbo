@@ -200,7 +200,7 @@ def _generated_segment_errors(task: AgentTask, segments: list[dict[str, Any]]) -
     return errors
 
 
-def source_media_research(session: Session, content_id: str, inputs: dict) -> tuple[AgentTask, dict, list[dict]]:
+def source_media_research(session: Session, content_id: str, inputs: dict, *, verify_files: bool = False) -> tuple[AgentTask, dict, list[dict]]:
     """Resolve the accepted research and its acquired images from server-owned lineage."""
     refs = inputs.get("upstream_task_ids") or {}
     if not isinstance(refs, dict):
@@ -223,7 +223,10 @@ def source_media_research(session: Session, content_id: str, inputs: dict) -> tu
     bound_id = (script.input_data.get("upstream_task_ids") or {}).get("research")
     if research_id and research_id != bound_id:
         raise TaskConflictError("SOURCE_MEDIA_RESEARCH_LINEAGE_CHANGED")
-    return _accepted_source_media_research(session, content_id, bound_id)
+    result = _accepted_source_media_research(session, content_id, bound_id)
+    if verify_files:
+        script_source_media_context(session, content_id, {"upstream_task_ids": {"research": bound_id}}, verify_files=True)
+    return result
 
 
 def _accepted_source_media_research(session: Session, content_id: str, research_id: str) -> tuple[AgentTask, dict, list[dict]]:
@@ -327,18 +330,20 @@ def script_source_media_context(session: Session, content_id: str, inputs: dict,
 
 def _source_media_priority_errors(session: Session, task: AgentTask, result: dict) -> list[dict]:
     inputs = task.input_data or {}
-    if task.task_type == TaskType.SHORT_SCRIPT and inputs.get("production_mode") == "image_only":
+    footage = inputs.get("production_mode") == "footage"
+    if task.task_type == TaskType.SHORT_SCRIPT and (
+            inputs.get("production_mode") == "image_only" or inputs.get("source_media_priority_version") == 1):
         try:
             context = script_source_media_context(session, task.content_id, inputs, verify_files=True)
         except TaskConflictError as exc:
             return [{"path": ["source_images"], "message": str(exc)}]
-        if context is not None and context["source_images"]:
+        if not footage and context is not None and context["source_images"]:
             allowed = {*context["allowed_asset_ids"], "ai_generate"}
             return [{"path": ["visual_requirements", index, "preferred_source"],
                      "message": "图文脚本必须引用当前研究已登记的 artifact_id 或 ai_generate"}
                     for index, row in enumerate(result.get("visual_requirements", []))
                     if row.get("preferred_source") not in allowed]
-    if inputs.get("production_mode") != "image_only" or "source_media_priority_version" not in inputs:
+    if "source_media_priority_version" not in inputs:
         return []
     if type(inputs["source_media_priority_version"]) is not int or inputs["source_media_priority_version"] != 1:
         return [{"path": ["source_media_priority_version"], "message": "不支持的素材优先级合同版本"}]
@@ -351,7 +356,7 @@ def _source_media_priority_errors(session: Session, task: AgentTask, result: dic
     if task.task_type != TaskType.VISUAL_PLAN:
         return []
     try:
-        research, search, registered = source_media_research(session, task.content_id, inputs)
+        research, search, registered = source_media_research(session, task.content_id, inputs, verify_files=footage)
         if (inputs.get("source_media_search") != search
                 or inputs.get("source_media_acquisition") != source_media_acquisition(research, registered)):
             raise TaskConflictError("SOURCE_MEDIA_AUDIT_CHANGED: 计划盘点必须与已接受研究完全一致")
@@ -370,8 +375,10 @@ def _source_media_priority_errors(session: Session, task: AgentTask, result: dic
     if unrelated:
         errors.append({"path": ["allowed_asset_ids"], "message": "原图白名单包含不属于当前已接受研究取图收据的素材"})
     segments = result.get("segments", [])
-    if source_ids and not any(segment.get("asset_id") in source_ids for segment in segments):
-        errors.append({"path": ["segments"], "message": "已有相关产品原图，计划必须优先直用，不能整片由 AI 图替代"})
+    scene_ids = {row["scene_id"] for row in inputs.get("scenes", []) if row.get("scene_id")} if footage else set()
+    if (source_ids or scene_ids) and not any(
+            segment.get("asset_id") in source_ids or segment.get("scene_id") in scene_ids for segment in segments):
+        errors.append({"path": ["segments"], "message": "已有相关产品原图或原片场景，计划必须优先直用，不能整片由 AI 图替代"})
     for index, segment in enumerate(segments):
         request = segment.get("asset_request")
         if request and not str(request.get("source_gap_reason") or "").strip():
@@ -537,12 +544,23 @@ def _normalize_content_task_input(
         if normalized.get("production_mode") != expected_mode:
             normalized["production_mode"] = expected_mode
             changed.append("production_mode")
-        if task_type in {TaskType.CONTENT_RESEARCH, TaskType.VISUAL_PLAN} and expected_mode == "image_only":
+        source_priority = expected_mode == "image_only" or "source_media_priority_version" in normalized
+        if expected_mode == "footage" and task_type in {TaskType.SHORT_SCRIPT, TaskType.VISUAL_PLAN}:
+            parent_key = "research" if task_type == TaskType.SHORT_SCRIPT else "script"
+            parent_id = (normalized.get("upstream_task_ids") or {}).get(parent_key)
+            parent = session.get(AgentTask, parent_id) if isinstance(parent_id, str) else None
+            source_priority = source_priority or bool(parent and parent.input_data.get("source_media_priority_version") == 1)
+            if task_type == TaskType.VISUAL_PLAN and not source_priority:
+                source_priority = bool(normalized.get("source_images")) or session.exec(select(Artifact.id).where(
+                    Artifact.artifact_type == "source_image",
+                    Artifact.id.in_(normalized.get("allowed_asset_ids") or []),
+                )).first() is not None
+        if task_type in {TaskType.CONTENT_RESEARCH, TaskType.SHORT_SCRIPT, TaskType.VISUAL_PLAN} and source_priority:
             if type(normalized.get("source_media_priority_version")) is not int or normalized.get("source_media_priority_version") != 1:
                 normalized["source_media_priority_version"] = 1
                 changed.append("source_media_priority_version")
             if task_type == TaskType.VISUAL_PLAN:
-                research, search, rows = source_media_research(session, content_id, normalized)
+                research, search, rows = source_media_research(session, content_id, normalized, verify_files=expected_mode == "footage")
                 acquisition = source_media_acquisition(research, rows)
                 for key, value in (("source_media_search", search), ("source_media_acquisition", acquisition)):
                     if key in normalized and normalized[key] != value:

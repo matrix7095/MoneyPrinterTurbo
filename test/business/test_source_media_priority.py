@@ -1,6 +1,8 @@
 """New image-only work must collect source media before requesting AI supplements."""
 
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -549,3 +551,360 @@ def test_packaged_revision_preserves_authoritative_audit_and_exact_material_whit
     assert plan.input_data["source_images"] == rows
     assert plan.input_data["previous_plan"] == previous
     assert plan.input_data["source_media_priority_version"] == 1
+
+
+@pytest.fixture
+def footage_subject(subject):
+    session, _, content, assets = subject
+    content.production_mode = ProductionMode.FOOTAGE
+    session.add(content)
+    root = Path(content.content_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    for asset in assets:
+        path = root / asset.relative_path
+        path.write_bytes(b"source fixture")
+        asset.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        asset.size_bytes = path.stat().st_size
+        session.add(asset)
+    session.commit()
+    return subject
+
+
+@pytest.mark.parametrize("research_first", [False, True])
+def test_footage_research_registers_images_once_across_scene_batches(footage_subject, monkeypatch, research_first):
+    session, settings, content, _ = footage_subject
+    service, research, token = issue(footage_subject, TaskType.CONTENT_RESEARCH, {"source_media_priority_version": 1})
+    result = deepcopy(RESEARCH)
+    result["source_images"] = [{"url": "https://example.org/product.png", "caption": "Official product",
+                                "source_page": "https://example.org/product"}]
+    complete(service, research, token, result)
+    root = Path(content.content_dir)
+    path = root / "official.png"
+    path.write_bytes(b"official image fixture")
+    calls = []
+    monkeypatch.setattr(pipeline.MediaExecutor, "acquire_images", lambda self, images: calls.append(images) or [
+        {**result["source_images"][0], "path": path, "width": 1080, "height": 1920}])
+    scene_tasks = []
+    for index in (1, 2):
+        scenes = [{"scene_id": f"s{index}", "start_sec": (index - 1) * 15, "end_sec": index * 15}]
+        inputs = {"scenes": scenes, "batch_index": index, "batch_count": 2}
+        task = AgentTask(task_type=TaskType.SCENE_ANALYZE, prompt_name="scene_analyze", content_id=content.id,
+                         instructions="Fixture", input_data=inputs, input_hash=stable_hash(inputs),
+                         result_data={"scenes": scenes})
+        session.add(task)
+        scene_tasks.append(task)
+    session.commit()
+    if research_first:
+        pipeline.advance_after_agent(session.get_bind(), settings, research.id)
+    for task in scene_tasks:
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        session.commit()
+        pipeline.advance_after_agent(session.get_bind(), settings, task.id)
+    if not research_first:
+        pipeline.advance_after_agent(session.get_bind(), settings, research.id)
+    session.expire_all()
+    script = session.exec(select(AgentTask).where(AgentTask.task_type == TaskType.SHORT_SCRIPT)).one()
+    assert len(calls) == 1
+    assert script.input_data["source_media_priority_version"] == 1
+    assert script.input_data["upstream_task_ids"]["research"] == research.id
+    receipts = session.exec(select(AuditEvent).where(AuditEvent.action == "source_media_images_acquired")).all()
+    assert len(receipts) == 1
+    assert len(receipts[0].metadata_json["images"]) == 1
+    frozen = deepcopy(receipts[0].metadata_json)
+    pipeline._acquire_source_images(session, content, result, research)
+    assert len(calls) == 1
+    session.refresh(receipts[0])
+    assert receipts[0].metadata_json == frozen
+
+
+@pytest.fixture
+def footage_plan(footage_subject, monkeypatch):
+    session, settings, content, assets = footage_subject
+    service, research, token = issue(footage_subject, TaskType.CONTENT_RESEARCH, {"source_media_priority_version": 1})
+    value = deepcopy(RESEARCH)
+    value["source_images"] = [{"url": "https://example.org/product.png", "caption": "Official product",
+                               "source_page": "https://example.org/product"}]
+    complete(service, research, token, value)
+    root = Path(content.content_dir)
+    official = root / "official.png"
+    official.write_bytes(b"official product fixture")
+    monkeypatch.setattr(pipeline.MediaExecutor, "acquire_images", lambda self, images: [
+        {**value["source_images"][0], "path": official, "width": 1080, "height": 1920}])
+    rows = pipeline._acquire_source_images(session, content, research.result_data, research)
+    session.add(AuditEvent(actor_type="system", actor_id="mpt-business", entity_type="agent_task", entity_id=research.id,
+                           action="mpt_agent_consumed", metadata_json={"result_hash": stable_hash(research.result_data)}))
+    script = bound_script(footage_subject, research)
+    scenes = [{"scene_id": "s1", "start_sec": 0, "end_sec": 30, "thumbnail": "scenes/s1.jpg"}]
+    scene_inputs = {"scenes": scenes}
+    scene = AgentTask(task_type=TaskType.SCENE_ANALYZE, prompt_name="scene_analyze", content_id=content.id,
+                      instructions="Fixture", input_data=scene_inputs, input_hash=stable_hash(scene_inputs),
+                      status=TaskStatus.COMPLETED, result_data={"scenes": scenes})
+    session.add(scene)
+    (root / "scenes").mkdir()
+    (root / "scenes/scenes.json").write_text(json.dumps({"scenes": scenes}), encoding="utf-8")
+    (root / "scenes/s1.jpg").write_bytes(b"scene thumbnail fixture")
+    session.commit()
+    script.input_data = {**script.input_data, "upstream_task_ids": {"research": research.id, "scene_analysis": scene.id}}
+    script.input_hash = stable_hash(script.input_data)
+    session.add(script)
+    session.commit()
+    service, qc, token = issue(footage_subject, TaskType.SCRIPT_QC, {"upstream_task_ids": {"script": script.id, "research": research.id}})
+    complete(service, qc, token, {"passed": True, "issues": []})
+    candidate = session.get(Candidate, content.candidate_id)
+    candidate.rights_status = RightsStatus.SELF_OWNED
+    content.business_status, content.current_stage = ContentStatus.SCRIPT_REVIEW, "script_review"
+    session.add_all([candidate, content])
+    session.commit()
+    voice = root / "voice.wav"
+    voice.write_bytes(b"voice fixture")
+    boundaries = root / "word_boundaries.json"
+    boundaries.write_text('{"boundaries": []}', encoding="utf-8")
+    timing = {"voice_sha256": hashlib.sha256(voice.read_bytes()).hexdigest(),
+              "boundaries_sha256": hashlib.sha256(boundaries.read_bytes()).hexdigest()}
+    monkeypatch.setattr(pipeline.MediaExecutor, "synthesize_voice", lambda *args, **kwargs: SimpleNamespace(audio_path=voice, duration_sec=30))
+    monkeypatch.setattr(pipeline.MediaExecutor, "visual_timing_evidence", lambda *args: timing)
+    monkeypatch.setattr(pipeline, "_require_script_assist", lambda *args, **kwargs: None)
+
+    def approve():
+        pipeline.approve_script(session.get_bind(), settings, content.id)
+        session.expire_all()
+        return session.exec(select(AgentTask).where(AgentTask.task_type == TaskType.VISUAL_PLAN)).one()
+
+    return footage_subject, research, script, rows, approve
+
+
+@pytest.mark.parametrize("ai_enabled", [False, True])
+def test_footage_official_image_reaches_script_qc_and_visual_plan_with_ai_on_or_off(footage_plan, ai_enabled):
+    from app.business import bundles
+    subject, research, script, rows, approve = footage_plan
+    session, settings, content, _ = subject
+    settings.asset_image_enabled = ai_enabled
+    frozen = deepcopy(script.input_data), script.input_hash
+    source = bundles._script_source_context(script, session)
+    assert source["source_images"][0]["artifact_id"] == rows[0]["artifact_id"]
+    assert rows[0]["relative_path"] in bundles.context_files_for(script, session)
+    qc = session.exec(select(AgentTask).where(AgentTask.task_type == TaskType.SCRIPT_QC)).one()
+    assert bundles._script_source_context(qc, session) == source
+    assert rows[0]["relative_path"] in bundles.context_files_for(qc, session)
+    assert (script.input_data, script.input_hash) == frozen
+    flow = WorkflowService(session, data_dir=settings.data_dir, submission_root=settings.agent_submission_dir, lease_minutes=45)
+    review = flow.create_agent_task(content.id, TaskType.SCRIPT_REVIEW_ASSIST,
+        {"upstream_task_ids": {"script": script.id, "script_qc": qc.id, "research": research.id}})
+    service = AgentTaskService(session, settings.agent_submission_dir)
+    review, review_token = service.claim(agent_id="fixture-reviewer", role_id=primary_role_for(TaskType.SCRIPT_REVIEW_ASSIST),
+        capabilities={TaskType.SCRIPT_REVIEW_ASSIST}, task_id=review.id)
+    bundle = bundles.build_bundle(review.id, review_token, service, session, flow, failure_recovery=lambda *a, **k: {})
+    assert bundle["input"]["research"]["source_images"] == source["source_images"]
+    assert bundle["input"]["source_images"] == source["source_images"]
+    assert rows[0]["artifact_id"] in {item["input_ref"] for item in bundle["context_manifest"]}
+    plan = approve()
+    assert plan.input_data["source_media_priority_version"] == 1
+    assert plan.input_data["source_media_acquisition"]["research_task_id"] == research.id
+    assert plan.input_data["source_images"] == rows
+    assert rows[0]["artifact_id"] in plan.input_data["allowed_asset_ids"]
+    assert "image_card" in plan.input_data["allowed_layouts"]
+    assert {"scenes/s1.jpg", rows[0]["relative_path"]}.issubset(plan.input_data["context_files"])
+    service = AgentTaskService(session, settings.agent_submission_dir)
+    task, token = service.claim(agent_id="fixture-worker", role_id=primary_role_for(TaskType.VISUAL_PLAN),
+                                capabilities={TaskType.VISUAL_PLAN}, task_id=plan.id)
+    result = {"segments": [
+        {"scene_id": "s1", "layout": "center_crop", "narration_start_sec": 0, "narration_end_sec": 15,
+         "source_start_sec": 0, "source_end_sec": 15, "purpose": "官方原片"},
+        {"asset_id": rows[0]["artifact_id"], "layout": "image_card", "narration_start_sec": 15,
+         "narration_end_sec": 30, "purpose": "官方产品图"},
+    ]}
+    complete(service, task, token, result)
+    flow = WorkflowService(session, data_dir=settings.data_dir, submission_root=settings.agent_submission_dir, lease_minutes=45)
+    visual_qc = flow.create_agent_task(content.id, TaskType.VISUAL_PLAN_QC, {"upstream_task_ids": {"visual_plan": plan.id}})
+    assert visual_qc.input_data["source_images"] == rows
+    assert visual_qc.input_data["source_media_acquisition"] == plan.input_data["source_media_acquisition"]
+    from glance_core.content_acceptance import joint_visual_plan_supported
+    assert not joint_visual_plan_supported(result)
+
+
+@pytest.mark.parametrize("original", ["scene", "mixed", "all_ai", "ai_no_gap"])
+def test_footage_source_priority_accepts_video_without_forcing_images_and_rejects_all_ai(footage_plan, original):
+    subject, _, _, rows, approve = footage_plan
+    session, settings, _, assets = subject
+    plan = approve()
+    service = AgentTaskService(session, settings.agent_submission_dir)
+    task, token = service.claim(agent_id="fixture-worker", role_id=primary_role_for(TaskType.VISUAL_PLAN),
+                                capabilities={TaskType.VISUAL_PLAN}, task_id=plan.id)
+    first = {"scene_id": "s1", "layout": "center_crop", "narration_start_sec": 0,
+             "narration_end_sec": 30, "source_start_sec": 0, "source_end_sec": 30, "purpose": "官方原片"}
+    result = {"segments": [first]}
+    if original == "all_ai":
+        result = {"segments": [{"asset_id": assets[1].id, "layout": "image_card", "narration_start_sec": 0,
+                                 "narration_end_sec": 30, "purpose": "已有生成图"}]}
+    elif original in {"mixed", "ai_no_gap"}:
+        first["narration_end_sec"] = first["source_end_sec"] = 10
+        result["segments"].extend([
+            {"asset_id": rows[0]["artifact_id"], "layout": "image_card", "narration_start_sec": 10,
+             "narration_end_sec": 20, "purpose": "官方细节图"},
+            {"asset_request": request(gap=original != "ai_no_gap"), "layout": "image_card", "narration_start_sec": 20,
+             "narration_end_sec": 30, "purpose": "现有素材没有的原理示意"},
+        ])
+    if original in {"all_ai", "ai_no_gap"}:
+        with pytest.raises(TaskValidationError) as error:
+            complete(service, task, token, result)
+        assert any("优先直用" in row["message"] or row["path"][-1] == "source_gap_reason" for row in error.value.errors)
+    else:
+        assert complete(service, task, token, result).status == TaskStatus.COMPLETED
+
+
+@pytest.mark.parametrize("damage", ["bytes", "path", "revision", "receipt", "unlisted", "result_hash"])
+def test_footage_source_images_fail_closed_before_voice_when_evidence_changes(footage_plan, monkeypatch, damage):
+    from glance_core.models import ContentRevision
+    subject, research, _, rows, approve = footage_plan
+    session, _, content, assets = subject
+    artifact = session.get(Artifact, rows[0]["artifact_id"])
+    receipt = session.exec(select(AuditEvent).where(AuditEvent.entity_id == research.id,
+                                                   AuditEvent.action == "source_media_images_acquired")).one()
+    if damage == "bytes":
+        (Path(content.content_dir) / artifact.relative_path).write_bytes(b"changed")
+    elif damage == "path":
+        artifact.relative_path = "../outside.png"
+        metadata = deepcopy(receipt.metadata_json)
+        metadata["images"][0]["relative_path"] = artifact.relative_path
+        receipt.metadata_json = metadata
+        session.add_all([artifact, receipt])
+    elif damage == "revision":
+        revision = ContentRevision(content_id=content.id, subject_sha256="b" * 64)
+        session.add(revision)
+        session.commit()
+        artifact.revision_id = revision.id
+        session.add(artifact)
+    elif damage == "receipt":
+        session.delete(receipt)
+    elif damage == "unlisted":
+        metadata = deepcopy(receipt.metadata_json)
+        metadata["images"][0]["artifact_id"] = assets[0].id
+        receipt.metadata_json = metadata
+        session.add(receipt)
+    else:
+        research.result_data = {**research.result_data, "recommended_verdict": "changed after acceptance"}
+        session.add(research)
+    session.commit()
+    monkeypatch.setattr(pipeline.MediaExecutor, "synthesize_voice", lambda *args, **kwargs: pytest.fail("evidence failure must precede TTS"))
+    with pytest.raises(TaskConflictError, match="SOURCE_MEDIA_"):
+        approve()
+
+
+def test_footage_research_repair_preserves_explicit_source_priority_without_upgrading_legacy(footage_subject):
+    session, settings, content, _ = footage_subject
+    flow = WorkflowService(session, data_dir=settings.data_dir, submission_root=settings.agent_submission_dir, lease_minutes=45)
+    for enabled in (False, True):
+        inputs = {"source_media_priority_version": 1} if enabled else {}
+        target = AgentTask(task_type=TaskType.CONTENT_RESEARCH, prompt_name="content_research", content_id=content.id,
+                           instructions="Frozen fixture", input_data=inputs, input_hash=stable_hash(inputs))
+        frozen = deepcopy(target.input_data), target.input_hash
+        repair = flow._research_repair_input(content, target)
+        assert (repair.get("source_media_priority_version") == 1) is enabled
+        assert (target.input_data, target.input_hash) == frozen
+
+
+def test_new_footage_prepare_explicitly_issues_source_media_contract(footage_subject, monkeypatch):
+    session, settings, content, _ = footage_subject
+    candidate = session.get(Candidate, content.candidate_id)
+    candidate.rights_status = RightsStatus.SELF_OWNED
+    session.add(candidate)
+    session.commit()
+    root = Path(content.content_dir)
+    source = root / "source/original.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"original video fixture")
+    transcript = root / "transcript/transcript.json"
+    transcript.parent.mkdir()
+    transcript.write_text('{"segments": []}', encoding="utf-8")
+    scenes_path = root / "scenes/scenes.json"
+    scenes_path.parent.mkdir()
+    scenes = [{"scene_id": "s1", "start_sec": 0, "end_sec": 30, "thumbnail": "scenes/s1.jpg"}]
+    scenes_path.write_text(json.dumps({"scenes": scenes}), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_require_media_tools", lambda *args: None)
+    monkeypatch.setattr(pipeline.MediaExecutor, "acquire", lambda *a, **k: source)
+    monkeypatch.setattr(pipeline.MediaExecutor, "ensure_transcript", lambda *a, **k: transcript)
+    monkeypatch.setattr(pipeline.MediaExecutor, "analyze_scenes", lambda *a, **k: (scenes_path, scenes))
+    pipeline.prepare_content(session.get_bind(), settings, content.id)
+    research = session.exec(select(AgentTask).where(AgentTask.task_type == TaskType.CONTENT_RESEARCH)).one()
+    assert research.input_data["production_mode"] == "footage"
+    assert research.input_data["source_media_priority_version"] == 1
+    assert session.exec(select(Artifact).where(Artifact.artifact_type == "source_video")).one().relative_path == "source/original.mp4"
+
+
+@pytest.fixture
+def approved_footage_plan(footage_plan):
+    subject, research, script, rows, approve = footage_plan
+    session, settings, _, _ = subject
+    plan = approve()
+    service = AgentTaskService(session, settings.agent_submission_dir)
+    task, token = service.claim(agent_id="fixture-worker", role_id=primary_role_for(TaskType.VISUAL_PLAN),
+                                capabilities={TaskType.VISUAL_PLAN}, task_id=plan.id)
+    result = {"segments": [
+        {"scene_id": "s1", "layout": "center_crop", "narration_start_sec": 0, "narration_end_sec": 15,
+         "source_start_sec": 0, "source_end_sec": 15, "purpose": "原片"},
+        {"asset_id": rows[0]["artifact_id"], "layout": "image_card", "narration_start_sec": 15,
+         "narration_end_sec": 30, "purpose": "官方图"},
+    ]}
+    complete(service, task, token, result)
+    service, qc, token = issue(subject, TaskType.VISUAL_PLAN_QC,
+        {"upstream_task_ids": {"visual_plan": plan.id, "script": script.id}})
+    complete(service, qc, token, {"passed": True, "issues": []})
+    return subject, research, rows, plan
+
+
+def test_footage_pipeline_passes_official_images_and_preserves_existing_renderer_assets(approved_footage_plan, monkeypatch):
+    subject, _, rows, _ = approved_footage_plan
+    session, settings, content, assets = subject
+    captured = {}
+
+    class RenderCaptured(RuntimeError):
+        pass
+
+    def capture(self, **kwargs):
+        captured.update(kwargs)
+        raise RenderCaptured("Stop at the renderer boundary; no simulated final QC")
+
+    monkeypatch.setattr(pipeline.MediaExecutor, "align_subtitles", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline.MediaExecutor, "render", capture)
+    with pytest.raises(RenderCaptured):
+        pipeline.render_content(session.get_bind(), settings, content.id)
+    assert captured["video_path"] == Path(content.content_dir) / "source/original.mp4"
+    assert captured["assets"][rows[0]["artifact_id"]] == Path(content.content_dir) / rows[0]["relative_path"]
+    assert captured["assets"][assets[1].id] == Path(content.content_dir) / assets[1].relative_path
+    assert captured["generated_image_ids"] == {assets[1].id}
+    assert [segment.get("scene_id") for segment in captured["plan_data"]["segments"]] == ["s1", None]
+
+
+@pytest.mark.parametrize("damage", ["bytes", "path", "hash", "receipt", "receipt_id"])
+def test_footage_render_rechecks_source_images_after_visual_qc(approved_footage_plan, monkeypatch, damage):
+    subject, research, rows, _ = approved_footage_plan
+    session, settings, content, _ = subject
+    artifact = session.get(Artifact, rows[0]["artifact_id"])
+    receipt = session.exec(select(AuditEvent).where(AuditEvent.entity_id == research.id,
+                                                   AuditEvent.action == "source_media_images_acquired")).one()
+    if damage == "bytes":
+        (Path(content.content_dir) / artifact.relative_path).write_bytes(b"changed after QC")
+    elif damage == "path":
+        artifact.relative_path = "../changed.png"
+        session.add(artifact)
+    elif damage == "hash":
+        artifact.sha256 = "b" * 64
+        session.add(artifact)
+    elif damage == "receipt":
+        session.delete(receipt)
+    else:
+        replacement = Artifact(content_id=content.id, revision_id=artifact.revision_id, artifact_type="source_image",
+            relative_path=artifact.relative_path, sha256=artifact.sha256, size_bytes=artifact.size_bytes,
+            mime_type=artifact.mime_type, producer_stage="fixture")
+        session.add(replacement)
+        session.commit()
+        metadata = deepcopy(receipt.metadata_json)
+        metadata["images"][0]["artifact_id"] = replacement.id
+        receipt.metadata_json = metadata
+        session.add(receipt)
+    session.commit()
+    monkeypatch.setattr(pipeline.MediaExecutor, "align_subtitles", lambda *a, **k: pytest.fail("changed source must precede ASR"))
+    monkeypatch.setattr(pipeline.MediaExecutor, "render", lambda *a, **k: pytest.fail("changed source must precede render"))
+    with pytest.raises(pipeline.NonRetryableMediaError, match="Source media changed after visual QC"):
+        pipeline.render_content(session.get_bind(), settings, content.id)

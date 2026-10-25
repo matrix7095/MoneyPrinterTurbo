@@ -310,7 +310,8 @@ _CONTENT_RESEARCH = """\
   只收相关官方产品宣传图（照片或官方渲染图）、参数表、结构图、发布会幻灯页；
   不能仅凭画面把官方宣传图称为实拍，装饰图、广告位、头像不收。
   只交 URL，**不要自己下载或保存图片**，平台会用确定性执行器取图。
-- `source_media_search`（`source_media_priority_version=1` 的图文任务必填）：
+  `footage` 原片已足以覆盖脚本时允许为空，在 `image_gap_reason` 说明无需额外原图的依据；不要为填清单收无关图片。
+- `source_media_search`（`source_media_priority_version=1` 的任务必填）：
   - `checked_pages[]`：实际检查的官方产品页、公告或媒体库，沿用 `{url,title,source_type}`，
     至少一项为 `official` 或 `primary`；不能把没打开的地址写成已检查。
   - `video_search_note`：查找**同型号**官方宣传视频的结果、视频或频道/媒体库链接、
@@ -485,7 +486,7 @@ _SHORT_SCRIPT = (
 - `estimated_duration_sec`：预估时长，必须落在 {min_video_seconds}-{max_video_seconds} 秒之间。
 - `claims_used[]`：用到的 claim ID，必须都来自 `research.verified_claims`，**最多 3 条**。
 - `visual_requirements[]`：`{purpose, keywords[], preferred_source}`，
-  有原片时 `preferred_source` 建议填 `scene_analysis` 里的 `scene_id`；图文模式必须填
+  有原片时 `preferred_source` 填 `scene_analysis` 里的 `scene_id` 或已登记原图的 `artifact_id`；图文模式必须填
   `research.source_images[]` 里的 `artifact_id`，或明确写 `ai_generate`，不得编造场景 ID。
 
 """
@@ -644,10 +645,10 @@ _VISUAL_PLAN = """\
 - `scene_analysis`：各场景的质量与信息价值评分。
 - `scenes[]`：可用场景及其 `start_sec` / `end_sec`（图文模式下为空）。
 - `allowed_layouts[]`：允许的布局白名单。
-- `asset_image_enabled`：是否允许申请 AI 生图。关闭时每段只能引用现有 `scene_id`。
-- 图文模式额外包含：`source_images[]`（已下载的网页原图，含 `artifact_id`、
-  `artifact_url`、`caption`、`width`、`height`）、`image_only_gen_budget`（生图预算）、
-  `allowed_reference_artifact_ids`（可参考重绘的原图）；原图文件同时下发到 `context/`。
+- `asset_image_enabled`：是否允许申请 AI 生图。关闭时仍可引用现有 `scene_id` 或白名单内的原图 `asset_id`。
+- 素材优先合同 v1 任务还包含 `source_images[]`（已下载的网页原图，含 `artifact_id`、
+  `artifact_url`、`caption`、`width`、`height`）；原图文件同时下发到 `context/`。
+- 图文模式另含 `image_only_gen_budget`（生图预算）、`allowed_reference_artifact_ids`（可参考重绘的原图）。
 - 重做任务可能含 `qc_issues` / `previous_plan`，必须逐项修正上轮质检问题。
 
 ## 输出
@@ -670,7 +671,9 @@ _VISUAL_PLAN = """\
   `mode` 目前只能为 `black`。原素材画面中有必须遮挡的营销字幕、台标或其他文字时，
   **必须填写这个结构化字段**，不能只在 `purpose` 里描述；没有遮挡要求时省略或填 `[]`。
   遮挡会在 layout 之前作用于整段原素材，旧计划省略该字段仍可渲染。
-- `footage` 模式中，无可用原片画面的段落必须用 `asset_request` 兜底；从下列四类中
+- `footage` 模式中，优先使用相关原片场景和已登记官方原图，原图直用时以 `asset_id` 配 `image_card`。
+  素材优先合同 v1 下，使用合适原片即满足原素材优先，不必为插图而打断完整原片；已有相关原素材时不能整片全 AI。
+  仅在现有原片和原图无法覆盖的段落用 `asset_request` 兜底；从下列四类中
   挑选**信息价值最高的一到两处**使用 `asset_request` 增强表达：数据参数对比、抽象结论、
   时间线或发展脉络、原理与结构示意。`image_only` 按下方的语义缺口与生图预算规划补图。
 - `footage` 模式的 `asset_request` 仍不超过 2 段且不得连续；`image_only` 模式允许
@@ -679,7 +682,7 @@ _VISUAL_PLAN = """\
 - 开启 `asset_image_enabled` 后，`asset_request` 布局必须为 `image_card`，每个
   `asset_request` 必须填写：
   - `information`：本图要传达的信息，中文（如「三款机型续航对比，新款领先」）。
-  - `source_gap_reason`：`source_media_priority_version=1` 的图文任务必填，说明现有
+  - `source_gap_reason`：`source_media_priority_version=1` 的任务必填，说明现有
     产品宣传图无法覆盖的具体信息缺口；不能为了统一风格或凑图片数就替换真实产品图。
   - `style_direction`：风格方向与用途，中文（如「产品实拍质感」「原理示意图，
     极简线条」「时间线概念插画」），不锁定具体模板；须与段落用途匹配：
@@ -790,7 +793,7 @@ _VISUAL_PLAN_QC = """\
 - `context/` 目录：`context_files` 中列出的场景缩略图。
   逐段判断画面内容时必须打开对应缩略图，禁止回退到内容目录或原片目录找图。
 - 重做任务还会包含 `qc_issues` 与 `previous_plan`；必须逐项修正上轮问题，不能原样返回。
-- 图文素材优先 v1 任务还包含 `source_media_priority_version`、`source_media_search` 与
+- 素材优先 v1 任务还包含 `source_media_priority_version`、`source_media_search` 与
   `source_images`，用于核对原图使用与 AI 补图的实际缺口。
 - `source_media_acquisition` 是绑定已接受研究的实际取图结果；原始 URL、下载成功与未取得
   图片分别列出。下载失败不等于官网没有原图，也不自动允许所有镜头都改成 AI。
@@ -824,8 +827,8 @@ _VISUAL_PLAN_QC = """\
 | 图文开场不是产品静物加规格字幕 | error |
 | 开场段没有因 `fit` 出现黑边/黑场 | error |
 | 旁白念参数时画面不是黑场或空镜 | error |
-| `footage` 模式增强型 `image_card` 不超过 2 段 | warning |
-| `footage` 模式不出现连续两个 `image_card` | warning |
+| `footage` 模式 AI 增强段（`asset_request`）不超过 2 段；官方原图直用不占生图额度 | warning |
+| `footage` 模式不出现连续两个 AI 增强段 | warning |
 | image_only 独立图片数量与镜头时长满足叙事节奏（4/5 张与 8 秒仅为建议） | warning |
 | image_only 图片段包含运动字段且不是整段 `hold` | warning |
 
